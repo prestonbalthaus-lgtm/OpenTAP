@@ -1,0 +1,18 @@
+[package]
+name = "otap-arena"
+description = "OpenTAP's write-cache arena: the huge-page memory that holds every acknowledged write until its consistency point commits, a bump allocator handing out slot runs with lap counters, and the per-slot state table that lets a restarted daemon re-attach without losing an acknowledged write. No I/O and no unsafe code; the memory comes from otap-sys."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-format = { path = "../otap-format" }
+otap-sys = { path = "../otap-sys" }
+zerocopy.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

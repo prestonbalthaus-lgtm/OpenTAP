@@ -1,0 +1,58 @@
+# cargo-fuzz targets for the on-disk and on-wire parsers (round 3, section
+# 8.4: one CPU-hour per parser nightly). This package is its own workspace:
+# it needs nightly and links libFuzzer, so it stays out of `cargo test
+# --workspace` (the root manifest excludes it).
+#
+#   cargo +nightly fuzz run fuzz_superblock        # from the repository root
+#   cargo check --manifest-path fuzz/Cargo.toml --no-default-features
+#
+# The second form type-checks the targets on a host without a C++ toolchain
+# by not building the bundled libFuzzer runtime.
+
+[package]
+name = "otap-fuzz"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "libFuzzer targets for otap-format and otap-stream"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[features]
+default = ["libfuzzer"]
+# Links the bundled libFuzzer runtime (what `cargo fuzz` needs).
+libfuzzer = ["libfuzzer-sys/link_libfuzzer"]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", default-features = false }
+bytes = "1.10"
+otap-format = { path = "../crates/otap-format" }
+otap-stream = { path = "../crates/otap-stream" }
+
+[[bin]]
+name = "fuzz_superblock"
+path = "fuzz_targets/fuzz_superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_stripe_summary"
+path = "fuzz_targets/fuzz_stripe_summary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_stream_frame"
+path = "fuzz_targets/fuzz_stream_frame.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

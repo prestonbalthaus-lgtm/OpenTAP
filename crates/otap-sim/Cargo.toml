@@ -1,0 +1,21 @@
+[package]
+name = "otap-sim"
+description = "OpenTAP's deterministic simulator: fake Backstore, FrontDoor, Clock and Net, a checker model of acknowledged writes, and a harness that drives the engine through random I/O, power cuts, daemon crashes and clean restarts to prove crash consistency and the nvfail rules without hardware."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-arena = { path = "../otap-arena" }
+otap-cp = { path = "../otap-cp" }
+otap-format = { path = "../otap-format" }
+otap-index = { path = "../otap-index" }
+otap-sys = { path = "../otap-sys" }
+
+[dev-dependencies]
+otap-stream = { path = "../otap-stream" }
+proptest.workspace = true

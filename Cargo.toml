@@ -1,0 +1,83 @@
+# OpenTAP workspace: Phase C, v0.1 single-node foundation.
+#
+# Crate versions are the 2026-10-12 snapshot verified against crates.io in
+# round 3 (fact check C39). `Cargo.lock` is the authority for the resolved
+# graph; a pin is bumped only together with the change that needs it.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/otap-format",
+    "crates/otap-stream",
+    "crates/otap-sys",
+    "crates/otap-arena",
+    "crates/otap-index",
+    "crates/otap-cp",
+    "crates/otap-sim",
+]
+# The cargo-fuzz package is its own workspace: it needs nightly and links
+# libFuzzer, so it must not take part in `cargo test --workspace`.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# crc-fast 1.10.0 declares rust-version 1.89 and proptest 1.12.0 declares
+# 1.88, so the workspace floor is 1.89; the brief's "1.82+" cannot hold with
+# these pins. The tree is built and tested with stable 1.99.
+rust-version = "1.89"
+publish = false
+
+[workspace.dependencies]
+# On-disk and on-wire views (round-3 ruling R25, Part 7 conventions).
+zerocopy = { version = "0.8.62", features = ["derive"] }
+# CRC-32C (the iSCSI polynomial) for every structure. `std` only: the default
+# feature set also exports a C FFI surface and a no_std panic handler, neither
+# of which belongs in a Rust daemon.
+crc-fast = { version = "=1.10.0", default-features = false, features = ["std"] }
+# Per-delta digests and the golden-vector manifest.
+blake3 = "1.8.7"
+# Zero-copy payload views in the stream codec.
+bytes = "1.10"
+# Property tests. 100,000 cases per structure per merge: PROPTEST_CASES=100000.
+proptest = "1.12.0"
+# The active-generation pointer of the dirty index (Step 3, E15): readers load
+# it lock-free, the cut swaps it and waits for the readers that saw the old
+# generation. Chosen over crossbeam-epoch because its API is safe, and only
+# otap-sys may contain unsafe code.
+arc-swap = "1.9.2"
+# Per-volume dirty maps and the small engine locks: fast when uncontended.
+parking_lot = "0.12.5"
+# Linux-only crates for otap-sys (and the engine crates that follow). They are
+# pulled in only under `cfg(target_os = "linux")`, so the workspace resolves
+# and builds on any host.
+io-uring = "0.7.15"
+libublk = "=0.4.8"
+rustix = "1.1.5"
+memmap2 = "0.9.11"
+# libfuzzer-sys 0.4 is declared by fuzz/Cargo.toml, which is outside this
+# workspace (see `exclude`).
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+
+[profile.dev.package."*"]
+# Dependencies at full optimisation even in dev builds: the CRC kernels and
+# proptest's shrinking are where the test suite spends its time.
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1
+# A storage engine traps on arithmetic overflow; it never wraps silently.
+overflow-checks = true

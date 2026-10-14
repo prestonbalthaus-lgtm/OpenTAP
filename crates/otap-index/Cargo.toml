@@ -1,0 +1,19 @@
+[package]
+name = "otap-index"
+description = "OpenTAP's volatile dirty index: one B-tree of dirty extents per volume per generation, coalescing writes into contiguous slot runs, and the epoch-flip cut that freezes the active generation for a consistency point without stalling front-door I/O. No I/O and no unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-arena = { path = "../otap-arena" }
+otap-format = { path = "../otap-format" }
+arc-swap.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

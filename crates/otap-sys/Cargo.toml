@@ -1,0 +1,21 @@
+[package]
+name = "otap-sys"
+description = "OpenTAP's system boundary, the only crate that may contain unsafe code: hugetlbfs arenas, the ublk UAPI mappings and command encodings, io_uring buffer registration and table cloning, and the startup capability probe, with portable fallbacks so the workspace builds and its pure parts are tested on any host."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zerocopy.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["mm", "fs", "io_uring"] }
+memmap2.workspace = true
+io-uring.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

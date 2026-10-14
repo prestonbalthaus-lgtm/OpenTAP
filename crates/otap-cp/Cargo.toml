@@ -1,0 +1,20 @@
+[package]
+name = "otap-cp"
+description = "OpenTAP's consistency-point engine: the Backstore, FrontDoor, Clock and Net traits every engine crate is written against, the write and read paths over the arena and the dirty index, the flusher that assembles full stripes and commits them through the superblock ring, and the boot evaluator that selects a verified consistency point, rewinds a torn one and engages nvfail on a dirty boot. No syscalls: every I/O goes through the traits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-arena = { path = "../otap-arena" }
+otap-format = { path = "../otap-format" }
+otap-index = { path = "../otap-index" }
+otap-sys = { path = "../otap-sys" }
+blake3.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

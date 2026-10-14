@@ -1,0 +1,3 @@
+# Golden vectors are binary and byte-exact.
+*.bin binary
+crates/otap-format/tests/vectors/** -text
