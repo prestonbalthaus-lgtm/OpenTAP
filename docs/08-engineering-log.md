@@ -424,7 +424,25 @@ equal sequences are the same write and are accepted (E20).
 the host and on the Linux target with every test target; fuzz clippy and
 rustdoc clean; `cargo test --workspace`: 318 tests passed, 1 ignored, 2
 doctests (arena 22, index 20, format 111, stream 75, sys 33, simulator 57).
-The 10,000-case gate's result is recorded in the next entry.
+`PROPTEST_CASES=10000 cargo test --workspace`: every suite passed, 40
+minutes 39 seconds in all (the review's simulator walk 16 min 16 s, the
+original random-crash walk 13 min 30 s, the arena's two ring properties
+5 min 27 s and 3 min 55 s, the index properties 47 s, format 21 s). The
+two simulator walks draw fresh seeds every run, so this is one more
+10,000-scenario sample of each on top of the three rounds before the
+review.
+
+## 2026-10-13: source control
+
+The owner approved putting the tree under version control. The lead
+installed the GitHub CLI 2.102.0 (zip release, SHA-256 verified against the
+published checksums, in `C:\Users\jimmy\tools\gh`), the owner logged in as
+`prestonbalthaus-lgtm`, and the lead initialised the repository at
+`E:\Coding\OpenTAP`, committed the tree as it stood after the Step 3 review
+(`aee54fc`, 93 files, "Phase C Steps 1 to 3"), created the private
+repository `github.com/prestonbalthaus-lgtm/OpenTAP` and pushed `main`.
+The ignore file gained the fuzz crate's build output. The rules are in
+`09-working-agreements.md`, section 8.
 
 ## Lessons, running list
 

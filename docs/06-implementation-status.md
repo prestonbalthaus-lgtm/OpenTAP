@@ -30,9 +30,12 @@ what a new session reads first; the rest is the detail behind it.
   CRCs). All are fixed and pinned (`08-engineering-log.md`, Step 3 entry;
   decisions E16 to E20). One item is refused rather than fixed: a
   flush-opaque backstore, which needs an owner decision (E19).
-- The tree is not under version control (no `.git` as of 2026-10-13).
-  `08-engineering-log.md` is the only history. Initialising a repository is
-  the first recommendation to the owner.
+- The tree is under version control since the evening of 2026-10-13:
+  branch `main` of the private repository
+  `github.com/prestonbalthaus-lgtm/OpenTAP`, first commit `aee54fc` ("Phase
+  C Steps 1 to 3"). Before that, `08-engineering-log.md` was the only
+  history. One commit per reviewed change with the gates green, pushed
+  through the GitHub CLI installed in `C:\Users\jimmy\tools\gh`.
 - Owner decisions D1 to D15 have no recorded answers. The code depends on them
   only through the reservations listed in section 6.
 - The development PC runs Windows. Everything Linux-specific is type-checked
@@ -226,7 +229,7 @@ README's Windows notes) and runs with `-j 3`; tests use `--test-threads=6`.
 | `cargo clippy --manifest-path fuzz/Cargo.toml --no-default-features -- -D warnings` | clean |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` | clean |
 | `cargo test --workspace` | 318 passed, 0 failed, 1 ignored, 2 doctests passed |
-| `PROPTEST_CASES=10000` | the whole workspace, after the review's fixes; the result and timing are in the Step 3 review entry of `08-engineering-log.md` (the simulator's seeds differ per run, so the walks are repeated) |
+| `PROPTEST_CASES=10000 cargo test --workspace` | every suite passed after the review's fixes; 40 min 39 s in all, the two simulator random walks 16 and 13 minutes of it (their seeds differ per run, so the walks are repeated over time) |
 
 Not runnable here: the Linux halves of `otap-sys` (type-checked only), the
 fuzz targets (need nightly and cargo-fuzz), and every kernel lane of §8.4.
@@ -284,7 +287,9 @@ three-CP ring, or a post-commit flush discipline) before the real
 
 ## 8. Known limits, debts and risks
 
-- **No version control.** One tree on one disk, no history beyond the log.
+- **History starts at the Step 3 commit.** Everything before `aee54fc`
+  exists only as this log describes it; the Step 1 and Step 2 states cannot
+  be checked out.
 - **Nothing kernel-facing has executed.** The ublk, io_uring and hugetlbfs
   code is verified against the 6.12 sources and type-checked for Linux only.
 - **The fuzz targets have never run.** They compile under

@@ -141,7 +141,17 @@ authority for why, and for what is not yet code.
 
 ## 8. Source control
 
-The tree has no repository as of 2026-10-13. Recommended before Step 3:
-`git init` at `E:\Coding\OpenTAP`, commit the current state as "Phase C
-Steps 1 and 2", and from then on one commit per reviewed change with the
-gates green. `.gitignore` and `.gitattributes` are already in place.
+Since 2026-10-13 the tree is a git repository with `origin` at the private
+GitHub repository `prestonbalthaus-lgtm/OpenTAP`, branch `main`. Rules:
+
+- One commit per reviewed change with the gates green; the message says
+  what changed and why, and ends with the co-author line for the model
+  that wrote it.
+- Commits are authored by the owner's GitHub identity (the no-reply
+  address, so pushes are never rejected for exposing an email).
+- Nothing is pushed anywhere but `origin`, and the repository stays
+  private, unless the owner says otherwise.
+- `target/`, the fuzz build output and corpora are ignored; `Cargo.lock`
+  files are committed; the golden vectors are binary (`.gitattributes`).
+- The GitHub CLI lives in `C:\Users\jimmy\tools\gh\bin` (on the user PATH)
+  and holds the owner's token; `gh auth status` shows the login.
