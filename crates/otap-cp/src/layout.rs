@@ -41,6 +41,12 @@ pub enum LayoutError {
         /// Bytes needed.
         needed: u64,
     },
+    /// The device holds more segments than the table can count (a `u32`):
+    /// a larger segment is needed, never a shortened layout.
+    TooManySegments {
+        /// Segments the device would hold.
+        segments: u64,
+    },
     /// The format refused the stripe size.
     Format(FormatError),
 }
@@ -50,6 +56,10 @@ impl fmt::Display for LayoutError {
         match self {
             Self::BadStripe { stripe_bytes } => write!(f, "stripe of {stripe_bytes} bytes"),
             Self::BadSegment { segment_bytes } => write!(f, "segment of {segment_bytes} bytes"),
+            Self::TooManySegments { segments } => write!(
+                f,
+                "{segments} segments are more than the segment table can count"
+            ),
             Self::TooSmall {
                 capacity_bytes,
                 needed,
@@ -123,8 +133,11 @@ impl DiskLayout {
                 needed,
             });
         }
-        let segments =
-            ((geom.capacity_bytes - front - back) / segment).min(u64::from(u32::MAX) - 1) as u32;
+        let segments = (geom.capacity_bytes - front - back) / segment;
+        if segments >= u64::from(u32::MAX) {
+            return Err(LayoutError::TooManySegments { segments });
+        }
+        let segments = segments as u32;
         let b_base = geom.capacity_bytes - back;
         Ok(Self {
             stripe_bytes: stripe,
@@ -236,16 +249,79 @@ impl DiskLayout {
         offset / BLOCK_SIZE as u64
     }
 
-    /// The byte length a region of `pages` pages occupies on the device when
-    /// written as whole stripes.
+    /// The stripes a region of `pages` pages occupies when written as whole
+    /// stripes (saturating at `u32::MAX`; unused by the engine, which packs
+    /// regions through the metadata stream).
     #[must_use]
     pub const fn stripes_for_pages(&self, pages: u32) -> u32 {
-        (pages * BLOCK_SIZE as u32).div_ceil(self.stripe_bytes)
+        let bytes = pages as u64 * BLOCK_SIZE as u64;
+        let stripes = bytes.div_ceil(self.stripe_bytes as u64);
+        if stripes > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            stripes as u32
+        }
     }
 
     /// Bytes every segment holds.
     #[must_use]
     pub const fn segment_data_bytes(&self) -> u64 {
         self.segment_bytes
+    }
+}
+
+impl DiskLayout {
+    /// Pages (4 KiB blocks) per stripe.
+    #[must_use]
+    pub const fn pages_per_stripe(&self) -> u32 {
+        self.blocks_per_stripe()
+    }
+
+    /// The first block number of segment `pseg`.
+    #[must_use]
+    pub fn segment_first_pba(&self, pseg: u64) -> Option<u64> {
+        self.stripe_pba(pseg, 0)
+    }
+
+    /// One past the last block number of segment `pseg`.
+    #[must_use]
+    pub fn segment_end_pba(&self, pseg: u64) -> Option<u64> {
+        self.segment_first_pba(pseg)
+            .map(|first| first + u64::from(self.blocks_per_segment()))
+    }
+
+    /// How a region of `pages` pages at `pba` falls over physical segments:
+    /// `(pseg, bytes)` per segment touched, in order. Blocks outside every
+    /// segment (the fixed regions) are not reported.
+    #[must_use]
+    pub fn segments_of_region(&self, pba: u64, pages: u32) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut at = pba;
+        let end = pba.saturating_add(u64::from(pages));
+        while at < end {
+            let Some(pseg) = self.pseg_of_pba(at) else {
+                break;
+            };
+            let seg_end = match self.segment_end_pba(pseg) {
+                Some(e) => e,
+                None => break,
+            };
+            let take = seg_end.min(end) - at;
+            out.push((pseg, take * BLOCK_SIZE as u64));
+            at = seg_end;
+        }
+        out
+    }
+
+    /// The stripe index within its segment of block number `pba`, if the
+    /// block is in a segment.
+    #[must_use]
+    pub fn stripe_of_pba(&self, pba: u64) -> Option<(u64, u32)> {
+        let pseg = self.pseg_of_pba(pba)?;
+        let first = self.segment_first_pba(pseg)?;
+        Some((
+            pseg,
+            ((pba - first) / u64::from(self.blocks_per_stripe())) as u32,
+        ))
     }
 }

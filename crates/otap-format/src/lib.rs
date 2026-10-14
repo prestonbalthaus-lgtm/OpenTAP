@@ -60,8 +60,10 @@
 //! | [`SnapRecord`] | 64 | 8 | trailing | [`records`] |
 //! | [`CpLogRec`] | 32 | 8 | trailing | [`records`] |
 //! | [`CpLogPage`] (`CpLogPageHdr` + 126 records) | 4096 | 4096 | header + records | [`records`] |
+//! | [`CpLogDirPage`] (`CpLogDirHdr` + 252 root references; 2.1) | 4096 | 4096 | header | [`records`] |
+//! | [`SnapRootPage`] (2.1) | 4096 | 4096 | trailing | [`records`] |
 //!
-//! # Format rulings (F1 to F11)
+//! # Format rulings (F1 to F15)
 //! These settle the points on which the Step-1 brief, the round-3 synthesis
 //! (docs/05, section 7.1) and the 4 KiB page bound differ. They are
 //! architect decisions, recorded so that a later change is deliberate.
@@ -145,6 +147,50 @@
 //!   2026-10-13, before any release wrote the format, which is the only time
 //!   a vector set may change without a minor bump.
 //!
+//! Format 2.1 (Step 4, 2026-10-13) adds three rulings for the persistent
+//! map (`otap-map`); the 2.0 vectors stay in `tests/vectors/v2.0/` and are
+//! still decoded, and `tests/vectors/v2.1/` holds the 2.1 set.
+//!
+//! - **F12. The CP log is a directory of delta regions.** The superblock's
+//!   `cp_log_head` names a region of [`CpLogDirPage`]s ([`CpLogDir`]): the
+//!   [`RootRef`]s of the delta regions (runs of [`CpLogPage`]s, one
+//!   [`CpLogRec`] per block written or hole punched) of every consistency
+//!   point since the last *fold*, in CP order, plus, when the writing CP is
+//!   the fold, the map pages the fold wrote. A fold rewrites the map pages
+//!   the deltas touched (copy on write) and the page indexes of the volumes
+//!   concerned, so the map pages hold the state at the fold CP and a boot
+//!   replays the deltas born after it; the fold CP's own records go into
+//!   the pages it rewrites, so it writes no delta region. Every region is
+//!   named exactly (block, length, CRC), as E14 requires.
+//! - **F13. A snapshot pins a root through a [`SnapRootPage`].** The page a
+//!   [`SnapRecord`]'s `map_root_pba` names carries the pinned [`MapRoot`],
+//!   the snapshot's identity, the deadlist reference and its own CRC, so a
+//!   pinned root is verified like every other structure. Snapshots are
+//!   taken at fold CPs, where the root is complete.
+//! - **F14. The table regions.** `map_roots` names one [`MapRoot`] per
+//!   volume index up to `vol_count`, absent volumes all zero
+//!   ([`map_roots_image`], [`parse_map_roots`]); `snap_table` names the
+//!   [`SnapRecord`]s in ascending id order ([`snap_table_image`],
+//!   [`parse_snap_table`]). Both are padded to whole pages and sealed by
+//!   the superblock's root reference. A pool written by format 2.0 (whose
+//!   `cp_log_head` held a whole-map dump, E14) is refused by the Step 4
+//!   boot; none was ever released.
+//!
+//! Format 2.2 (Step 4 review, 2026-10-14) adds one ruling; the 2.0 and 2.1
+//! vectors stay and are still decoded, and `tests/vectors/v2.2/` holds the
+//! 2.2 set.
+//!
+//! - **F15. The superblock records the geometry.** Every commit carries the
+//!   stripe, the segment and the capacity the pool was laid out with
+//!   (`geom_stripe_bytes`, `geom_segment_bytes`, `geom_capacity_bytes`, in
+//!   the former reserved area), verified whole and consistent on a 2.2
+//!   page. A boot compares them with the profile it was given and refuses a
+//!   difference before it writes anything: the slots `A1`, `B0` and `B1`
+//!   and every segment move with the stripe, so a pool opened under another
+//!   geometry would find a verified `A0` at block 0 and lay itself out anew
+//!   over the old layout. Pools written by 2.1 (no geometry recorded) are
+//!   refused like 2.0 pools; none was released.
+//!
 //! # Using the views
 //! ```
 //! use otap_format::{FromBytes, IntoBytes, SbLocation, SbSlot, SuperblockSlot, Uuid, VOL_PRESENT};
@@ -191,11 +237,13 @@ pub mod types;
 
 pub use constants::*;
 pub use map::{
-    MapEntry, MapPage, MapRoot, PageIndexEntry, PageIndexPage, MAP_LSEG_SHIFT, MAP_OFF_SHIFT,
+    map_roots_image, parse_map_roots, MapEntry, MapPage, MapRoot, PageIndexEntry, PageIndexPage,
+    MAP_LSEG_SHIFT, MAP_OFF_SHIFT,
 };
 pub use records::{
-    CpLogPage, CpLogPageHdr, CpLogRec, SegEntry, SegKind, SegState, SnapKind, SnapOrigin,
-    SnapRecord, PIN_CLONE, PIN_MASK, PIN_REPLICATION, PIN_SCHEDULE, PIN_USER,
+    parse_snap_table, snap_table_image, CpLogDir, CpLogDirHdr, CpLogDirPage, CpLogPage,
+    CpLogPageHdr, CpLogRec, SegEntry, SegKind, SegState, SnapKind, SnapOrigin, SnapRecord,
+    SnapRootPage, PIN_CLONE, PIN_MASK, PIN_REPLICATION, PIN_SCHEDULE, PIN_USER,
 };
 pub use stream::{Codec, FrameKind, HoleRecord, StreamHeader, FLAGS_CODEC_MASK};
 pub use stripe::{

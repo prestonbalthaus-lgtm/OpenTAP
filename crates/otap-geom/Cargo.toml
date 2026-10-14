@@ -1,0 +1,17 @@
+[package]
+name = "otap-geom"
+description = "OpenTAP's geometry discovery: reads a block device's sysfs queue parameters and md topology (through a source that the tests mock), classifies the device (mdadm, NVMe, a hardware RAID virtual drive, a plain disk), and derives the stripe and segment geometry, the media profile, the discard posture and the E19 flush policy the engine runs with. Pure: no syscalls beyond reading files, no unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-cp = { path = "../otap-cp" }
+otap-format = { path = "../otap-format" }
+
+[dev-dependencies]
+proptest.workspace = true

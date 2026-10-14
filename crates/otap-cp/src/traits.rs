@@ -120,17 +120,44 @@ pub struct Geometry {
     /// The device, in bytes.
     pub capacity_bytes: u64,
     /// `true` when a completed write is durable only after a flush that the
-    /// device may not honour (C07). The Step 3 engine refuses such a
-    /// geometry at format and boot (E19 in
-    /// `docs/07-engineering-decisions.md`): round 3's N-2 fallback needs a
-    /// deeper superblock ring than F7 lays out, and the owner decides
-    /// between that and a post-commit flush discipline before a real
-    /// controller is driven.
+    /// device may not honour (C07): a hardware RAID virtual drive or any
+    /// LUN whose cache the kernel cannot see. What the engine does with
+    /// such a device is the profile's [`FlushPolicy`] (E19, closed by the
+    /// owner's Step 4 ruling; E21 in `docs/07-engineering-decisions.md`).
     pub flush_opaque: bool,
 }
 
+/// How the engine treats a backstore whose flushes it cannot verify (the
+/// owner's E19 ruling, Step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FlushPolicy {
+    /// Strict: the backstore must honour FUA and flushes; a flush-opaque
+    /// geometry is refused at format and boot.
+    RequireFuaOrFlush,
+    /// Standard and homelab mode, the default for hardware RAID and opaque
+    /// LUNs: the engine issues its host-side barrier (the flush before the
+    /// superblock commit) and trusts it, publishes a structured operator
+    /// warning in the pool status, defers segment reuse one more CP, and
+    /// relies on nvfail to quarantine volumes after a power loss that lost
+    /// the controller's cache.
+    #[default]
+    TrustBarrierWithNvfail,
+}
+
+/// What the engine does with a segment it frees (D9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DiscardPolicy {
+    /// Nothing: free segments are reused by whole-stripe overwrite
+    /// (rotational media and hardware RAID virtual drives).
+    #[default]
+    Never,
+    /// A whole-segment discard (`BLKDISCARD`) when a segment is freed
+    /// (flash and NVMe).
+    WholeSegment,
+}
+
 /// The profile that drives the consistency-point engine (section 7.2's
-/// `MediaProfile`, the fields Step 3 uses).
+/// `MediaProfile`, the fields Steps 3 and 4 use).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MediaProfile {
     /// The media.
@@ -145,11 +172,16 @@ pub struct MediaProfile {
     pub back_to_back_bytes: u64,
     /// The write-active policy.
     pub nvfail_intent: NvfailIntent,
+    /// What to do with a flush-opaque geometry (E19 / E21).
+    pub flush_policy: FlushPolicy,
+    /// What to do with a freed segment (D9).
+    pub discard: DiscardPolicy,
 }
 
 impl MediaProfile {
     /// The flash profile for a lab-sized aggregate: 5 s timer, 8 stripes in
-    /// flight, back to back above 1 GiB, conservative intents.
+    /// flight, back to back above 1 GiB, conservative intents, whole-segment
+    /// discards, the barrier trusted on an opaque geometry.
     #[must_use]
     pub const fn flash(geom: Geometry) -> Self {
         Self {
@@ -159,10 +191,13 @@ impl MediaProfile {
             inflight_stripes: 8,
             back_to_back_bytes: 1 << 30,
             nvfail_intent: NvfailIntent::Conservative,
+            flush_policy: FlushPolicy::TrustBarrierWithNvfail,
+            discard: DiscardPolicy::WholeSegment,
         }
     }
 
-    /// The HDD profile: 10 s timer, 16 stripes in flight.
+    /// The HDD profile: 10 s timer, 16 stripes in flight, no discards, the
+    /// barrier trusted on an opaque geometry.
     #[must_use]
     pub const fn hdd(geom: Geometry) -> Self {
         Self {
@@ -172,7 +207,16 @@ impl MediaProfile {
             inflight_stripes: 16,
             back_to_back_bytes: 1 << 30,
             nvfail_intent: NvfailIntent::Conservative,
+            flush_policy: FlushPolicy::TrustBarrierWithNvfail,
+            discard: DiscardPolicy::Never,
         }
+    }
+
+    /// `true` when the geometry is flush-opaque and the policy trusts the
+    /// barrier: the engine runs with the E19 warning and the deferred reuse.
+    #[must_use]
+    pub const fn trusts_opaque_barrier(&self) -> bool {
+        self.geom.flush_opaque && matches!(self.flush_policy, FlushPolicy::TrustBarrierWithNvfail)
     }
 }
 
@@ -204,6 +248,12 @@ pub trait Backstore {
 
     /// Reads `dst.len()` bytes (whole blocks) at `pba`.
     fn read(&mut self, pba: u64, dst: &mut [u8]) -> Result<(), IoError>;
+
+    /// Submits a discard of `bytes` bytes at `pba` (a whole freed segment,
+    /// D9): the device may return zeros or the old data for the range
+    /// afterwards; nothing the engine references lives there. A backstore
+    /// without discard support completes it as a no-op.
+    fn discard_segment(&mut self, pba: u64, bytes: u64, tag: Tag) -> Result<(), Busy>;
 
     /// Moves every completion that has arrived into `out`; returns how many.
     fn poll(&mut self, out: &mut Vec<Done>) -> usize;
@@ -242,6 +292,27 @@ pub enum RequestKind {
         /// The volume.
         vol: u32,
     },
+    /// Discard `blocks` blocks at `lba` of `vol`: the blocks read as zeros
+    /// afterwards and the map holds holes (thin provisioning, D9). Held in
+    /// the arena as one hole record until its CP commits, like a write.
+    Discard {
+        /// The volume.
+        vol: u32,
+        /// The first LBA.
+        lba: u64,
+        /// Blocks, at least 1.
+        blocks: u32,
+    },
+    /// Write zeros over `blocks` blocks at `lba` of `vol`: served exactly
+    /// like a discard (a hole reads as zeros).
+    WriteZeroes {
+        /// The volume.
+        vol: u32,
+        /// The first LBA.
+        lba: u64,
+        /// Blocks, at least 1.
+        blocks: u32,
+    },
 }
 
 /// A front-door request.
@@ -260,8 +331,20 @@ impl Request {
         match self.kind {
             RequestKind::Write { vol, .. }
             | RequestKind::Read { vol, .. }
-            | RequestKind::Flush { vol } => vol,
+            | RequestKind::Flush { vol }
+            | RequestKind::Discard { vol, .. }
+            | RequestKind::WriteZeroes { vol, .. } => vol,
         }
+    }
+
+    /// `true` for a discard or a write of zeros: a request the engine
+    /// serves as a hole punch.
+    #[must_use]
+    pub const fn is_punch(&self) -> bool {
+        matches!(
+            self.kind,
+            RequestKind::Discard { .. } | RequestKind::WriteZeroes { .. }
+        )
     }
 }
 
@@ -286,8 +369,9 @@ pub enum Status {
     /// The pool has no free segment: the write could never be made durable.
     NoSpace,
     /// The request is longer than the engine accepts: above
-    /// [`MAX_REQUEST_BLOCKS`](crate::engine::MAX_REQUEST_BLOCKS) blocks, or
-    /// longer than the arena.
+    /// [`MAX_REQUEST_BLOCKS`](crate::engine::MAX_REQUEST_BLOCKS) blocks (or
+    /// [`MAX_PUNCH_BLOCKS`](crate::engine::MAX_PUNCH_BLOCKS) for a discard),
+    /// or longer than the arena.
     TooLarge,
 }
 

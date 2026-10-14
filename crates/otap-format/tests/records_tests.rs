@@ -387,3 +387,356 @@ fn cp_log_page_header_rejects_foreign_pages() {
     assert!(other.verify().is_ok(), "a later minor is readable");
     assert_eq!(page.hdr.compute_crc(), crc32c(&page.as_bytes()[..60]));
 }
+
+// ---------------------------------------------------------------------------
+// format 2.1: the CP log directory (F12), the snapshot root page (F13) and
+// the table regions (F14)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn format_2_1_sizes_alignments_and_offsets() {
+    assert_eq!(size_of::<CpLogDirHdr>(), 64);
+    assert_eq!(size_of::<CpLogDirPage>(), 4096);
+    assert_eq!(size_of::<SnapRootPage>(), 4096);
+    assert_eq!(align_of::<CpLogDirHdr>(), 8);
+    assert_eq!(align_of::<CpLogDirPage>(), 4096);
+    assert_eq!(align_of::<SnapRootPage>(), 4096);
+    assert_eq!(CP_LOG_DIR_ENTRIES, 252);
+    assert_eq!(offset_of!(CpLogDirHdr, magic), 0);
+    assert_eq!(offset_of!(CpLogDirHdr, ver), 4);
+    assert_eq!(offset_of!(CpLogDirHdr, count), 6);
+    assert_eq!(offset_of!(CpLogDirHdr, cp_seq), 8);
+    assert_eq!(offset_of!(CpLogDirHdr, fold_cp_seq), 16);
+    assert_eq!(offset_of!(CpLogDirHdr, agg_id), 24);
+    assert_eq!(offset_of!(CpLogDirHdr, delta_entries), 40);
+    assert_eq!(offset_of!(CpLogDirHdr, page_entries), 44);
+    assert_eq!(offset_of!(CpLogDirHdr, page_seq), 48);
+    assert_eq!(offset_of!(CpLogDirHdr, rsvd), 52);
+    assert_eq!(offset_of!(CpLogDirHdr, crc32c), 60);
+    assert_eq!(offset_of!(CpLogDirPage, entries), 64);
+    assert_eq!(offset_of!(SnapRootPage, snap_id), 8);
+    assert_eq!(offset_of!(SnapRootPage, agg_id), 16);
+    assert_eq!(offset_of!(SnapRootPage, birth_cp), 32);
+    assert_eq!(offset_of!(SnapRootPage, root), 40);
+    assert_eq!(offset_of!(SnapRootPage, deadlist), 104);
+    assert_eq!(offset_of!(SnapRootPage, reserved), 120);
+    assert_eq!(offset_of!(SnapRootPage, crc32c), 4092);
+    assert_eq!(CPDIR_MAGIC, u32::from_le_bytes(*b"OTCD"));
+    assert_eq!(SNAPROOT_MAGIC, u32::from_le_bytes(*b"OTSR"));
+    assert_eq!(FORMAT_VERSION, 0x0202);
+}
+
+fn root_ref(i: u64) -> RootRef {
+    RootRef::new(1000 + i * 8, 1 + (i % 7) as u32, 0x1234_5678 ^ i as u32)
+}
+
+#[test]
+fn cp_log_dir_pages_round_trip_and_refuse_bad_entries() {
+    let mut page = CpLogDirPage::new(uuid(4), 42, 40, 0);
+    page.hdr.delta_entries = 3;
+    for i in 0..3 {
+        assert_eq!(page.push(root_ref(i)).unwrap(), Some(i as usize));
+    }
+    page.seal();
+    assert!(page.verify().is_ok());
+    assert_eq!(page.used().len(), 3);
+    let mut img = Block4K::zeroed();
+    img.0.copy_from_slice(page.as_bytes());
+    assert_eq!(*CpLogDirPage::parse(&img.0).unwrap(), page);
+    assert_eq!(CpLogDirPage::read(&img.0).unwrap(), page);
+
+    // An absent or zero-block reference is refused by the builder and by
+    // the parser alike.
+    assert!(page.push(RootRef::NONE).is_err());
+    assert!(page.push(RootRef::new(0, 1, 1)).is_err());
+    let mut bad = page;
+    bad.entries[1] = RootRef::new(0, 1, 1);
+    bad.seal();
+    assert!(matches!(
+        bad.verify(),
+        Err(FormatError::BadField { field: "pba", .. })
+    ));
+    // An entry beyond the count must be absent.
+    let mut bad = page;
+    bad.entries[3] = root_ref(9);
+    bad.seal();
+    assert!(matches!(
+        bad.verify(),
+        Err(FormatError::BadField { field: "count", .. })
+    ));
+    // The fold never lies ahead of the CP, and fold pages belong to the fold
+    // CP only.
+    let mut bad = page;
+    bad.hdr.fold_cp_seq = 43;
+    bad.seal();
+    assert!(matches!(
+        bad.verify(),
+        Err(FormatError::OutOfRange {
+            field: "fold_cp_seq",
+            ..
+        })
+    ));
+    let mut bad = page;
+    bad.hdr.page_entries = 1;
+    bad.seal();
+    assert!(matches!(
+        bad.verify(),
+        Err(FormatError::BadField {
+            field: "page_entries",
+            ..
+        })
+    ));
+    let mut bad = page;
+    bad.hdr.count = CP_LOG_DIR_ENTRIES as u16 + 1;
+    bad.seal();
+    assert!(matches!(
+        bad.verify(),
+        Err(FormatError::OutOfRange { field: "count", .. })
+    ));
+    let mut bad = page;
+    bad.hdr.magic = CPLOG_MAGIC;
+    bad.seal();
+    assert!(matches!(bad.verify(), Err(FormatError::BadMagic { .. })));
+    let mut bad = page;
+    bad.hdr.ver = 0x0300;
+    bad.seal();
+    assert!(matches!(bad.verify(), Err(FormatError::BadVersion { .. })));
+    let mut later = page;
+    later.hdr.ver = FORMAT_VERSION + 1;
+    later.seal();
+    assert!(later.verify().is_ok(), "a later minor is readable");
+
+    // A full page refuses a further entry without failing.
+    let mut full = CpLogDirPage::new(uuid(4), 1, 1, 0);
+    for i in 0..CP_LOG_DIR_ENTRIES as u64 {
+        assert!(full.push(root_ref(i)).unwrap().is_some());
+    }
+    assert!(full.is_full());
+    assert_eq!(full.push(root_ref(1)).unwrap(), None);
+}
+
+#[test]
+fn a_cp_log_directory_encodes_across_pages_and_decodes_to_the_same() {
+    for (deltas, pages) in [
+        (0usize, 0usize),
+        (1, 0),
+        (5, 3),
+        (252, 0),
+        (253, 0),
+        (300, 260),
+    ] {
+        let dir = CpLogDir {
+            cp_seq: 77,
+            fold_cp_seq: if pages > 0 { 77 } else { 70 },
+            deltas: (0..deltas as u64).map(root_ref).collect(),
+            pages: (0..pages as u64).map(|i| root_ref(1000 + i)).collect(),
+        };
+        let bytes = dir.encode(uuid(5)).unwrap();
+        assert_eq!(
+            bytes.len(),
+            dir.pages_needed() * CP_LOG_DIR_PAGE_SIZE,
+            "{deltas}/{pages}"
+        );
+        let back = CpLogDir::decode(&bytes, &uuid(5)).unwrap();
+        assert_eq!(back, dir, "{deltas}/{pages}");
+        assert!(matches!(
+            CpLogDir::decode(&bytes, &uuid(6)),
+            Err(FormatError::IdentityMismatch { field: "agg_id" })
+        ));
+        if bytes.len() > CP_LOG_DIR_PAGE_SIZE {
+            // Pages out of order, or disagreeing on the totals, are refused.
+            let mut swapped = bytes.clone();
+            let (a, b) = swapped.split_at_mut(CP_LOG_DIR_PAGE_SIZE);
+            a.swap_with_slice(&mut b[..CP_LOG_DIR_PAGE_SIZE]);
+            assert!(CpLogDir::decode(&swapped, &uuid(5)).is_err());
+            let mut short = bytes.clone();
+            short.truncate(bytes.len() - CP_LOG_DIR_PAGE_SIZE);
+            assert!(matches!(
+                CpLogDir::decode(&short, &uuid(5)),
+                Err(FormatError::BadField { field: "count", .. })
+            ));
+        }
+    }
+    // Pages outside the fold CP, and a fold ahead of the CP, never encode.
+    let bad = CpLogDir {
+        cp_seq: 10,
+        fold_cp_seq: 9,
+        deltas: vec![],
+        pages: vec![root_ref(1)],
+    };
+    assert!(bad.encode(uuid(5)).is_err());
+    let bad = CpLogDir {
+        cp_seq: 10,
+        fold_cp_seq: 11,
+        deltas: vec![],
+        pages: vec![],
+    };
+    assert!(bad.encode(uuid(5)).is_err());
+    assert!(CpLogDir::decode(&[], &uuid(5)).is_err());
+    assert!(CpLogDir::decode(&[0u8; 100], &uuid(5)).is_err());
+}
+
+fn golden_root() -> MapRoot {
+    MapRoot {
+        vol: 3,
+        flags: 0,
+        index_pba: 4096,
+        index_pages: 1,
+        index_crc: 0xCAFE_F00D,
+        lba_count: 1 << 18,
+        checkpoint_cp_seq: 30,
+        max_birth: 30,
+        rsvd0: 0,
+        rsvd1: [0; 16],
+    }
+}
+
+#[test]
+fn snap_root_pages_round_trip_and_validate() {
+    let page = SnapRootPage::new(uuid(7), 5, 30, golden_root(), RootRef::NONE).unwrap();
+    assert!(page.verify().is_ok());
+    let mut img = Block4K::zeroed();
+    img.0.copy_from_slice(page.as_bytes());
+    assert_eq!(*SnapRootPage::parse(&img.0).unwrap(), page);
+    assert_eq!(SnapRootPage::read(&img.0).unwrap(), page);
+    let with_deadlist =
+        SnapRootPage::new(uuid(7), 5, 30, golden_root(), RootRef::new(8192, 2, 1)).unwrap();
+    assert!(with_deadlist.verify().is_ok());
+
+    assert!(SnapRootPage::new(uuid(7), 0, 30, golden_root(), RootRef::NONE).is_err());
+    assert!(SnapRootPage::new(uuid(7), 5, 0, golden_root(), RootRef::NONE).is_err());
+    assert!(SnapRootPage::new(uuid(7), 5, MAX_CP_SEQ + 1, golden_root(), RootRef::NONE).is_err());
+    assert!(
+        SnapRootPage::new(uuid(7), 5, 29, golden_root(), RootRef::NONE).is_err(),
+        "a root checkpointed after the birth"
+    );
+    assert!(SnapRootPage::new(uuid(7), 5, 30, MapRoot::ABSENT, RootRef::NONE).is_err());
+    assert!(SnapRootPage::new(uuid(7), 5, 30, golden_root(), RootRef::new(0, 2, 1)).is_err());
+    let mut bad_root = golden_root();
+    bad_root.index_pages = 2;
+    assert!(SnapRootPage::new(uuid(7), 5, 30, bad_root, RootRef::NONE).is_err());
+
+    // Every bit of the page is under the CRC.
+    for bit in [
+        0usize,
+        40,
+        8 * 8,
+        16 * 8 + 3,
+        32 * 8,
+        40 * 8 + 5,
+        104 * 8,
+        120 * 8,
+        4091 * 8 + 7,
+    ] {
+        let mut flipped = img;
+        flip_bit(&mut flipped.0, bit);
+        assert!(SnapRootPage::parse(&flipped.0).is_err(), "bit {bit}");
+    }
+    let mut flipped = img;
+    flip_bit(&mut flipped.0, 4092 * 8);
+    assert!(matches!(
+        SnapRootPage::parse(&flipped.0),
+        Err(FormatError::BadCrc { .. })
+    ));
+}
+
+fn snap(id: u64, vol: u32, birth: u32) -> SnapRecord {
+    let mut rec = SnapRecord {
+        snap_id: id,
+        snap_uuid: uuid(id as u8),
+        map_root_pba: 100 + id,
+        deadlist_pba: 0,
+        created_wall_ns: 1_760_000_000_000_000_000 + id,
+        birth_cp: birth,
+        vol,
+        kind: SnapKind::Crash.as_u8(),
+        origin: SnapOrigin::User.as_u8(),
+        flags: PIN_USER,
+        rsvd: 0,
+        crc32c: 0,
+    };
+    rec.seal();
+    rec
+}
+
+#[test]
+fn the_snapshot_table_region_round_trips_and_refuses_disorder() {
+    assert_eq!(snap_table_image(&[]).unwrap().len(), BLOCK_SIZE);
+    assert!(parse_snap_table(&snap_table_image(&[]).unwrap())
+        .unwrap()
+        .is_empty());
+    let records: Vec<SnapRecord> = (1..=70)
+        .map(|i| snap(i, (i % 4) as u32, 10 + i as u32))
+        .collect();
+    let image = snap_table_image(&records).unwrap();
+    assert_eq!(image.len(), 2 * BLOCK_SIZE, "70 records need two pages");
+    assert_eq!(parse_snap_table(&image).unwrap(), records);
+    // Ids must ascend; the padding must be zero; a record must verify.
+    let mut disorder = records.clone();
+    disorder.swap(3, 4);
+    assert!(snap_table_image(&disorder).is_err());
+    let mut dirty = image.clone();
+    dirty[70 * SNAP_RECORD_SIZE + 5] = 1;
+    assert!(parse_snap_table(&dirty).is_err());
+    let mut flipped = image.clone();
+    flipped[64 + 9] ^= 1;
+    assert!(parse_snap_table(&flipped).is_err());
+    assert!(parse_snap_table(&image[..100]).is_err());
+    let mut pages = image.clone();
+    let (a, b) = pages.split_at_mut(BLOCK_SIZE);
+    a.swap_with_slice(&mut b[..BLOCK_SIZE]);
+    assert!(
+        parse_snap_table(&pages).is_err(),
+        "ids out of order across pages"
+    );
+}
+
+#[test]
+fn the_map_roots_region_round_trips_and_checks_positions() {
+    let mut roots = vec![MapRoot::ABSENT; 5];
+    roots[1] = MapRoot {
+        vol: 1,
+        index_pba: 8192,
+        index_pages: 1,
+        lba_count: 64,
+        checkpoint_cp_seq: 3,
+        ..MapRoot::ABSENT
+    };
+    roots[3] = {
+        let mut r = golden_root();
+        r.vol = 3;
+        r
+    };
+    let image = map_roots_image(&roots).unwrap();
+    assert_eq!(image.len(), BLOCK_SIZE);
+    assert_eq!(parse_map_roots(&image, 5).unwrap(), roots);
+    assert_eq!(map_roots_image(&[]).unwrap().len(), BLOCK_SIZE);
+    assert!(parse_map_roots(&map_roots_image(&[]).unwrap(), 0)
+        .unwrap()
+        .is_empty());
+    // A root at the wrong position, an absent slot that is not zero, a
+    // count the region cannot hold, and dirty padding are refused.
+    let mut wrong = roots.clone();
+    wrong[2] = roots[1];
+    assert!(map_roots_image(&wrong).is_err());
+    let mut wrong = roots.clone();
+    wrong[0].max_birth = 1;
+    assert!(map_roots_image(&wrong).is_err());
+    assert!(parse_map_roots(&image, 65).is_err());
+    assert!(parse_map_roots(&image, MAX_VOLS as u32 + 1).is_err());
+    let mut dirty = image.clone();
+    dirty[5 * MAP_ROOT_SIZE + 1] = 1;
+    assert!(parse_map_roots(&dirty, 5).is_err());
+    let mut moved = image.clone();
+    moved.copy_within(3 * MAP_ROOT_SIZE..4 * MAP_ROOT_SIZE, 2 * MAP_ROOT_SIZE);
+    assert!(
+        parse_map_roots(&moved, 5).is_err(),
+        "a root at another volume's slot"
+    );
+    // Fewer slots than the region holds is fine as long as the rest is zero.
+    assert_eq!(parse_map_roots(&image, 4).unwrap().len(), 4);
+    assert!(
+        parse_map_roots(&image, 3).is_err(),
+        "slot 3 is present and must be counted"
+    );
+}

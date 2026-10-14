@@ -696,11 +696,20 @@ fn a_geometry_whose_metadata_could_outgrow_a_segment_is_refused() {
     cfg.segments = 200;
     cfg.volumes = vec![(0, 16)];
     // One mapped block plus the segment table are two 8 KiB stripes; a
-    // segment holds one. Before the fix the format accepted this and the
-    // first data CP wedged for ever.
-    let err = Sim::new(cfg).unwrap_err();
-    assert!(err.contains("stripes"), "{err}");
-    // The same device with two-stripe segments is fine.
+    // segment holds one. In Step 3 the format refused this (its whole-map
+    // image had to fit one segment, E14); since Step 4 the metadata stream
+    // spans adjacent segments and the pool works (E22).
+    let mut s = sim_with(cfg);
+    s.boot().unwrap();
+    ok(&mut s, 0, 0, 1);
+    s.request_cp().unwrap();
+    assert_eq!(s.check_disk_prefix().unwrap(), 1);
+    ok(&mut s, 0, 5, 3);
+    s.request_cp().unwrap();
+    s.crash_power().unwrap();
+    s.boot().unwrap();
+    assert_eq!(s.verify_recovery().unwrap().k, 2);
+    // The same device with two-stripe segments is fine too.
     let mut cfg = small(111);
     cfg.stripe_bytes = 8 * 1024;
     cfg.stripes_per_segment = 2;
@@ -761,12 +770,20 @@ fn a_full_pool_refuses_writes_serves_reads_and_boots_after_a_daemon_crash() {
     let v = s.verify_recovery().unwrap();
     assert!(v.lost.is_empty());
     assert_eq!(s.read(0, 0, 7).unwrap().0, Status::Ok);
-    // Still full: the replayed write cannot be flushed, so it waits in the
-    // arena, and a clean shutdown stops without the clean marker.
+    // The boot commit took a segment of the reserve, and the metadata
+    // segment the boot CP's own table had leaked until the Step 4 review
+    // is recycled: the requested CP finds room for the replayed write, the
+    // pool is no longer full, and a clean shutdown lands its marker. (Before
+    // the review's fix the pool stayed full here and the shutdown stopped
+    // without the marker.)
     s.engine().request_cp();
     s.ticks(400).unwrap();
-    assert!(s.engine().is_pool_full());
+    assert!(!s.engine().is_pool_full(), "the replayed write was flushed");
+    assert_eq!(s.check_disk_prefix().unwrap(), s.model.last_op());
     s.shutdown_clean().unwrap();
+    // One segment is left, which the shutdown commit must not take (it is
+    // the boot's): the final CP finds no room and the engine stops without
+    // the clean marker; the arena keeps nothing unflushed by then.
     assert_eq!(
         s.last_stop(),
         Stop::Daemon,
@@ -774,7 +791,8 @@ fn a_full_pool_refuses_writes_serves_reads_and_boots_after_a_daemon_crash() {
     );
     s.boot().unwrap();
     let v = s.verify_recovery().unwrap();
-    assert!(v.lost.is_empty(), "the arena kept the unflushed write");
+    assert!(v.lost.is_empty(), "every acknowledged write is on disk");
+    assert_eq!(v.k, s.model.last_op());
 }
 
 #[test]
@@ -812,12 +830,16 @@ fn metadata_segments_are_recycled_so_empty_cps_never_exhaust_the_pool() {
 // Review defects, pinned: flush-opaque backstores (D3, D4, D14, D15 -> E19)
 // ---------------------------------------------------------------------------
 
+/// The owner's E19 ruling (E21): strict mode refuses a flush-opaque
+/// geometry at format and at boot, with the parts given back; the default
+/// mode accepts it, warns in the pool status and runs.
 #[test]
-fn flush_opaque_geometries_are_refused_until_the_owner_decides() {
+fn flush_opaque_geometries_follow_the_flush_policy() {
     let mut cfg = small(114);
     cfg.flush_opaque = true;
+    cfg.flush_policy = otap_cp::FlushPolicy::RequireFuaOrFlush;
     let err = Sim::new(cfg).unwrap_err();
-    assert!(err.contains("flush-opaque"), "{err}");
+    assert!(err.contains("RequireFuaOrFlush"), "{err}");
     // The boot refuses too, with the parts given back.
     let cfg = small(115);
     let clock = SimClock::new(WALL_BASE);
@@ -826,6 +848,7 @@ fn flush_opaque_geometries_are_refused_until_the_owner_decides() {
         .unwrap();
     let mut opaque = cfg.clone();
     opaque.flush_opaque = true;
+    opaque.flush_policy = otap_cp::FlushPolicy::RequireFuaOrFlush;
     let mut lying = SimBackstore::new(opaque.profile(), cfg.seed).unwrap();
     lying.corrupt_durable(0, disk.durable());
     let memory = HugeArena::anonymous(cfg.arena_bytes, HugePageSize::TwoMiB).unwrap();
@@ -837,10 +860,43 @@ fn flush_opaque_geometries_are_refused_until_the_owner_decides() {
         memory,
     )
     .expect_err("refused");
-    assert!(matches!(failure.error, EngineError::Unsupported(_)));
+    assert!(matches!(failure.error, EngineError::FlushOpaqueRefused));
     let (_, disk_back, _, _, memory_back) = failure.into_parts();
     assert_eq!(disk_back.durable().len(), disk.durable().len());
     assert_eq!(memory_back.len(), cfg.arena_bytes);
+    // The default policy trusts the barrier: the pool formats, boots with
+    // the structured warning, serves, and survives a power cut whose
+    // controller cache held (a healthy battery).
+    let mut cfg = small(116);
+    cfg.flush_opaque = true;
+    cfg.flush_policy = otap_cp::FlushPolicy::TrustBarrierWithNvfail;
+    cfg.cache_protected = true;
+    let mut s = sim_with(cfg);
+    s.boot().unwrap();
+    let status = s.engine().pool_status();
+    assert!(status.flush_opaque);
+    assert_eq!(
+        status.flush_policy,
+        otap_cp::FlushPolicy::TrustBarrierWithNvfail
+    );
+    assert!(matches!(
+        status.warnings.as_slice(),
+        [otap_cp::OperatorWarning::FlushOpaqueTrusted { .. }]
+    ));
+    assert!(s
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::OperatorWarning(_))));
+    ok(&mut s, 0, 0, 4);
+    s.request_cp().unwrap();
+    ok(&mut s, 1, 0, 2);
+    s.crash_power().unwrap();
+    s.boot().unwrap();
+    let verdict = s.verify_recovery().unwrap();
+    assert!(
+        verdict.k >= 1,
+        "the committed CP survived in the protected cache"
+    );
 }
 
 #[test]
@@ -1681,6 +1737,10 @@ impl Backstore for ErrDisk {
         self.inner.read(pba, dst)
     }
 
+    fn discard_segment(&mut self, pba: u64, bytes: u64, tag: Tag) -> Result<(), Busy> {
+        self.inner.discard_segment(pba, bytes, tag)
+    }
+
     fn poll(&mut self, out: &mut Vec<Done>) -> usize {
         let mut done = Vec::new();
         self.inner.poll(&mut done);
@@ -2214,6 +2274,17 @@ enum Op {
     },
     CrashDaemon,
     CleanRestart,
+    Punch {
+        vol: u8,
+        lba: u16,
+        blocks: u8,
+        zeroes: bool,
+    },
+    Snapshot {
+        vol: u8,
+    },
+    Fold,
+    CheckSnapshots,
     Device {
         max: u8,
         reorder: bool,
@@ -2231,6 +2302,11 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (1u8..=20).prop_map(Op::Ticks),
         1 => (0u8..=7).prop_map(Op::Advance),
         2 => Just(Op::RequestCp),
+        2 => (any::<u8>(), any::<u16>(), 1u8..=32, any::<bool>())
+            .prop_map(|(vol, lba, blocks, zeroes)| Op::Punch { vol, lba, blocks, zeroes }),
+        1 => any::<u8>().prop_map(|vol| Op::Snapshot { vol }),
+        1 => Just(Op::Fold),
+        1 => Just(Op::CheckSnapshots),
         1 => (0u8..4).prop_map(|tear| Op::CrashPower { tear }),
         1 => Just(Op::CrashDaemon),
         1 => Just(Op::CleanRestart),
@@ -2290,6 +2366,17 @@ impl Walk {
         self.s.verify_recovery()?;
         if power {
             self.s.clear_nvfail()?;
+        }
+        Ok(())
+    }
+
+    /// Every snapshot still reads its image, and the live diff against
+    /// each is exactly what changed since.
+    fn check_snapshots(&mut self) -> Result<(), String> {
+        self.s.verify_snapshots()?;
+        let ids: Vec<u64> = self.s.snaps.iter().map(|x| x.snap_id).collect();
+        for id in ids {
+            self.s.check_diff(id)?;
         }
         Ok(())
     }
@@ -2367,6 +2454,32 @@ impl Walk {
                     return Err(format!("read {vol}/{lba}+{blocks}: {status:?}"));
                 }
             }
+            Op::Punch {
+                vol,
+                lba,
+                blocks,
+                zeroes,
+            } => {
+                let (vol, lba, blocks) = self.pick(vol, lba, blocks);
+                let held = self.held(vol);
+                let done = self.s.punch(vol, lba, blocks, zeroes)?;
+                let expected = if held { Status::NvFailed } else { Status::Ok };
+                if done.status != expected {
+                    return Err(format!("punch {vol}/{lba}+{blocks}: {:?}", done.status));
+                }
+            }
+            Op::Snapshot { vol } => {
+                // A few per scenario: every snapshot pins data the pool
+                // cannot reclaim, and these pools are small.
+                let vol = u32::from(vol) % self.sizes.len() as u32;
+                if !self.held(vol) && self.s.snaps.len() < 3 {
+                    self.s.snapshot(vol)?;
+                }
+            }
+            Op::Fold => {
+                self.s.request_fold()?;
+            }
+            Op::CheckSnapshots => self.check_snapshots()?,
             Op::Ticks(n) => self.s.ticks(u32::from(n))?,
             Op::Advance(secs) => self.s.advance(u64::from(secs) * 1_000_000_000),
             Op::RequestCp => {
@@ -2451,6 +2564,7 @@ fn walk(sc: &Scenario) -> Result<(), String> {
             w.s.model.last_op()
         ));
     }
+    w.check_snapshots()?;
     if w.s.last_stop() != Stop::Clean {
         return Err("the last stop was not clean".into());
     }
@@ -2465,14 +2579,103 @@ proptest! {
     })]
 
     /// Random stripe geometries, volume counts, completion schedules, queue
-    /// depths, tear policies, write sizes up to 64 blocks, bursts of writes
-    /// in flight together and crashes with requests in flight (in both
-    /// nvfail modes), power cuts, daemon crashes and clean restarts, checked
-    /// by the harness's model after every recovery.
+    /// depths, tear policies, write sizes up to 64 blocks, punches, snapshots
+    /// and folds, bursts of writes in flight together and crashes with
+    /// requests in flight (in both nvfail modes), power cuts, daemon crashes
+    /// and clean restarts, checked by the harness's model after every
+    /// recovery, and the snapshot images and diffs on demand and at the end.
     #[test]
     fn random_geometries_schedules_bursts_and_crashes_recover(sc in scenario()) {
         if let Err(e) = walk(&sc) {
             prop_assert!(false, "{e}");
         }
+    }
+}
+
+/// Found by this walk right after the Step 4 review's fixes: a discard that
+/// completed while a CP was still staging its stripes was recorded as a
+/// free to re-apply when the CP's table copy landed, but that CP copied the
+/// table *after* the free, allocated the freed segment for its own
+/// metadata, and the re-applied free then handed the segment, with the
+/// snapshot's pinned page in it, to the next CP. A free is re-applied only
+/// for a CP that copied the table before it (one past its metadata
+/// preparation).
+#[test]
+fn a_free_that_lands_while_a_cp_is_staging_is_not_applied_twice() {
+    let sc = Scenario {
+        seed: 2542330785522,
+        precise: false,
+        geometry: 0,
+        volumes: 2,
+        ops: vec![
+            Op::Write {
+                vol: 0,
+                lba: 0,
+                blocks: 1,
+            },
+            Op::Write {
+                vol: 0,
+                lba: 0,
+                blocks: 8,
+            },
+            Op::RequestCp,
+            Op::Punch {
+                vol: 0,
+                lba: 0,
+                blocks: 1,
+                zeroes: false,
+            },
+            Op::Write {
+                vol: 0,
+                lba: 0,
+                blocks: 32,
+            },
+            Op::InflightCrash {
+                n: 2,
+                ticks: 1,
+                power: false,
+                seed: 9438,
+            },
+            Op::Write {
+                vol: 0,
+                lba: 0,
+                blocks: 32,
+            },
+            Op::Write {
+                vol: 0,
+                lba: 0,
+                blocks: 32,
+            },
+            Op::Write {
+                vol: 19,
+                lba: 0,
+                blocks: 38,
+            },
+            Op::Write {
+                vol: 89,
+                lba: 0,
+                blocks: 33,
+            },
+            Op::Write {
+                vol: 0,
+                lba: 0,
+                blocks: 32,
+            },
+            Op::RequestCp,
+            Op::Write {
+                vol: 0,
+                lba: 0,
+                blocks: 1,
+            },
+            Op::Snapshot { vol: 0 },
+            Op::Write {
+                vol: 0,
+                lba: 0,
+                blocks: 1,
+            },
+        ],
+    };
+    if let Err(e) = walk(&sc) {
+        panic!("{e}");
     }
 }

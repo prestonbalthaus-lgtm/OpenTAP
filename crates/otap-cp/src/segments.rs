@@ -1,8 +1,9 @@
 //! The segment table: which physical segments are in use, by which
 //! consistency point, and how much of each is live.
 //!
-//! Step 3 keeps `lseg == pseg` (no relocation; the cleaner is a later step)
-//! and never frees a segment. The table is written whole at every
+//! Step 4 keeps `lseg == pseg` (no relocation; the cleaner is a later step).
+//! Metadata segments and dead data segments are freed after a deferral
+//! (E24, E31). The table is written whole at every
 //! consistency point into the open metadata segment, and the superblock's
 //! `seg_table` root names that image exactly (E14).
 
@@ -242,5 +243,62 @@ impl SegmentTable {
             }
         }
         Ok(Self { entries })
+    }
+}
+
+impl SegmentTable {
+    /// Opens `count` consecutive free segments for `kind` (a region longer
+    /// than one segment spans physically adjacent segments, which the
+    /// layout keeps contiguous), keeping `reserve` segments free; returns
+    /// the first. The lowest run that fits is taken.
+    pub fn allocate_run(
+        &mut self,
+        kind: SegKind,
+        birth_cp: u32,
+        stripe_bytes: u32,
+        count: u32,
+        reserve: u32,
+    ) -> Result<u64, SegmentError> {
+        if count == 0 {
+            return Err(SegmentError::NoSpace);
+        }
+        if count == 1 {
+            return self.allocate_keeping(kind, birth_cp, stripe_bytes, reserve);
+        }
+        if self.free_count() < count.saturating_add(reserve) {
+            return Err(SegmentError::NoSpace);
+        }
+        let segments = self.segments();
+        let mut run_start = 0u64;
+        let mut run_len = 0u32;
+        let mut found = None;
+        for (pseg, entry) in self.iter() {
+            if entry.is_free() {
+                if run_len == 0 {
+                    run_start = pseg;
+                }
+                run_len += 1;
+                if run_len == count {
+                    found = Some(run_start);
+                    break;
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+        let _ = segments;
+        let first = found.ok_or(SegmentError::NoSpace)?;
+        for pseg in first..first + u64::from(count) {
+            let lap = self.entry(pseg)?.lap.wrapping_add(1).max(1);
+            let entry = SegEntry::open(pseg, stripe_bytes, birth_cp, lap, kind)?;
+            *self.entry_mut(pseg)? = entry;
+        }
+        Ok(first)
+    }
+
+    /// `true` when `pseg` is free.
+    #[must_use]
+    pub fn is_free(&self, pseg: u64) -> bool {
+        self.entry(pseg).is_ok_and(SegEntry::is_free)
     }
 }

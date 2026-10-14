@@ -69,26 +69,69 @@ pub fn superseded_blocks(runs: &[(RingRef, u32)]) -> u64 {
 pub const DEFAULT_RING: usize = 8;
 
 /// A run of dirty blocks: LBAs `lba..lba + blocks` (the map key is `lba`)
-/// held in arena slots `ring.slot..ring.slot + blocks` on lap `ring.lap`.
+/// held in arena slots `ring.slot..ring.slot + blocks` on lap `ring.lap`;
+/// or, with `hole` set, a run of blocks a discard punched, which holds no
+/// data and whose `ring` names the one arena slot carrying the discard's
+/// record (Step 4, E23). A hole reads as zeros and reaches the disk as map
+/// holes, never as stripe blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DirtyExtent {
-    /// The first slot.
+    /// The first slot, or the record slot of a hole.
     pub ring: RingRef,
     /// Blocks in the run, at least 1.
     pub blocks: u32,
     /// The sequence number of the write (the highest, once merged).
     pub seq: u64,
+    /// `true` for a punched hole.
+    pub hole: bool,
 }
 
 impl DirtyExtent {
+    /// A data run.
+    #[must_use]
+    pub const fn data(ring: RingRef, blocks: u32, seq: u64) -> Self {
+        Self {
+            ring,
+            blocks,
+            seq,
+            hole: false,
+        }
+    }
+
+    /// A punched hole whose record lives in slot `record`.
+    #[must_use]
+    pub const fn hole(record: RingRef, blocks: u32, seq: u64) -> Self {
+        Self {
+            ring: record,
+            blocks,
+            seq,
+            hole: true,
+        }
+    }
+
     /// The part of the extent from block `from` to block `to` (exclusive),
-    /// counted from its first block.
+    /// counted from its first block. A hole's record slot stays the same.
     #[must_use]
     pub const fn slice(&self, from: u32, to: u32) -> Self {
         Self {
-            ring: self.ring.offset(from),
+            ring: if self.hole {
+                self.ring
+            } else {
+                self.ring.offset(from)
+            },
             blocks: to - from,
             seq: self.seq,
+            hole: self.hole,
+        }
+    }
+
+    /// The slot of block `k` of the extent (the record slot for a hole).
+    #[must_use]
+    pub const fn slot_of(&self, k: u32) -> RingRef {
+        if self.hole {
+            self.ring
+        } else {
+            self.ring.offset(k)
         }
     }
 }
@@ -96,12 +139,14 @@ impl DirtyExtent {
 /// Where a block is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hit {
-    /// The block's own slot.
+    /// The block's own slot, or the record slot of the hole covering it.
     pub ring: RingRef,
     /// The sequence number of the extent holding it.
     pub seq: u64,
     /// The generation holding it.
     pub gen: GenId,
+    /// `true` when the block is a punched hole (zeros, no slot data).
+    pub hole: bool,
 }
 
 /// Why an operation was refused.
@@ -186,9 +231,10 @@ impl VolumeDirty {
     /// Inserts `ext` at `lba`: it wins its whole range, so the overlapped
     /// blocks of earlier extents are trimmed or split away; what remains is
     /// merged with neighbours whose slot runs continue it. Returns the arena
-    /// runs of the data superseded, whose slots the caller releases. (The
-    /// index above refuses out-of-order sequences; this map trusts the
-    /// order it is called in.)
+    /// runs of the data superseded, whose slots the caller releases (a hole
+    /// superseded releases nothing: its record slot is released when its
+    /// generation's consistency point commits). (The index above refuses
+    /// out-of-order sequences; this map trusts the order it is called in.)
     pub fn insert(&mut self, lba: u64, ext: DirtyExtent) -> Superseded {
         debug_assert!(ext.blocks > 0);
         let end = lba + u64::from(ext.blocks);
@@ -213,25 +259,45 @@ impl VolumeDirty {
             if ov_end < e_end {
                 self.put(ov_end, e.slice((ov_end - k) as u32, e.blocks));
             }
-            superseded.push((
-                e.ring.offset((ov_start - k) as u32),
-                (ov_end - ov_start) as u32,
-            ));
+            if !e.hole {
+                superseded.push((
+                    e.ring.offset((ov_start - k) as u32),
+                    (ov_end - ov_start) as u32,
+                ));
+            }
         }
         self.put(lba, ext);
         self.coalesce_around(lba, end);
         superseded
     }
 
-    /// The slot holding `lba`, with the extent's sequence number.
+    /// The slot holding `lba`, with the extent's sequence number (for a
+    /// hole, its record slot; see [`find`](Self::find)).
     #[must_use]
     pub fn lookup(&self, lba: u64) -> Option<(RingRef, u64)> {
+        self.find(lba)
+            .map(|(k, e)| (e.slot_of((lba - k) as u32), e.seq))
+    }
+
+    /// The extent holding `lba`, with its first LBA.
+    #[must_use]
+    pub fn find(&self, lba: u64) -> Option<(u64, &DirtyExtent)> {
         let (&k, e) = self.map.range(..=lba).next_back()?;
         if k + u64::from(e.blocks) > lba {
-            Some((e.ring.offset((lba - k) as u32), e.seq))
+            Some((k, e))
         } else {
             None
         }
+    }
+
+    /// Dirty blocks that hold data (holes excluded).
+    #[must_use]
+    pub fn data_blocks(&self) -> u64 {
+        self.map
+            .values()
+            .filter(|e| !e.hole)
+            .map(|e| u64::from(e.blocks))
+            .sum()
     }
 
     /// The extents in LBA order.
@@ -289,16 +355,25 @@ impl VolumeDirty {
                 i += 1;
                 continue;
             };
-            let contiguous = a_key + u64::from(a.blocks) == b_key
-                && a.ring.lap == b.ring.lap
-                && a.ring.slot + a.blocks == b.ring.slot
+            // Data runs merge when their slots continue each other; holes
+            // merge when they share one record slot (two pieces of a hole a
+            // later write split, or a re-attach produced).
+            let adjacent = a_key + u64::from(a.blocks) == b_key
+                && a.hole == b.hole
                 && u64::from(a.blocks) + u64::from(b.blocks) <= u64::from(u32::MAX);
+            let contiguous = adjacent
+                && if a.hole {
+                    a.ring == b.ring
+                } else {
+                    a.ring.lap == b.ring.lap && a.ring.slot + a.blocks == b.ring.slot
+                };
             if contiguous {
                 self.remove(b_key, &b);
                 let merged = DirtyExtent {
                     ring: a.ring,
                     blocks: a.blocks + b.blocks,
                     seq: a.seq.max(b.seq),
+                    hole: a.hole,
                 };
                 self.blocks -= u64::from(a.blocks);
                 self.map.insert(a_key, merged);
@@ -424,10 +499,11 @@ impl Generation {
     fn lookup(&self, vol: u32, lba: u64) -> Option<Hit> {
         let cell = self.vols.get(vol as usize)?;
         let guard = cell.lock();
-        guard.lookup(lba).map(|(ring, seq)| Hit {
-            ring,
-            seq,
+        guard.find(lba).map(|(k, e)| Hit {
+            ring: e.slot_of((lba - k) as u32),
+            seq: e.seq,
             gen: self.id,
+            hole: e.hole,
         })
     }
 }

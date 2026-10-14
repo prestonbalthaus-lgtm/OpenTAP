@@ -1,45 +1,54 @@
-//! The checker model: every write the client issued, what the engine
-//! answered, and the rules a recovered image must satisfy.
+//! The checker model: every write and punch the client issued, what the
+//! engine answered, and the rules a recovered image must satisfy.
 //!
 //! Every block a write carries is self-describing: its first bytes name the
 //! write (the harness's operation number), the volume, the LBA and the
 //! block's position in the write, and the rest is a fill derived from them.
-//! A recovered block therefore says which write it came from, or that it was
-//! never written (all zero), or that it is garbage (which the checker treats
-//! as a failure).
+//! A recovered block therefore says which write it came from, or that it
+//! holds zeros (never written, or punched), or that it is garbage (which the
+//! checker treats as a failure). A *punch* (a discard or a write of zeros)
+//! is an operation like a write whose blocks read as zeros.
 //!
 //! # The rules (section 7.7, invariants 1 and 6)
 //!
-//! The engine places writes in the order the client issued them (reads may
-//! pass a deferred write; writes never pass each other), and a consistency
-//! point carries whole generations, which are contiguous ranges of that
-//! order. So whatever a crash leaves behind is the state after applying the
-//! issued writes up to some operation number `j`, acknowledged or not:
+//! The engine places operations in the order the client issued them (reads
+//! may pass a deferred write; writes and punches never pass each other), and
+//! a consistency point carries whole generations, which are contiguous
+//! ranges of that order. So whatever a crash leaves behind is the state
+//! after applying the issued operations up to some operation number `j`,
+//! acknowledged or not:
 //!
-//! - every block holds the newest issued write with `op <= j` that covered
-//!   it, or zeros if none did ([`Model::check_prefix`] finds `j` as the
-//!   highest operation number any block holds, then checks every block);
-//! - an *acknowledged* write with `op > j` is lost; after a daemon crash or
-//!   a clean restart there is none; after a power cut its volume must be
-//!   held by nvfail;
-//! - an unacknowledged write with `op > j` simply never happened (the client
-//!   never heard of it), and one with `op <= j` was placed before the crash
-//!   and lives on like an acknowledged one: [`Model::settle`] records both
-//!   outcomes once a recovery was checked;
+//! - every block holds the newest issued operation with `op <= j` that
+//!   covered it (zeros for a punch), or zeros if none did
+//!   ([`Model::check_prefix`] finds `j` as the highest operation number any
+//!   data block holds, raised to the punches that must have landed for a
+//!   zero block to be explained, then checks every block);
+//! - an *acknowledged* operation with `op > j` is lost; after a daemon
+//!   crash or a clean restart there is none; after a power cut its volume
+//!   must be held by nvfail;
+//! - an unacknowledged operation with `op > j` simply never happened (the
+//!   client never heard of it), and one with `op <= j` was placed before
+//!   the crash and lives on like an acknowledged one: [`Model::settle`]
+//!   records both outcomes once a recovery was checked;
 //! - nvfail after a dirty boot holds every volume that lost an acknowledged
-//!   write, holds no volume after a clean shutdown, and in precise mode
-//!   holds no volume idle for two consistency points (a write issued but
-//!   never acknowledged still counts as activity: its intent may have
+//!   operation, holds no volume after a clean shutdown, and in precise mode
+//!   holds no volume idle for two consistency points (an operation issued
+//!   but never acknowledged still counts as activity: its intent may have
 //!   landed).
+//!
+//! A snapshot is the image of a volume at the moment it was taken, which
+//! [`Model::image_of`] computes while nothing is in flight; the harness
+//! keeps it and checks the engine's snapshot reads against it for as long
+//! as the snapshot exists.
 
 use std::collections::{BTreeMap, HashMap};
 
 use otap_format::{VolBitSet, BLOCK_SIZE};
 
-/// A write the client issued.
+/// A write or punch the client issued.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteRecord {
-    /// The operation number (1 and up); embedded in the data.
+    /// The operation number (1 and up); embedded in the data of a write.
     pub op: u64,
     /// The volume.
     pub vol: u32,
@@ -57,12 +66,14 @@ pub struct WriteRecord {
     /// The index (among generation commits the harness saw) of the
     /// consistency point that carried the write, once one did.
     pub committed_at: Option<u64>,
+    /// A discard or a write of zeros: its blocks read as zeros.
+    pub punch: bool,
 }
 
 /// What a recovered block decoded to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decoded {
-    /// Never written.
+    /// Never written, or punched.
     Zero,
     /// Block `k` of write `op`.
     Write {
@@ -74,6 +85,10 @@ pub enum Decoded {
     /// Neither.
     Garbage,
 }
+
+/// What a block of a volume should hold: the newest operation covering it
+/// and the block's position in that operation, or nothing.
+pub type Expected = Option<(u64, u32, bool)>;
 
 /// The model.
 #[derive(Debug, Clone, Default)]
@@ -104,6 +119,16 @@ pub fn block_data(op: u64, vol: u32, lba: u64, k: u32) -> Vec<u8> {
         *byte = (x & 0xff) as u8;
     }
     block
+}
+
+/// The data a block should hold under an expectation: the write's block,
+/// or zeros for a punch or nothing.
+#[must_use]
+pub fn expected_data(vol: u32, lba: u64, expected: Expected) -> Vec<u8> {
+    match expected {
+        Some((op, pos, false)) => block_data(op, vol, lba - u64::from(pos), pos),
+        _ => vec![0u8; BLOCK_SIZE],
+    }
 }
 
 /// Decodes a recovered block.
@@ -160,6 +185,15 @@ impl Model {
     /// Records a write the client issued (not yet answered). Operation
     /// numbers must increase.
     pub fn issued(&mut self, op: u64, vol: u32, lba: u64, blocks: u32) {
+        self.issue(op, vol, lba, blocks, false);
+    }
+
+    /// Records a punch (a discard or a write of zeros) the client issued.
+    pub fn issued_punch(&mut self, op: u64, vol: u32, lba: u64, blocks: u32) {
+        self.issue(op, vol, lba, blocks, true);
+    }
+
+    fn issue(&mut self, op: u64, vol: u32, lba: u64, blocks: u32, punch: bool) {
         debug_assert!(self.writes.last().is_none_or(|w| w.op < op));
         let index = self.writes.len();
         for k in 0..blocks {
@@ -177,10 +211,11 @@ impl Model {
             acked: false,
             landed: false,
             committed_at: None,
+            punch,
         });
     }
 
-    /// Records that the engine acknowledged write `op` with `seq`.
+    /// Records that the engine acknowledged operation `op` with `seq`.
     pub fn acked(&mut self, op: u64, seq: u64) {
         if let Some(w) = self.writes.iter_mut().find(|w| w.op == op) {
             w.acked = true;
@@ -188,7 +223,7 @@ impl Model {
         }
     }
 
-    /// Records that the engine refused write `op`: it never happened.
+    /// Records that the engine refused operation `op`: it never happened.
     pub fn refused(&mut self, op: u64) {
         self.writes.retain(|w| w.op != op);
         self.reindex();
@@ -201,22 +236,22 @@ impl Model {
         self.acked(op, seq);
     }
 
-    /// Every write issued and not refused, in operation order.
+    /// Every operation issued and not refused, in operation order.
     #[must_use]
     pub fn writes(&self) -> &[WriteRecord] {
         &self.writes
     }
 
-    /// Writes issued and neither acknowledged nor found landed.
+    /// Operations issued and neither acknowledged nor found landed.
     #[must_use]
     pub fn unresolved(&self) -> usize {
         self.writes.iter().filter(|w| !w.acked && !w.landed).count()
     }
 
-    /// Settles a checked recovery at prefix `j`: every write above `j` is
-    /// gone (the acknowledged ones were lost, the others never happened),
-    /// every write at or below it is part of the image. Returns how many
-    /// acknowledged writes were lost.
+    /// Settles a checked recovery at prefix `j`: every operation above `j`
+    /// is gone (the acknowledged ones were lost, the others never
+    /// happened), every operation at or below it is part of the image.
+    /// Returns how many acknowledged operations were lost.
     pub fn settle(&mut self, j: u64) -> usize {
         let lost = self.writes.iter().filter(|w| w.acked && w.op > j).count();
         self.writes.retain(|w| w.op <= j);
@@ -239,19 +274,29 @@ impl Model {
         }
     }
 
-    /// The newest write with `op <= limit` covering the block, and the
-    /// block's position in it.
+    /// The newest operation with `op <= limit` covering the block, the
+    /// block's position in it, and whether it is a punch.
     #[must_use]
-    pub fn expected(&self, vol: u32, lba: u64, limit: u64) -> Option<(u64, u32)> {
+    pub fn expected(&self, vol: u32, lba: u64, limit: u64) -> Expected {
         let list = self.by_block.get(&(vol, lba))?;
         list.iter()
             .rev()
             .map(|i| &self.writes[*i])
             .find(|w| w.op <= limit)
-            .map(|w| (w.op, (lba - w.lba) as u32))
+            .map(|w| (w.op, (lba - w.lba) as u32, w.punch))
     }
 
-    /// The newest acknowledged (or landed) write's operation number.
+    /// The whole image of `vol` as the issued operations leave it: what a
+    /// snapshot taken now holds, meaningful while nothing is in flight.
+    #[must_use]
+    pub fn image_of(&self, vol: u32) -> Vec<Expected> {
+        let size = self.sizes.get(&vol).copied().unwrap_or(0);
+        (0..size)
+            .map(|lba| self.expected(vol, lba, u64::MAX))
+            .collect()
+    }
+
+    /// The newest acknowledged (or landed) operation's number.
     #[must_use]
     pub fn last_op(&self) -> u64 {
         self.writes
@@ -262,7 +307,7 @@ impl Model {
     }
 
     /// Checks that `image` (every block of every volume, as `read` returns
-    /// them) is the state after the issued writes up to some operation
+    /// them) is the state after the issued operations up to some operation
     /// number `j`, and returns `j` (0 for an empty image).
     pub fn check_prefix<R>(&self, mut read: R) -> Result<u64, String>
     where
@@ -281,6 +326,7 @@ impl Model {
                     Decoded::Write { op, .. } => {
                         if !self.writes.iter().any(|w| {
                             w.op == op
+                                && !w.punch
                                 && w.vol == vol
                                 && lba >= w.lba
                                 && lba < w.lba + u64::from(w.blocks)
@@ -296,11 +342,52 @@ impl Model {
                 decoded.push((vol, lba, d));
             }
         }
-        for (vol, lba, d) in decoded {
-            let expected = self.expected(vol, lba, j);
-            let ok = match (d, expected) {
-                (Decoded::Zero, None) => true,
-                (Decoded::Write { op, k: pos }, Some((e_op, e_pos))) => op == e_op && pos == e_pos,
+        // A zero block where the prefix expects data means a later punch
+        // landed: the prefix reaches at least the oldest punch above `j`
+        // that covers the block. Raising `j` can change other blocks'
+        // expectations, so iterate to a fixed point (the bound only rises).
+        loop {
+            let mut raised = false;
+            for (vol, lba, d) in &decoded {
+                if *d != Decoded::Zero {
+                    continue;
+                }
+                if let Some((_, _, false)) = self.expected(*vol, *lba, j) {
+                    let next_punch = self
+                        .by_block
+                        .get(&(*vol, *lba))
+                        .into_iter()
+                        .flatten()
+                        .map(|i| &self.writes[*i])
+                        .filter(|w| w.punch && w.op > j)
+                        .map(|w| w.op)
+                        .min();
+                    match next_punch {
+                        Some(p) => {
+                            j = p;
+                            raised = true;
+                        }
+                        None => {
+                            return Err(format!(
+                                "volume {vol} LBA {lba}: zeros where write {:?} is expected under \
+                                 prefix bound {j} and no later punch covers it",
+                                self.expected(*vol, *lba, j)
+                            ));
+                        }
+                    }
+                }
+            }
+            if !raised {
+                break;
+            }
+        }
+        for (vol, lba, d) in &decoded {
+            let expected = self.expected(*vol, *lba, j);
+            let ok = match (*d, expected) {
+                (Decoded::Zero, None) | (Decoded::Zero, Some((_, _, true))) => true,
+                (Decoded::Write { op, k: pos }, Some((e_op, e_pos, false))) => {
+                    op == e_op && pos == e_pos
+                }
                 _ => false,
             };
             if !ok {
@@ -309,10 +396,30 @@ impl Model {
                 ));
             }
         }
+        // Zeros are ambiguous: a punch over a write leaves what nothing at
+        // all would. The image may therefore equal the state after a later
+        // operation too; the prefix is the largest operation number whose
+        // state it equals (what a reader cannot tell apart was not lost).
+        let consistent_at = |limit: u64| {
+            decoded.iter().all(
+                |(vol, lba, d)| match (d, self.expected(*vol, *lba, limit)) {
+                    (Decoded::Zero, None) | (Decoded::Zero, Some((_, _, true))) => true,
+                    (Decoded::Write { op, k: pos }, Some((e_op, e_pos, false))) => {
+                        *op == e_op && *pos == e_pos
+                    }
+                    _ => false,
+                },
+            )
+        };
+        for w in &self.writes {
+            if w.op > j && consistent_at(w.op) {
+                j = w.op;
+            }
+        }
         Ok(j)
     }
 
-    /// Volumes with an acknowledged write above `j`: the writes a crash at
+    /// Volumes with an acknowledged operation above `j`: what a crash at
     /// prefix `j` lost.
     #[must_use]
     pub fn lost_volumes(&self, j: u64) -> VolBitSet {
@@ -326,8 +433,8 @@ impl Model {
     }
 
     /// Records that generation commit number `cp_index` carried every
-    /// acknowledged write with a sequence number up to `max_seq`, and every
-    /// write issued before one of those.
+    /// acknowledged operation with a sequence number up to `max_seq`, and
+    /// every operation issued before one of those.
     pub fn mark_committed(&mut self, max_seq: u64, cp_index: u64) {
         let mut last_op = 0u64;
         for w in &self.writes {
@@ -345,10 +452,10 @@ impl Model {
     }
 
     /// Volumes precise mode may still hold after `cps_now` generation
-    /// commits: those with a write (issued, acknowledged or not) not yet
-    /// carried by a consistency point, and those whose last carried write
-    /// is at most one commit old (the bit clears at the second consistency
-    /// point without a write, section 7.6).
+    /// commits: those with an operation (issued, acknowledged or not) not
+    /// yet carried by a consistency point, and those whose last carried
+    /// operation is at most one commit old (the bit clears at the second
+    /// consistency point without a write, section 7.6).
     #[must_use]
     pub fn recently_active(&self, cps_now: u64) -> VolBitSet {
         let mut set = VolBitSet::EMPTY;

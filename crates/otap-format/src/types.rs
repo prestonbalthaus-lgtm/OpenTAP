@@ -188,6 +188,11 @@ pub(crate) const fn major_of(ver: u16) -> u8 {
     (ver >> 8) as u8
 }
 
+/// The minor of a `ver` field.
+pub(crate) const fn minor_of(ver: u16) -> u8 {
+    ver as u8
+}
+
 pub(crate) fn check_major(ver: u16, expected_major: u8) -> Result<(), FormatError> {
     if major_of(ver) == expected_major {
         Ok(())

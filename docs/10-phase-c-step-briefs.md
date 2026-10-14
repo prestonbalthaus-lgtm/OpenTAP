@@ -305,3 +305,123 @@ the following:
   fit the two-CP ring of F7. The engine refuses the geometry and the owner
   decides between the two designs in E19 before Step 4 drives a RAID
   virtual drive.
+
+---
+
+## Step 4 brief (received 2026-10-13)
+
+The message opened with "ok its been updated, time to move onto step 4" and
+pasted the following:
+
+> # OpenTAP Step 4 Implementation Brief: Radix Map, Geometry Discovery, Linux `io_uring` Backstore, and `ublk` Front Door
+>
+> **Role Definition:**
+> You are Fable 5.1, Lead Systems Architect and Engineering Director for **OpenTAP**. Step 3 (`otap-arena`, `otap-index`, `otap-cp`, `otap-sim`) is complete, merged to `main`, and passing all 318 unit tests and the 10,000-case `proptest` gate. You are now directing **Step 4**.
+>
+> ---
+>
+> ## 1. Executive Rulings on Open Decisions (Record in `06` & Engineering Log)
+>
+> Before writing Step 4 code, record and enforce the project owner's binding rulings on the open architectural items:
+>
+> 1. **Decision E19 (Flush-Opaque Backstores & Hardware RAID Compatibility):**
+>    * **Ruling:** OpenTAP MUST NOT hard-refuse flush-opaque backstores in production. A core requirement of OpenTAP is Ceph-like hardware agnosticism across Dell PERC, MegaRAID, HPE Smart Array virtual disks, `mdadm`, and raw drives.
+>    * **Mechanism:** Introduce a `FlushPolicy` / `BackstoreCapabilities` configuration mode:
+>      * Strict mode (`RequireFuaOrFlush`) remains available for strict verification.
+>      * Standard/Homelab mode (`TrustBarrierWithNvfail`, default for hardware RAID / opaque LUNs) accepts devices that do not expose FUA or transparent cache reporting. It enforces a strict host-side barrier (`fdatasync` / `IORING_OP_FSYNC` completion) after stripe + map writes and *before* issuing the `A0/A1/B0/B1` superblock commit, emits a structured operator warning in the pool status, and relies on `nvfail` to quarantine volumes if an ungraceful power loss corrupts an un-flushed controller cache.
+> 2. **Decision D1 / D2 / D8 / D9 / D10 Closure:**
+>    * **D1 (Hardware Phasing):** Execute Phase C (Single-Node v0.1) $\rightarrow$ Phase B (Dual-Node internal drives with async SnapMirror delta shipping) $\rightarrow$ Phase A (Shared SAS shelf).
+>    * **D2 (Degraded Durability):** Lock `unmirrored_flush = placed` as the default. Never throttle client writes to disk speeds when a partner or witness node is unreachable; acknowledge at DRAM speed and assert a degraded cluster health alert.
+>    * **D8 (Protocol Rollout Order):** 1. iSCSI (`LIO` over `ublk`) $\rightarrow$ 2. NFSv3/v4.1 & SMB3 (in SVM `netns`/`utsns`) $\rightarrow$ 3. Fibre Channel (`tcm_qla2xxx`) & S3 (`versitygw`).
+>    * **D9 (Provisioning & Trim Posture):** Volumes are thin-provisioned by default (`nvfail = on` by default). Segment reclamation uses whole-segment `BLKDISCARD` on flash/SSD backstores and sequential stripe overwrite without discard on rotational HDD / hardware RAID backstores.
+>    * **D10 (Witness Placement):** 3rd Raft voter (Phase B/A) runs on the local LAN (VM, container, or Raspberry Pi) with `<100ms` RTT. Witness failure never degrades or throttles storage I/O.
+>
+> ---
+>
+> ## 2. Step 4 Objectives & Task Delegation
+>
+> Your mandate for Step 4 is to lift the single-segment metadata limit via `otap-map`, build hardware geometry discovery (`otap-geom`), implement the real Linux `io_uring` `Backstore` alongside cross-platform host compilation, and implement the `otap-ublk` front door.
+>
+> Direct four specialized Opus 5.5 worker agents:
+>
+> ### 1. Opus-Storage-Map (`crates/otap-map` & `otap-cp` Integration)
+> * Create `crates/otap-map` (`#![forbid(unsafe_code)]`) implementing the persistent two-level Radix Map and `CpLogRec` delta journal defined in `otap-format`:
+>   * **Two-Level Radix Tree:** Manage 16 KiB `MapPage` nodes (L1 root directory $\rightarrow$ L0 leaf pages of 1,024 packed `lseg:36 | off:16 | plen:12` entries) with Copy-on-Write dirty page tracking per CP.
+>   * **Fast CP Logging (`CpLogPage` / `CpLogRec`):** Allow CPs to log incremental extent updates via `CpLogPage` records and periodically fold dirty leaf pages into full map segments, lifting Step 3's single-segment metadata limit.
+>   * **Snapshot Pinning & `birth_cp` Walk:** Support pinning a volume's root at any CP into a `SnapRecord` and walking extents with `birth_cp > base_cp` to feed `otap-stream` delta shipping and segment live-byte accounting (`SegEntry::live_bytes`).
+> * Wire `otap-map` into `otap-cp` so multi-segment pools and snapshots persist and recover cleanly across simulated crashes.
+>
+> ### 2. Opus-Storage-Geom (`crates/otap-geom` & Linux `IoUringBackstore`)
+> * Create `crates/otap-geom` (`#![forbid(unsafe_code)]`):
+>   * Inspect Linux sysfs queue parameters (`/sys/block/<dev>/queue/rotational`, `minimum_io_size`, `optimal_io_size`, `alignment_offset`, `discard_granularity`, `write_cache`, `fua`) with deterministic mock inputs for Windows/unit testing.
+>   * Compute the optimal `StripeGeometry` (aligning stripe width and chunk size to hardware RAID or `mdadm` `optimal_io_size`, selecting 8 MiB flash segments vs. large rotational segments, and deriving the E19 `FlushPolicy`).
+> * Implement the production Linux `Backstore` driver (`UringBackstore` in `otap-cp` or `otap-backstore` via `otap-sys`):
+>   * Use `O_DIRECT` + `io_uring` batched vectored writes for stripes and map segments, `IORING_OP_FSYNC` (`FSYNC_DATASYNC`) barriers, and ordered `A` then `B` superblock slot writes.
+>   * Keep Linux-specific execution gated behind `#[cfg(target_os = "linux")]` with full cross-target compilation (`x86_64-unknown-linux-gnu`) and portable file-backed fallback so `cargo test --workspace` continues to run on the Windows host.
+>
+> ### 3. Opus-Protocols-Ublk (`crates/otap-ublk`)
+> * Create `crates/otap-ublk`:
+>   * Implement the `FrontDoor` trait bridging incoming block requests (`Read`, `Write`, `Flush`, `Discard`, `WriteZeroes`) into the D-Blade engine (`otap-arena`, `otap-index`, `otap-cp`).
+>   * Provide the Linux `ublk` runner (`#[cfg(target_os = "linux")]`) using `otap-sys::ublk` (`UBLK_F_USER_COPY`) and provide a platform-agnostic loop/channel driver so the entire `otap-ublk` command state machine (including `nvfail` `EIO` / offline rejection, read-hit from dirty arena vs. read-miss from `otap-map`/`Backstore`, and write backpressure watermarks) is 100% unit- and property-tested on Windows.
+>
+> ### 4. Opus-QA-Adversarial (Independent Audit & 10k Property Gate)
+> * Perform an independent adversarial review across `otap-map`, `otap-geom`, `otap-ublk`, and the updated `otap-cp`.
+> * Add `proptest` suites in `otap-sim` verifying:
+>   * Multi-segment radix map persistence, `CpLogRec` replay, and snapshot read isolation across random power-loss crashes.
+>   * Hybrid read path correctness (reading a 4 KiB range that partially overlaps the active volatile `otap-index`, the frozen flushing generation, and committed on-disk `otap-map` extents).
+>   * E19 `TrustBarrierWithNvfail` behavior when the backstore caches writes up to the explicit `fdatasync` barrier.
+>
+> ---
+>
+> ## 3. Gates & Deliverables
+> 1. All new and updated crates committed cleanly to the repository.
+> 2. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` (on both host Windows and `--target x86_64-unknown-linux-gnu`), `fuzz` clippy, and `cargo doc -D warnings` must be 100% clean.
+> 3. `cargo test --workspace` and `PROPTEST_CASES=10000` must pass completely.
+> 4. Update the status and engineering log documentation (`06`) with the E19, D1, D2, D8, D9, and D10 rulings and the Step 4 verification report.
+
+### How Step 4 was read
+
+- The rulings of section 1 were recorded first (E21 in
+  `07-engineering-decisions.md`, the status in `06`, this log's Step 4
+  entry) and the E19 part was built: `FlushPolicy` with the strict and the
+  trust mode, the barrier where E17 already had it, the structured warning
+  in the pool status, the deferred free, nvfail doing the quarantine.
+  Nothing in D1, D8 or D10 has code yet; D2's "ack at DRAM speed" is how
+  the engine has always completed a flush; D9's trim posture is the
+  `DiscardPolicy`.
+- "Two-Level Radix Tree: 16 KiB `MapPage` nodes": the format's `MapPage`
+  (Step 2, F8) is 1,024 packed entries of `lseg:36 | off:16 | plen:12`
+  with a birth each, and the index above it one `PageIndexEntry` per page;
+  the page size is the format's, not the brief's figure. Copy-on-write
+  dirty page tracking per CP is the fold (E22): between folds the CP log
+  carries the changes and an in-memory overlay answers lookups, which is
+  the "fast CP logging" the brief asks for.
+- "pinning a volume's root at any CP into a `SnapRecord`": at any *fold*
+  CP (the engine makes the snapshot's CP a fold), because a root is
+  complete only then (E25). The `birth_cp > base_cp` walk is `diff`,
+  `live_diff` and `snapshot_diff`; `SegEntry::live_bytes` is kept as
+  `data_live` and `meta_live` in the segment table (E24).
+- "`UringBackstore` in `otap-cp` or `otap-backstore`": its own crate, with
+  the ring in `otap-sys` (E27), so `otap-cp` stays free of `unsafe` and
+  of Linux types. "Batched vectored writes": the ring batches submissions
+  and stages each write in an aligned slot; one write per stripe, which
+  is already the engine's unit, rather than `writev`.
+- "deriving the E19 `FlushPolicy`": a hardware RAID virtual disk is
+  flush-opaque and gets the trust policy; everything else the strict one;
+  an operator override exists (E26).
+- "platform-agnostic loop/channel driver": the `Transport` trait and its
+  `MockTransport` (E28); the state machine never names a ring, so every
+  path, including nvfail `EIO`, offline `ENODEV`, the read hit from the
+  arena against the read miss from the map, the watermarks, aborts and
+  stale completions, runs under unit and property tests on the Windows
+  PC and behind the engine over the simulator's device.
+- "Opus-QA-Adversarial": the independent review ran as in Step 3 (a
+  worker with its own test files, the lead porting its `bug_*` tests and
+  fixing); its findings are in this log's Step 4 entry. The brief's three
+  proptest subjects are `step4_sim_tests.rs` and the extended random walk
+  of `adversarial_sim_tests.rs`.
+- The gates of section 3 were run as listed in `06`, section 5; the
+  Linux halves (`otap-sys::block`, the ublk device module,
+  `UringBackstore`, `Sysfs`) are type-checked for
+  `x86_64-unknown-linux-gnu` and have not executed, which the owner knows
+  from Step 2 (no Linux host).

@@ -1167,7 +1167,351 @@ mod linux {
             self.fd.as_raw_fd()
         }
     }
+
+    use io_uring::{cqueue, IoUring};
+    use memmap2::{Mmap, MmapOptions};
+    use rustix::io::{pread, pwrite};
+    use zerocopy::FromBytes;
+
+    use super::{
+        checked_user_copy_offset, UblksrvIoDesc, UBLKSRV_CMD_BUF_OFFSET, UBLK_MAX_QUEUE_DEPTH,
+    };
+
+    /// The control device with a private ring of 128-byte SQEs, running
+    /// one control command at a time, synchronously: what device creation
+    /// and teardown need (`ADD_DEV`, `SET_PARAMS`, `START_DEV`,
+    /// `STOP_DEV`, `DEL_DEV`, the recovery pair).
+    pub struct UblkControlRing {
+        control: UblkControl,
+        ring: IoUring<squeue::Entry128, cqueue::Entry>,
+    }
+
+    impl UblkControlRing {
+        /// A private two-entry SQE128 ring over `control`.
+        ///
+        /// # Errors
+        /// The `io_uring_setup(2)` error.
+        pub fn new(control: UblkControl) -> io::Result<Self> {
+            let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder().build(2)?;
+            Ok(Self { control, ring })
+        }
+
+        /// The control device.
+        #[must_use]
+        pub const fn control(&self) -> &UblkControl {
+            &self.control
+        }
+
+        /// Runs `cmd` and returns its result (0, or a negative errno which
+        /// is also returned as an error). `buf` is the command's IN or OUT
+        /// buffer and must be the one `cmd.header.addr` names with
+        /// `cmd.header.len` bytes (checked), so it is alive for the call.
+        ///
+        /// # Errors
+        /// A buffer that does not match the command, the ring's error, or
+        /// the command's negative result as an OS error.
+        pub fn execute(&mut self, cmd: &CtrlCommand, buf: Option<&mut [u8]>) -> io::Result<i32> {
+            match &buf {
+                Some(b) => {
+                    if b.as_ptr().expose_provenance() as u64 != cmd.header.addr
+                        || b.len() != usize::from(cmd.header.len)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "the buffer is not the one the command names",
+                        ));
+                    }
+                }
+                None => {
+                    if cmd.header.addr != 0 || cmd.header.len != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "the command names a buffer that was not given",
+                        ));
+                    }
+                }
+            }
+            let sqe = self
+                .control
+                .command_sqe(cmd)
+                .user_data(u64::from(cmd.cmd_op));
+            // SAFETY: `push` requires the entry's addresses to stay valid
+            // for the operation. The only memory the entry names is `buf`,
+            // which the caller lends for the whole call (checked above to
+            // be exactly the command's address and length) and which this
+            // function does not return from until the CQE is reaped or
+            // the ring is closed with the entry never submitted.
+            let pushed = unsafe { self.ring.submission().push(&sqe) };
+            if pushed.is_err() {
+                return Err(io::Error::other("the control ring refused its entry"));
+            }
+            let result = loop {
+                match self.ring.submit_and_wait(1) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        // Keep `buf` alive until the kernel is known to be
+                        // done: a submitted entry with no CQE is waited
+                        // for, a never-submitted one is dropped with the
+                        // ring.
+                        if self.ring.submission().is_empty() {
+                            let mut sink = 0;
+                            while self.ring.completion().next().is_none() && sink < 1_000_000 {
+                                let _ = self.ring.submit_and_wait(1);
+                                sink += 1;
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+                if let Some(cqe) = self.ring.completion().next() {
+                    break cqe.result();
+                }
+            };
+            let _ = buf;
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result));
+            }
+            Ok(result)
+        }
+    }
+
+    impl std::fmt::Debug for UblkControlRing {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("UblkControlRing")
+                .field("control", &self.control)
+                .finish()
+        }
+    }
+
+    /// `sizeof(struct ublksrv_io_desc) * UBLK_MAX_QUEUE_DEPTH`: the stride
+    /// of one queue's descriptor array in the `mmap` offset space of
+    /// `/dev/ublkcN` (`ublk_ch_mmap`, `drivers/block/ublk_drv.c`).
+    pub const UBLK_QUEUE_CMD_BUF_STRIDE: u64 =
+        size_of::<UblksrvIoDesc>() as u64 * UBLK_MAX_QUEUE_DEPTH as u64;
+
+    /// One hardware queue of a ublk device served from this process: the
+    /// character device, a ring of 64-byte SQEs for its `FETCH_REQ` and
+    /// `COMMIT_AND_FETCH_REQ` commands, and the read-only mapping of the
+    /// queue's request descriptors. Every command of the queue must be
+    /// issued from the thread that issued its first fetch (the driver pins
+    /// the queue to that task).
+    pub struct UblkQueue {
+        chr: UblkChar,
+        ring: IoUring<squeue::Entry, cqueue::Entry>,
+        descs: Mmap,
+        q_id: u16,
+        depth: u16,
+        pushed: usize,
+    }
+
+    impl UblkQueue {
+        /// Queue `q_id` of `chr`, `depth` tags deep (at most
+        /// [`UBLK_MAX_QUEUE_DEPTH`]), with a ring of `entries` entries (at
+        /// least `depth`).
+        ///
+        /// # Errors
+        /// The `mmap(2)` or `io_uring_setup(2)` error, or a depth over the
+        /// bound.
+        pub fn new(chr: UblkChar, q_id: u16, depth: u16, entries: u32) -> io::Result<Self> {
+            if depth == 0 || u32::from(depth) > UBLK_MAX_QUEUE_DEPTH {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "queue depth out of range",
+                ));
+            }
+            let bytes = usize::from(depth) * size_of::<UblksrvIoDesc>();
+            let len = bytes.next_multiple_of(4096);
+            let offset = UBLKSRV_CMD_BUF_OFFSET + u64::from(q_id) * UBLK_QUEUE_CMD_BUF_STRIDE;
+            // SAFETY: memmap2 requires that the mapped file not be changed
+            // underneath the mapping in ways the mapping does not expect.
+            // The descriptor array of a ublk queue is driver memory that
+            // the driver writes exactly once per request, before it
+            // completes that request's fetch, and this value reads a
+            // descriptor only after reaping that completion (`desc` takes
+            // the tag of a reaped fetch), so no read overlaps a write. The
+            // mapping is read-only (`map`, not `map_mut`) and the driver
+            // enforces `offset` and `len` (`ublk_ch_mmap` refuses any other
+            // length than the page-rounded array of this queue).
+            let descs = unsafe { MmapOptions::new().offset(offset).len(len).map(&chr) }?;
+            let ring = IoUring::builder().build(entries.max(u32::from(depth)))?;
+            Ok(Self {
+                chr,
+                ring,
+                descs,
+                q_id,
+                depth,
+                pushed: 0,
+            })
+        }
+
+        /// The character device.
+        #[must_use]
+        pub const fn chr(&self) -> &UblkChar {
+            &self.chr
+        }
+
+        /// The queue id.
+        #[must_use]
+        pub const fn q_id(&self) -> u16 {
+            self.q_id
+        }
+
+        /// Tags in the queue.
+        #[must_use]
+        pub const fn depth(&self) -> u16 {
+            self.depth
+        }
+
+        /// The descriptor of `tag`, as the driver wrote it before
+        /// completing the tag's fetch; `None` for a tag beyond the depth.
+        #[must_use]
+        pub fn desc(&self, tag: u16) -> Option<UblksrvIoDesc> {
+            if tag >= self.depth {
+                return None;
+            }
+            let size = size_of::<UblksrvIoDesc>();
+            let at = usize::from(tag) * size;
+            UblksrvIoDesc::read_from_bytes(&self.descs[at..at + size]).ok()
+        }
+
+        /// Pushes `FETCH_REQ` for `tag`.
+        ///
+        /// # Errors
+        /// [`crate::block::Full`] when the ring has no room.
+        pub fn push_fetch(&mut self, tag: u16) -> Result<(), crate::block::Full> {
+            self.push_command(&IoCommand::fetch(self.q_id, tag), tag)
+        }
+
+        /// Pushes `COMMIT_AND_FETCH_REQ` for `tag` with `result` (bytes
+        /// transferred, or a negative errno).
+        ///
+        /// # Errors
+        /// [`crate::block::Full`] when the ring has no room.
+        pub fn push_commit(&mut self, tag: u16, result: i32) -> Result<(), crate::block::Full> {
+            self.push_command(&IoCommand::commit_and_fetch(self.q_id, tag, result), tag)
+        }
+
+        fn push_command(&mut self, cmd: &IoCommand, tag: u16) -> Result<(), crate::block::Full> {
+            let sqe = self.chr.command_sqe(cmd).user_data(u64::from(tag));
+            // SAFETY: `push` requires the entry's addresses to stay valid
+            // for the operation. An I/O command under `UBLK_F_USER_COPY`
+            // names no memory of this process (`addr` is 0 and the 16
+            // command bytes travel inline in the SQE), and the descriptor
+            // it names is owned by `self.chr` for the queue's life.
+            let pushed = unsafe { self.ring.submission().push(&sqe) };
+            if pushed.is_err() {
+                return Err(crate::block::Full);
+            }
+            self.pushed += 1;
+            Ok(())
+        }
+
+        /// Submits every pushed command.
+        ///
+        /// # Errors
+        /// The `io_uring_enter(2)` error (`EINTR` is retried).
+        pub fn submit(&mut self) -> io::Result<usize> {
+            loop {
+                match self.ring.submit() {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    other => return other,
+                }
+            }
+        }
+
+        /// Submits and waits for at least one completion (a request
+        /// arriving, or a commit's own completion).
+        ///
+        /// # Errors
+        /// The `io_uring_enter(2)` error (`EINTR` is retried).
+        pub fn submit_and_wait(&mut self) -> io::Result<usize> {
+            loop {
+                match self.ring.submit_and_wait(1) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    other => return other,
+                }
+            }
+        }
+
+        /// Moves every available completion into `out` as `(tag, result)`:
+        /// `UBLK_IO_RES_OK` means a request waits in the tag's descriptor,
+        /// [`super::UBLK_IO_RES_ABORT`] that the tag must not be fetched
+        /// again.
+        pub fn reap(&mut self, out: &mut Vec<(u16, i32)>) -> usize {
+            let mut n = 0;
+            let mut cq = self.ring.completion();
+            cq.sync();
+            for cqe in cq.by_ref() {
+                let tag = u16::try_from(cqe.user_data()).unwrap_or(u16::MAX);
+                out.push((tag, cqe.result()));
+                n += 1;
+            }
+            n
+        }
+
+        /// Copies `dst.len()` bytes of a WRITE request's data out of the
+        /// driver, from byte `off` of request `tag` (`pread` at the
+        /// user-copy position).
+        ///
+        /// # Errors
+        /// The `pread(2)` error, or a short copy as `UnexpectedEof`.
+        pub fn read_data(&self, tag: u16, off: u32, dst: &mut [u8]) -> io::Result<()> {
+            let pos = checked_user_copy_offset(self.q_id, tag, off).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "user-copy position out of range",
+                )
+            })?;
+            let mut done = 0usize;
+            while done < dst.len() {
+                let n = pread(&self.chr, &mut dst[done..], pos + done as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short user copy",
+                    ));
+                }
+                done += n;
+            }
+            Ok(())
+        }
+
+        /// Copies `src` into a READ request's data, at byte `off` of
+        /// request `tag` (`pwrite` at the user-copy position).
+        ///
+        /// # Errors
+        /// The `pwrite(2)` error, or a short copy as `WriteZero`.
+        pub fn write_data(&self, tag: u16, off: u32, src: &[u8]) -> io::Result<()> {
+            let pos = checked_user_copy_offset(self.q_id, tag, off).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "user-copy position out of range",
+                )
+            })?;
+            let mut done = 0usize;
+            while done < src.len() {
+                let n = pwrite(&self.chr, &src[done..], pos + done as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "short user copy"));
+                }
+                done += n;
+            }
+            Ok(())
+        }
+    }
+
+    impl std::fmt::Debug for UblkQueue {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("UblkQueue")
+                .field("dev_id", &self.chr.dev_id())
+                .field("q_id", &self.q_id)
+                .field("depth", &self.depth)
+                .field("pushed", &self.pushed)
+                .finish()
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{UblkChar, UblkControl};
+pub use linux::{UblkChar, UblkControl, UblkControlRing, UblkQueue, UBLK_QUEUE_CMD_BUF_STRIDE};

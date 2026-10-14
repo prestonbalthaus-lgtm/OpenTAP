@@ -12,7 +12,7 @@ pub const FORMAT_MAJOR: u8 = 2;
 /// Minor version of the on-disk format. A later minor may only give meaning to
 /// bytes that this minor writes as zero; readers accept any minor of their own
 /// major.
-pub const FORMAT_MINOR: u8 = 0;
+pub const FORMAT_MINOR: u8 = 2;
 /// The `ver` field written into every on-disk structure: `major << 8 | minor`.
 pub const FORMAT_VERSION: u16 = ((FORMAT_MAJOR as u16) << 8) | FORMAT_MINOR as u16;
 
@@ -47,7 +47,7 @@ pub const SUPERBLOCK_SLOTS: usize = 4;
 pub const SUPERBLOCK_CRC_OFFSET: usize = SUPERBLOCK_SIZE - 4;
 /// Reserved bytes at the end of the superblock page, written as zero and
 /// covered by the CRC.
-pub const SUPERBLOCK_RESERVED: usize = 2396;
+pub const SUPERBLOCK_RESERVED: usize = 2364;
 
 /// Volumes per aggregate. A volume index is below this bound everywhere: in
 /// the bitsets, the volume table, descriptors and hole records (F8).
@@ -138,6 +138,18 @@ pub const CP_LOG_PAGE_HDR_SIZE: usize = 64;
 pub const CP_LOG_PAGE_SIZE: usize = 4096;
 /// Records in one CP log page.
 pub const CP_LOG_RECS_PER_PAGE: usize = (CP_LOG_PAGE_SIZE - CP_LOG_PAGE_HDR_SIZE) / CP_LOG_REC_SIZE;
+/// Size of one CP log directory page (format 2.1, F12).
+pub const CP_LOG_DIR_PAGE_SIZE: usize = 4096;
+/// Size of the CP log directory page header.
+pub const CP_LOG_DIR_HDR_SIZE: usize = 64;
+/// Root references in one CP log directory page.
+pub const CP_LOG_DIR_ENTRIES: usize = (CP_LOG_DIR_PAGE_SIZE - CP_LOG_DIR_HDR_SIZE) / ROOT_REF_SIZE;
+/// Size of one snapshot root page (format 2.1, F13).
+pub const SNAP_ROOT_PAGE_SIZE: usize = 4096;
+/// Bytes of the snapshot root page that precede the trailing CRC.
+pub const SNAP_ROOT_CRC_OFFSET: usize = SNAP_ROOT_PAGE_SIZE - 4;
+/// Reserved bytes at the end of the snapshot root page.
+pub const SNAP_ROOT_RESERVED: usize = 3972;
 
 /// Size of the stream frame header.
 pub const STREAM_HEADER_SIZE: usize = 64;
@@ -161,6 +173,10 @@ pub const STRIPE_MAGIC: u32 = u32::from_le_bytes(*b"OTST");
 pub const STREAM_MAGIC: u32 = u32::from_le_bytes(*b"OTSF");
 /// CP log page header magic: `OTCL`.
 pub const CPLOG_MAGIC: u32 = u32::from_le_bytes(*b"OTCL");
+/// CP log directory page magic: `OTCD` (format 2.1).
+pub const CPDIR_MAGIC: u32 = u32::from_le_bytes(*b"OTCD");
+/// Snapshot root page magic: `OTSR` (format 2.1).
+pub const SNAPROOT_MAGIC: u32 = u32::from_le_bytes(*b"OTSR");
 
 /// Bits of the volume index field in a stripe descriptor. The field is wider
 /// than [`MAX_VOL`] needs; only values below [`MAX_VOLS`] are valid.
@@ -192,7 +208,7 @@ pub const MAX_PLEN: u16 = (1 << PLEN_BITS) - 1;
 pub const NULL_LSEG: u64 = 0;
 
 const _: () = {
-    assert!(FORMAT_VERSION == 0x0200);
+    assert!(FORMAT_VERSION == 0x0202);
     assert!(STREAM_VERSION == 0x0100);
     assert!(VOL_BITSET_BYTES == 128);
     assert!(VOL_TABLE_SIZE == 16384);
@@ -208,5 +224,8 @@ const _: () = {
     assert!(MAX_WIRE_PAYLOAD as usize == MAX_STRIPE_BYTES);
     assert!(MIN_STRIPE_BYTES < MAX_STRIPE_BYTES);
     assert!(CP_LOG_RECS_PER_PAGE == 126);
+    assert!(CP_LOG_DIR_ENTRIES == 252);
+    assert!(CP_LOG_DIR_HDR_SIZE + CP_LOG_DIR_ENTRIES * ROOT_REF_SIZE == CP_LOG_DIR_PAGE_SIZE);
+    assert!(SNAP_ROOT_RESERVED + 120 + 4 == SNAP_ROOT_PAGE_SIZE);
     assert!(MAX_SEG_BYTES == 256 * 1024 * 1024);
 };

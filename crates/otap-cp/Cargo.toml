@@ -13,6 +13,7 @@ workspace = true
 otap-arena = { path = "../otap-arena" }
 otap-format = { path = "../otap-format" }
 otap-index = { path = "../otap-index" }
+otap-map = { path = "../otap-map" }
 otap-sys = { path = "../otap-sys" }
 blake3.workspace = true
 

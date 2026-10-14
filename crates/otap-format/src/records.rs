@@ -15,7 +15,7 @@
 //! # Snapshot catalogue
 //! The `snap_table` root points at an array of [`SnapRecord`]s. A record
 //! pins a volume's map root at a CP (`map_root_pba` is the page that holds
-//! the pinned [`MapRoot`](crate::MapRoot)) and names its deadlist. Names are
+//! the pinned [`MapRoot`]) and names its deadlist. Names are
 //! control-plane metadata keyed by `snap_uuid`; they are not on disk here.
 //! An all-zero record is an empty slot.
 //!
@@ -33,13 +33,15 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use crate::checksum::crc32c;
 use crate::constants::{
-    BLOCK_SIZE, CPLOG_MAGIC, CP_LOG_PAGE_HDR_SIZE, CP_LOG_PAGE_SIZE, CP_LOG_RECS_PER_PAGE,
+    BLOCK_SIZE, CPDIR_MAGIC, CPLOG_MAGIC, CP_LOG_DIR_ENTRIES, CP_LOG_DIR_HDR_SIZE,
+    CP_LOG_DIR_PAGE_SIZE, CP_LOG_PAGE_HDR_SIZE, CP_LOG_PAGE_SIZE, CP_LOG_RECS_PER_PAGE,
     CP_LOG_REC_SIZE, FORMAT_MAJOR, FORMAT_VERSION, MAX_CP_SEQ, MAX_LBA, MAX_SEG_BYTES,
-    MAX_STRIPE_BYTES, MAX_VOL, MIN_STRIPE_BYTES, NULL_PSEG, SEG_ENTRY_SIZE, SNAP_RECORD_SIZE,
+    MAX_STRIPE_BYTES, MAX_VOL, MIN_STRIPE_BYTES, NULL_PSEG, SEG_ENTRY_SIZE, SNAPROOT_MAGIC,
+    SNAP_RECORD_SIZE, SNAP_ROOT_CRC_OFFSET, SNAP_ROOT_PAGE_SIZE, SNAP_ROOT_RESERVED,
 };
-use crate::map::MapEntry;
+use crate::map::{MapEntry, MapRoot};
 use crate::types::{
-    bad_field, check_crc, check_magic, check_major, copy_out, view, FormatError, Uuid,
+    bad_field, check_crc, check_magic, check_major, copy_out, view, FormatError, RootRef, Uuid,
 };
 
 /// What a segment holds.
@@ -84,7 +86,10 @@ pub enum SegState {
     /// relocation table and `live_bytes` is zero.
     Relocated = 3,
     /// Freed by a CP; the physical segment is reused only after the next CP
-    /// (or the one after on `flush-opaque` backstores).
+    /// (or the one after on `flush-opaque` backstores). Reserved for a
+    /// persisted deferred-free list: the Step 4 engine keeps the deferral in
+    /// memory and recomputes it at boot from the two slots' regions, and
+    /// never writes this state.
     FreedPending = 4,
 }
 
@@ -131,8 +136,10 @@ pub struct SegEntry {
     pub live_bytes: u32,
     /// The CP that allocated the segment, at least 1 unless `Free`.
     pub birth_cp: u32,
-    /// How many times the physical segment has been handed out; a stale
-    /// reference from an earlier lap never matches.
+    /// How many times the physical segment has been handed out, so a stale
+    /// reference from an earlier lap never matches. Not yet advanced: the
+    /// Step 4 engine frees a segment with its lap at zero, and recovery
+    /// reads exact roots (E14), so nothing relies on it until relocation.
     pub lap: u32,
     /// A [`SegKind`] byte.
     pub kind: u8,
@@ -801,4 +808,511 @@ const _: () = {
     assert!(offset_of!(CpLogPage, hdr) == 0);
     assert!(offset_of!(CpLogPage, recs) == CP_LOG_PAGE_HDR_SIZE);
     assert!(CP_LOG_PAGE_HDR_SIZE + CP_LOG_RECS_PER_PAGE * CP_LOG_REC_SIZE == CP_LOG_PAGE_SIZE);
+};
+
+// ---------------------------------------------------------------------------
+// Format 2.1: the CP log directory (F12) and the snapshot root page (F13)
+// ---------------------------------------------------------------------------
+
+/// The 64-byte header of a CP log directory page (F12).
+///
+/// The superblock's `cp_log_head` names a directory region: a run of
+/// [`CpLogDirPage`]s listing, as [`RootRef`]s, the delta regions (runs of
+/// [`CpLogPage`]s) of every consistency point since the last fold, in CP
+/// order, followed by the map pages the fold wrote when this CP is the fold
+/// (so a boot that selects it can verify them). Every page of one region
+/// carries the same `cp_seq`, `fold_cp_seq`, `agg_id`, `delta_entries` and
+/// `page_entries`; `page_seq` numbers the pages from 0.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(C)]
+pub struct CpLogDirHdr {
+    /// [`CPDIR_MAGIC`].
+    pub magic: u32,
+    /// [`FORMAT_VERSION`].
+    pub ver: u16,
+    /// Entries used in this page, at most [`CP_LOG_DIR_ENTRIES`].
+    pub count: u16,
+    /// The CP that wrote the directory, at most [`MAX_CP_SEQ`].
+    pub cp_seq: u64,
+    /// The CP of the last fold: the map pages hold the state at this CP and
+    /// the deltas listed are those of CPs `fold_cp_seq..=cp_seq`.
+    pub fold_cp_seq: u64,
+    /// The aggregate.
+    pub agg_id: Uuid,
+    /// Delta regions in the whole directory (the first entries).
+    pub delta_entries: u32,
+    /// Fold page regions in the whole directory (the entries after the
+    /// deltas); non-zero only when `cp_seq == fold_cp_seq`.
+    pub page_entries: u32,
+    /// The page's position in the directory region, from 0.
+    pub page_seq: u32,
+    /// Reserved, zero.
+    pub rsvd: [u8; 8],
+    /// CRC-32C over bytes `0..60`.
+    pub crc32c: u32,
+}
+
+impl CpLogDirHdr {
+    /// The CRC-32C over bytes `0..60`.
+    #[must_use]
+    pub fn compute_crc(&self) -> u32 {
+        crc32c(&self.as_bytes()[..CP_LOG_DIR_HDR_SIZE - 4])
+    }
+
+    /// Stores the CRC.
+    pub fn seal(&mut self) {
+        self.crc32c = self.compute_crc();
+    }
+
+    /// Checks magic, major version, CRC, the count and the CP bounds.
+    pub fn verify(&self) -> Result<(), FormatError> {
+        check_magic(self.magic, CPDIR_MAGIC)?;
+        check_major(self.ver, FORMAT_MAJOR)?;
+        check_crc("cp log directory header", self.compute_crc(), self.crc32c)?;
+        if self.count as usize > CP_LOG_DIR_ENTRIES {
+            return Err(FormatError::OutOfRange {
+                field: "count",
+                value: u64::from(self.count),
+                max: CP_LOG_DIR_ENTRIES as u64,
+            });
+        }
+        if self.cp_seq > MAX_CP_SEQ {
+            return Err(FormatError::OutOfRange {
+                field: "cp_seq",
+                value: self.cp_seq,
+                max: MAX_CP_SEQ,
+            });
+        }
+        if self.fold_cp_seq > self.cp_seq {
+            return Err(FormatError::OutOfRange {
+                field: "fold_cp_seq",
+                value: self.fold_cp_seq,
+                max: self.cp_seq,
+            });
+        }
+        if self.page_entries != 0 && self.fold_cp_seq != self.cp_seq {
+            return Err(bad_field("page_entries", u64::from(self.page_entries)));
+        }
+        Ok(())
+    }
+}
+
+/// A 4 KiB CP log directory page: a header and up to 252 root references.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(C, align(4096))]
+pub struct CpLogDirPage {
+    /// The header.
+    pub hdr: CpLogDirHdr,
+    /// The entries; `hdr.count` of them are used, the rest are
+    /// [`RootRef::NONE`].
+    pub entries: [RootRef; CP_LOG_DIR_ENTRIES],
+}
+
+impl CpLogDirPage {
+    /// An empty page for the directory `cp_seq` writes, whose last fold was
+    /// `fold_cp_seq`, at position `page_seq`.
+    #[must_use]
+    pub fn new(agg_id: Uuid, cp_seq: u64, fold_cp_seq: u64, page_seq: u32) -> Self {
+        let mut page = Self::new_zeroed();
+        page.hdr.magic = CPDIR_MAGIC;
+        page.hdr.ver = FORMAT_VERSION;
+        page.hdr.cp_seq = cp_seq;
+        page.hdr.fold_cp_seq = fold_cp_seq;
+        page.hdr.agg_id = agg_id;
+        page.hdr.page_seq = page_seq;
+        page
+    }
+
+    /// Appends a reference, which must name a region at a non-zero block;
+    /// `Ok(None)` when the page is full.
+    pub fn push(&mut self, root: RootRef) -> Result<Option<usize>, FormatError> {
+        if root.is_none() || root.pba == 0 {
+            return Err(bad_field("pba", root.pba));
+        }
+        let index = self.hdr.count as usize;
+        if index >= CP_LOG_DIR_ENTRIES {
+            return Ok(None);
+        }
+        self.entries[index] = root;
+        self.hdr.count += 1;
+        Ok(Some(index))
+    }
+
+    /// The entries in use.
+    #[must_use]
+    pub fn used(&self) -> &[RootRef] {
+        &self.entries[..(self.hdr.count as usize).min(CP_LOG_DIR_ENTRIES)]
+    }
+
+    /// `true` when no entry fits any more.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.hdr.count as usize >= CP_LOG_DIR_ENTRIES
+    }
+
+    /// Stores the header CRC.
+    pub fn seal(&mut self) {
+        self.hdr.seal();
+    }
+
+    /// Verifies the header, that every used entry names a region at a
+    /// non-zero block, and that the unused entries are absent.
+    pub fn verify(&self) -> Result<(), FormatError> {
+        self.hdr.verify()?;
+        for (i, entry) in self.entries.iter().enumerate() {
+            if i < self.hdr.count as usize {
+                if entry.is_none() || entry.pba == 0 {
+                    return Err(bad_field("pba", entry.pba));
+                }
+            } else if *entry != RootRef::NONE {
+                return Err(bad_field("count", u64::from(self.hdr.count)));
+            }
+        }
+        Ok(())
+    }
+
+    /// A verified zero-copy view over a 4 KiB, 4096-aligned buffer.
+    pub fn parse(bytes: &[u8]) -> Result<&Self, FormatError> {
+        let page: &Self = view(bytes)?;
+        page.verify()?;
+        Ok(page)
+    }
+
+    /// A verified copy out of a 4 KiB buffer of any alignment.
+    pub fn read(bytes: &[u8]) -> Result<Self, FormatError> {
+        let page: Self = copy_out(bytes)?;
+        page.verify()?;
+        Ok(page)
+    }
+}
+
+/// A CP log directory as a whole: what one region of [`CpLogDirPage`]s
+/// encodes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CpLogDir {
+    /// The CP that wrote it.
+    pub cp_seq: u64,
+    /// The CP of the last fold.
+    pub fold_cp_seq: u64,
+    /// The delta regions of CPs `fold_cp_seq..=cp_seq`, in CP order (a CP
+    /// without changes has none; a CP may have several).
+    pub deltas: Vec<RootRef>,
+    /// The map pages the fold wrote, when `cp_seq == fold_cp_seq`.
+    pub pages: Vec<RootRef>,
+}
+
+impl CpLogDir {
+    /// The region image: whole 4 KiB pages, at least one.
+    pub fn encode(&self, agg_id: Uuid) -> Result<Vec<u8>, FormatError> {
+        if self.cp_seq > MAX_CP_SEQ {
+            return Err(FormatError::OutOfRange {
+                field: "cp_seq",
+                value: self.cp_seq,
+                max: MAX_CP_SEQ,
+            });
+        }
+        if self.fold_cp_seq > self.cp_seq {
+            return Err(FormatError::OutOfRange {
+                field: "fold_cp_seq",
+                value: self.fold_cp_seq,
+                max: self.cp_seq,
+            });
+        }
+        if !self.pages.is_empty() && self.fold_cp_seq != self.cp_seq {
+            return Err(bad_field("page_entries", self.pages.len() as u64));
+        }
+        let delta_entries =
+            u32::try_from(self.deltas.len()).map_err(|_| bad_field("delta_entries", u64::MAX))?;
+        let page_entries =
+            u32::try_from(self.pages.len()).map_err(|_| bad_field("page_entries", u64::MAX))?;
+        let fresh = |page_seq: u32| {
+            let mut page = CpLogDirPage::new(agg_id, self.cp_seq, self.fold_cp_seq, page_seq);
+            page.hdr.delta_entries = delta_entries;
+            page.hdr.page_entries = page_entries;
+            page
+        };
+        let mut out = Vec::new();
+        let mut page_seq = 0u32;
+        let mut page = fresh(page_seq);
+        for root in self.deltas.iter().chain(self.pages.iter()) {
+            if page.push(*root)?.is_none() {
+                page.seal();
+                out.extend_from_slice(page.as_bytes());
+                page_seq += 1;
+                page = fresh(page_seq);
+                page.push(*root)?.ok_or_else(|| bad_field("count", 0))?;
+            }
+        }
+        page.seal();
+        out.extend_from_slice(page.as_bytes());
+        Ok(out)
+    }
+
+    /// Decodes a region written by [`encode`](Self::encode) for `agg_id`:
+    /// every page verifies, agrees with the first on the CP, the fold, the
+    /// totals and the aggregate, and is in position; the entries add up to
+    /// the totals.
+    pub fn decode(bytes: &[u8], agg_id: &Uuid) -> Result<Self, FormatError> {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(CP_LOG_DIR_PAGE_SIZE) {
+            return Err(FormatError::BadLength {
+                expected: bytes.len().div_ceil(CP_LOG_DIR_PAGE_SIZE).max(1) * CP_LOG_DIR_PAGE_SIZE,
+                found: bytes.len(),
+            });
+        }
+        let mut all: Vec<RootRef> = Vec::new();
+        let mut first: Option<CpLogDirHdr> = None;
+        for (i, chunk) in bytes
+            .as_chunks::<CP_LOG_DIR_PAGE_SIZE>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let page = CpLogDirPage::read(chunk)?;
+            if page.hdr.agg_id != *agg_id {
+                return Err(FormatError::IdentityMismatch { field: "agg_id" });
+            }
+            if page.hdr.page_seq as usize != i {
+                return Err(FormatError::IdentityMismatch { field: "page_seq" });
+            }
+            match &first {
+                None => first = Some(page.hdr),
+                Some(h) => {
+                    if page.hdr.cp_seq != h.cp_seq
+                        || page.hdr.fold_cp_seq != h.fold_cp_seq
+                        || page.hdr.delta_entries != h.delta_entries
+                        || page.hdr.page_entries != h.page_entries
+                    {
+                        return Err(FormatError::IdentityMismatch { field: "cp_seq" });
+                    }
+                }
+            }
+            all.extend_from_slice(page.used());
+        }
+        let hdr = first.ok_or(FormatError::BadLength {
+            expected: CP_LOG_DIR_PAGE_SIZE,
+            found: 0,
+        })?;
+        let total = hdr.delta_entries as usize + hdr.page_entries as usize;
+        if all.len() != total {
+            return Err(bad_field("count", all.len() as u64));
+        }
+        let pages = all.split_off(hdr.delta_entries as usize);
+        Ok(Self {
+            cp_seq: hdr.cp_seq,
+            fold_cp_seq: hdr.fold_cp_seq,
+            deltas: all,
+            pages,
+        })
+    }
+
+    /// Pages the encoded region takes.
+    #[must_use]
+    pub fn pages_needed(&self) -> usize {
+        (self.deltas.len() + self.pages.len())
+            .div_ceil(CP_LOG_DIR_ENTRIES)
+            .max(1)
+    }
+}
+
+/// The 4 KiB snapshot root page (F13): the page a [`SnapRecord`]'s
+/// `map_root_pba` names, holding the pinned [`MapRoot`] and the deadlist
+/// reference, sealed by its own CRC.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(C, align(4096))]
+pub struct SnapRootPage {
+    /// [`SNAPROOT_MAGIC`].
+    pub magic: u32,
+    /// [`FORMAT_VERSION`].
+    pub ver: u16,
+    /// Reserved, zero.
+    pub rsvd0: u16,
+    /// The snapshot, at least 1.
+    pub snap_id: u64,
+    /// The aggregate.
+    pub agg_id: Uuid,
+    /// The CP the snapshot pins, at least 1.
+    pub birth_cp: u64,
+    /// The pinned root: the volume's map as of `birth_cp`.
+    pub root: MapRoot,
+    /// The deadlist region, or none.
+    pub deadlist: RootRef,
+    /// Reserved, zero.
+    pub reserved: [u8; SNAP_ROOT_RESERVED],
+    /// CRC-32C over bytes `0..4092`.
+    pub crc32c: u32,
+}
+
+impl SnapRootPage {
+    /// A page pinning `root` as snapshot `snap_id` of `agg_id` at
+    /// `birth_cp`, sealed.
+    pub fn new(
+        agg_id: Uuid,
+        snap_id: u64,
+        birth_cp: u64,
+        root: MapRoot,
+        deadlist: RootRef,
+    ) -> Result<Self, FormatError> {
+        let mut page = Self::new_zeroed();
+        page.magic = SNAPROOT_MAGIC;
+        page.ver = FORMAT_VERSION;
+        page.snap_id = snap_id;
+        page.agg_id = agg_id;
+        page.birth_cp = birth_cp;
+        page.root = root;
+        page.deadlist = deadlist;
+        page.validate()?;
+        page.seal();
+        Ok(page)
+    }
+
+    /// The CRC-32C over bytes `0..4092`.
+    #[must_use]
+    pub fn compute_crc(&self) -> u32 {
+        crc32c(&self.as_bytes()[..SNAP_ROOT_CRC_OFFSET])
+    }
+
+    /// Stores the CRC.
+    pub fn seal(&mut self) {
+        self.crc32c = self.compute_crc();
+    }
+
+    /// Checks the fields: a snapshot id and a birth, a root that validates,
+    /// has a size and was checkpointed at or before the birth, a deadlist
+    /// that is absent or names a region at a non-zero block.
+    pub fn validate(&self) -> Result<(), FormatError> {
+        check_magic(self.magic, SNAPROOT_MAGIC)?;
+        check_major(self.ver, FORMAT_MAJOR)?;
+        if self.snap_id == 0 {
+            return Err(bad_field("snap_id", 0));
+        }
+        if self.birth_cp == 0 || self.birth_cp > MAX_CP_SEQ {
+            return Err(FormatError::OutOfRange {
+                field: "birth_cp",
+                value: self.birth_cp,
+                max: MAX_CP_SEQ,
+            });
+        }
+        self.root.validate()?;
+        if self.root.lba_count == 0 {
+            return Err(bad_field("lba_count", 0));
+        }
+        if self.root.checkpoint_cp_seq > self.birth_cp {
+            return Err(FormatError::OutOfRange {
+                field: "checkpoint_cp_seq",
+                value: self.root.checkpoint_cp_seq,
+                max: self.birth_cp,
+            });
+        }
+        if self.deadlist.is_none() {
+            if self.deadlist != RootRef::NONE {
+                return Err(bad_field("deadlist", self.deadlist.pba));
+            }
+        } else if self.deadlist.pba == 0 {
+            return Err(bad_field("deadlist", 0));
+        }
+        Ok(())
+    }
+
+    /// Validates the fields and checks the CRC.
+    pub fn verify(&self) -> Result<(), FormatError> {
+        self.validate()?;
+        check_crc("snapshot root page", self.compute_crc(), self.crc32c)
+    }
+
+    /// A verified zero-copy view over a 4 KiB, 4096-aligned buffer.
+    pub fn parse(bytes: &[u8]) -> Result<&Self, FormatError> {
+        let page: &Self = view(bytes)?;
+        page.verify()?;
+        Ok(page)
+    }
+
+    /// A verified copy out of a 4 KiB buffer of any alignment.
+    pub fn read(bytes: &[u8]) -> Result<Self, FormatError> {
+        let page: Self = copy_out(bytes)?;
+        page.verify()?;
+        Ok(page)
+    }
+}
+
+/// The snapshot table region (F14): `records` in ascending `snap_id` order,
+/// none empty, padded with zero bytes to whole 4 KiB pages. An empty table
+/// is no region at all (`snap_table` is [`RootRef::NONE`]).
+pub fn snap_table_image(records: &[SnapRecord]) -> Result<Vec<u8>, FormatError> {
+    let mut last = 0u64;
+    for rec in records {
+        rec.verify()?;
+        if rec.snap_id <= last {
+            return Err(bad_field("snap_id", rec.snap_id));
+        }
+        last = rec.snap_id;
+    }
+    let mut bytes = records.as_bytes().to_vec();
+    let padded = bytes.len().div_ceil(BLOCK_SIZE).max(1) * BLOCK_SIZE;
+    bytes.resize(padded, 0);
+    Ok(bytes)
+}
+
+/// Parses a snapshot table region: records until the first empty slot,
+/// each verified, ids strictly ascending, and only zero bytes after.
+pub fn parse_snap_table(bytes: &[u8]) -> Result<Vec<SnapRecord>, FormatError> {
+    if !bytes.len().is_multiple_of(BLOCK_SIZE) {
+        return Err(FormatError::BadLength {
+            expected: bytes.len().div_ceil(BLOCK_SIZE) * BLOCK_SIZE,
+            found: bytes.len(),
+        });
+    }
+    let mut out = Vec::new();
+    let mut last = 0u64;
+    let mut rest: &[u8] = bytes;
+    while rest.len() >= SNAP_RECORD_SIZE {
+        let (chunk, tail) = rest.split_at(SNAP_RECORD_SIZE);
+        if chunk.iter().all(|b| *b == 0) {
+            break;
+        }
+        let rec: SnapRecord = copy_out(chunk)?;
+        rec.verify()?;
+        if rec.snap_id <= last {
+            return Err(bad_field("snap_id", rec.snap_id));
+        }
+        last = rec.snap_id;
+        out.push(rec);
+        rest = tail;
+    }
+    if rest.iter().any(|b| *b != 0) {
+        return Err(bad_field("snap_id", 0));
+    }
+    Ok(out)
+}
+
+const _: () = {
+    assert!(size_of::<CpLogDirHdr>() == CP_LOG_DIR_HDR_SIZE);
+    assert!(align_of::<CpLogDirHdr>() == 8);
+    assert!(offset_of!(CpLogDirHdr, magic) == 0);
+    assert!(offset_of!(CpLogDirHdr, ver) == 4);
+    assert!(offset_of!(CpLogDirHdr, count) == 6);
+    assert!(offset_of!(CpLogDirHdr, cp_seq) == 8);
+    assert!(offset_of!(CpLogDirHdr, fold_cp_seq) == 16);
+    assert!(offset_of!(CpLogDirHdr, agg_id) == 24);
+    assert!(offset_of!(CpLogDirHdr, delta_entries) == 40);
+    assert!(offset_of!(CpLogDirHdr, page_entries) == 44);
+    assert!(offset_of!(CpLogDirHdr, page_seq) == 48);
+    assert!(offset_of!(CpLogDirHdr, rsvd) == 52);
+    assert!(offset_of!(CpLogDirHdr, crc32c) == 60);
+    assert!(size_of::<CpLogDirPage>() == CP_LOG_DIR_PAGE_SIZE);
+    assert!(align_of::<CpLogDirPage>() == 4096);
+    assert!(offset_of!(CpLogDirPage, hdr) == 0);
+    assert!(offset_of!(CpLogDirPage, entries) == CP_LOG_DIR_HDR_SIZE);
+
+    assert!(size_of::<SnapRootPage>() == SNAP_ROOT_PAGE_SIZE);
+    assert!(align_of::<SnapRootPage>() == 4096);
+    assert!(offset_of!(SnapRootPage, magic) == 0);
+    assert!(offset_of!(SnapRootPage, ver) == 4);
+    assert!(offset_of!(SnapRootPage, rsvd0) == 6);
+    assert!(offset_of!(SnapRootPage, snap_id) == 8);
+    assert!(offset_of!(SnapRootPage, agg_id) == 16);
+    assert!(offset_of!(SnapRootPage, birth_cp) == 32);
+    assert!(offset_of!(SnapRootPage, root) == 40);
+    assert!(offset_of!(SnapRootPage, deadlist) == 104);
+    assert!(offset_of!(SnapRootPage, reserved) == 120);
+    assert!(offset_of!(SnapRootPage, crc32c) == SNAP_ROOT_CRC_OFFSET);
 };

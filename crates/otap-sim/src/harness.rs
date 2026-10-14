@@ -11,16 +11,18 @@ use std::collections::HashMap;
 
 use otap_arena::ArenaError;
 use otap_cp::{
-    Engine, EngineConfig, Event, Geometry, MediaProfile, NvfailIntent, Phase, ReqId, Status,
-    VolumeSpec,
+    DiscardPolicy, Engine, EngineConfig, Event, FlushPolicy, FoldPolicy, Geometry, MediaProfile,
+    NvfailIntent, Phase, ReqId, Status, VolumeSpec,
 };
-use otap_format::{Uuid, VolBitSet, BLOCK_SIZE, INTENT_SLOT_SIZE, SUPERBLOCK_SLOT_SIZE};
+use otap_format::{
+    SnapKind, SnapOrigin, Uuid, VolBitSet, BLOCK_SIZE, INTENT_SLOT_SIZE, SUPERBLOCK_SLOT_SIZE,
+};
 use otap_sys::{HugeArena, HugePageSize};
 
 use crate::backstore::{CrashReport, Schedule, SimBackstore, TearPolicy};
 use crate::clock::SimClock;
 use crate::frontdoor::{Completion, SimFrontDoor};
-use crate::model::Model;
+use crate::model::{expected_data, Expected, Model};
 
 /// Ticks the harness spends waiting for one thing before it gives up.
 pub const TICK_BUDGET: u32 = 100_000;
@@ -46,9 +48,18 @@ pub struct SimConfig {
     pub cp_timer_ns: u64,
     /// Stripe writes in flight.
     pub inflight_stripes: u16,
-    /// A controller that acknowledges flushes it does not perform (the
-    /// engine refuses it; see `Geometry::flush_opaque`).
+    /// A controller that acknowledges flushes it does not perform (see
+    /// `Geometry::flush_opaque`); what the engine does with it is
+    /// `flush_policy` (E19 / E21).
     pub flush_opaque: bool,
+    /// The flush policy.
+    pub flush_policy: FlushPolicy,
+    /// On a flush-opaque device: the controller cache survives a power cut.
+    pub cache_protected: bool,
+    /// The discard policy.
+    pub discard: DiscardPolicy,
+    /// When the map folds.
+    pub fold: FoldPolicy,
     /// The device's completion schedule.
     pub schedule: Schedule,
     /// How a power cut tears unsafe writes.
@@ -57,7 +68,9 @@ pub struct SimConfig {
 
 impl SimConfig {
     /// A small pool: 32 KiB stripes, 8 per segment, 48 segments, a 2 MiB
-    /// arena, two volumes of 64 blocks, conservative intents, a 5 s timer.
+    /// arena, two volumes of 64 blocks, conservative intents, a 5 s timer,
+    /// whole-segment discards, and a fold policy that folds every few CPs
+    /// so the map's paths run often.
     #[must_use]
     pub fn small(seed: u64) -> Self {
         Self {
@@ -71,6 +84,16 @@ impl SimConfig {
             cp_timer_ns: 5_000_000_000,
             inflight_stripes: 4,
             flush_opaque: false,
+            flush_policy: FlushPolicy::TrustBarrierWithNvfail,
+            cache_protected: true,
+            discard: DiscardPolicy::WholeSegment,
+            fold: FoldPolicy {
+                log_bytes: 64 * 1024,
+                interval_ns: 60_000_000_000,
+                max_cps: 5,
+                max_dirty_pages: 8,
+                max_overlay_entries: 1024,
+            },
             schedule: Schedule::default(),
             tear: TearPolicy::default(),
         }
@@ -100,13 +123,15 @@ impl SimConfig {
         profile.cp_timer_ns = self.cp_timer_ns;
         profile.inflight_stripes = self.inflight_stripes;
         profile.nvfail_intent = self.intent;
+        profile.flush_policy = self.flush_policy;
+        profile.discard = self.discard;
         profile
     }
 
     /// The engine configuration.
     #[must_use]
     pub fn engine_config(&self) -> EngineConfig {
-        EngineConfig::new(
+        let mut cfg = EngineConfig::new(
             Uuid::from_bytes(
                 self.seed
                     .to_le_bytes()
@@ -121,8 +146,26 @@ impl SimConfig {
                     size_blocks: *size,
                 })
                 .collect(),
-        )
+        );
+        cfg.fold = self.fold;
+        cfg.cache_pages = 16;
+        cfg
     }
+}
+
+/// A snapshot the harness took, with the image the model gave it.
+#[derive(Debug, Clone)]
+pub struct SnapExpect {
+    /// The engine's id.
+    pub snap_id: u64,
+    /// The volume.
+    pub vol: u32,
+    /// The identity.
+    pub uuid: Uuid,
+    /// The CP it pins.
+    pub cp_seq: u64,
+    /// What every block held when it was taken.
+    pub image: Vec<Expected>,
 }
 
 /// The engine the harness drives.
@@ -143,7 +186,7 @@ pub enum Stop {
 }
 
 /// What a boot reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootInfo {
     /// The CP selected.
     pub cp_seq: u64,
@@ -159,10 +202,12 @@ pub struct BootInfo {
     pub damaged_slots: u32,
     /// Volumes held after the boot.
     pub nvfail: VolBitSet,
+    /// Why each skipped candidate was torn.
+    pub torn: Vec<(u64, String)>,
 }
 
 /// What a recovery check established.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
     /// The prefix bound: the image is the state after the issued writes up
     /// to this operation.
@@ -199,6 +244,9 @@ pub struct Sim {
     last_boot: Option<BootInfo>,
     /// Every event the engine reported.
     pub events: Vec<Event>,
+    /// Snapshots taken and their expected images.
+    pub snaps: Vec<SnapExpect>,
+    next_uuid: u64,
 }
 
 impl std::fmt::Debug for Sim {
@@ -220,6 +268,7 @@ impl Sim {
         let mut disk = SimBackstore::new(cfg.profile(), cfg.seed).map_err(|e| e.to_string())?;
         disk.set_schedule(cfg.schedule);
         disk.set_tear_policy(cfg.tear);
+        disk.set_cache_protected(cfg.cache_protected);
         Engine::<SimBackstore, SimFrontDoor, SimClock>::format(
             &mut disk,
             &clock,
@@ -246,6 +295,8 @@ impl Sim {
             last_stop: Stop::Fresh,
             last_boot: None,
             events: Vec::new(),
+            snaps: Vec::new(),
+            next_uuid: 1,
         })
     }
 
@@ -288,8 +339,8 @@ impl Sim {
 
     /// The last boot.
     #[must_use]
-    pub const fn last_boot(&self) -> Option<BootInfo> {
-        self.last_boot
+    pub fn last_boot(&self) -> Option<BootInfo> {
+        self.last_boot.clone()
     }
 
     /// How the previous instance stopped.
@@ -341,6 +392,7 @@ impl Sim {
                 arena_lost,
                 damaged_slots,
                 nvfail,
+                torn,
                 ..
             } = event
             {
@@ -352,11 +404,12 @@ impl Sim {
                     arena_lost,
                     damaged_slots,
                     nvfail,
+                    torn,
                 });
             }
         }
         let info = info.ok_or("no Booted event")?;
-        self.last_boot = Some(info);
+        self.last_boot = Some(info.clone());
         self.tick_until(|e| e.is_serving(), "the boot commit")?;
         Ok(info)
     }
@@ -422,6 +475,35 @@ impl Sim {
         let id = self.engine().front_door().submit_write(vol, lba, data);
         self.inflight.insert(id, op);
         id
+    }
+
+    /// Queues a discard (or a write of zeros) and records it in the model
+    /// as issued.
+    pub fn submit_punch(&mut self, vol: u32, lba: u64, blocks: u32, zeroes: bool) -> ReqId {
+        self.next_op += 1;
+        let op = self.next_op;
+        self.model.issued_punch(op, vol, lba, blocks);
+        let front = self.engine().front_door();
+        let id = if zeroes {
+            front.submit_write_zeroes(vol, lba, blocks)
+        } else {
+            front.submit_discard(vol, lba, blocks)
+        };
+        self.inflight.insert(id, op);
+        id
+    }
+
+    /// Issues a discard (or a write of zeros) and waits for its completion.
+    pub fn punch(
+        &mut self,
+        vol: u32,
+        lba: u64,
+        blocks: u32,
+        zeroes: bool,
+    ) -> Result<Completion, String> {
+        let id = self.submit_punch(vol, lba, blocks, zeroes);
+        self.wait(id, TICK_BUDGET)?
+            .ok_or_else(|| format!("punch {id:?} did not complete within {TICK_BUDGET} ticks"))
     }
 
     /// Queues a read.
@@ -490,12 +572,8 @@ impl Sim {
         if self.inflight.is_empty() && self.model.unresolved() == 0 {
             for k in 0..blocks {
                 let block = &data[(k as usize) * BLOCK_SIZE..(k as usize + 1) * BLOCK_SIZE];
-                let expected = match self.model.expected(vol, lba + u64::from(k), u64::MAX) {
-                    Some((op, pos)) => {
-                        crate::model::block_data(op, vol, lba + u64::from(k) - u64::from(pos), pos)
-                    }
-                    None => vec![0u8; BLOCK_SIZE],
-                };
+                let at = lba + u64::from(k);
+                let expected = expected_data(vol, at, self.model.expected(vol, at, u64::MAX));
                 if block != expected.as_slice() {
                     return Err(format!(
                         "read of volume {vol} LBA {}: {:?}, expected {:?}",
@@ -515,6 +593,185 @@ impl Sim {
         self.engine().request_cp();
         self.tick_until(|e| e.cp_seq() > before, "the requested CP")?;
         Ok(self.engine().cp_seq())
+    }
+
+    /// Asks for a fold and waits until the CP that folds commits.
+    pub fn request_fold(&mut self) -> Result<u64, String> {
+        let before = self.engine().map().fold_cp();
+        self.engine().request_fold();
+        self.tick_until(|e| e.map().fold_cp() > before, "the requested fold")?;
+        Ok(self.engine().cp_seq())
+    }
+
+    /// Takes a snapshot of `vol` (nothing may be in flight), waits until it
+    /// is durable, and records what the model says it holds. Returns its
+    /// id.
+    pub fn snapshot(&mut self, vol: u32) -> Result<u64, String> {
+        if !self.inflight.is_empty() || self.model.unresolved() > 0 {
+            return Err("a snapshot needs nothing in flight".into());
+        }
+        let uuid = Uuid::from_bytes({
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&self.next_uuid.to_le_bytes());
+            b[8..].copy_from_slice(&self.cfg.seed.to_le_bytes());
+            b
+        });
+        self.next_uuid += 1;
+        self.engine()
+            .create_snapshot(vol, uuid, SnapKind::Crash, SnapOrigin::User)
+            .map_err(|e| format!("create snapshot of {vol}: {e}"))?;
+        let seen = self.events.len();
+        for _ in 0..TICK_BUDGET {
+            let found = self.events[seen..].iter().find_map(|e| match e {
+                Event::SnapshotCreated {
+                    snap_id,
+                    vol: v,
+                    cp_seq,
+                } if *v == vol => Some((*snap_id, *cp_seq)),
+                _ => None,
+            });
+            if let Some((snap_id, cp_seq)) = found {
+                let image = self.model.image_of(vol);
+                self.snaps.push(SnapExpect {
+                    snap_id,
+                    vol,
+                    uuid,
+                    cp_seq,
+                    image,
+                });
+                return Ok(snap_id);
+            }
+            self.tick()?;
+        }
+        Err(format!(
+            "the snapshot of {vol} was not created within {TICK_BUDGET} ticks"
+        ))
+    }
+
+    /// Reads every snapshot the harness took through the engine and checks
+    /// it against the image the model gave it. A snapshot the engine no
+    /// longer lists is allowed only after a boot that rewound below its CP;
+    /// the harness forgets it then.
+    pub fn verify_snapshots(&mut self) -> Result<(), String> {
+        let listed: Vec<otap_cp::SnapshotInfo> = self.engine().snapshots();
+        let boot = self.last_boot.clone();
+        let mut kept = Vec::new();
+        for snap in std::mem::take(&mut self.snaps) {
+            match listed.iter().find(|s| s.snap_id == snap.snap_id) {
+                None => {
+                    let rewound_past = boot
+                        .as_ref()
+                        .is_some_and(|b| b.rewound && b.cp_seq < snap.cp_seq);
+                    if !rewound_past {
+                        return Err(format!(
+                            "snapshot {} (CP {}) vanished without a rewind below it",
+                            snap.snap_id, snap.cp_seq
+                        ));
+                    }
+                    continue;
+                }
+                Some(info) => {
+                    if info.uuid != snap.uuid || info.vol != snap.vol || info.cp_seq != snap.cp_seq
+                    {
+                        return Err(format!(
+                            "snapshot {} changed identity: {info:?}",
+                            snap.snap_id
+                        ));
+                    }
+                }
+            }
+            let mut buf = vec![0u8; BLOCK_SIZE];
+            for (lba, expected) in snap.image.iter().enumerate() {
+                let lba = lba as u64;
+                self.engine()
+                    .snapshot_read(snap.snap_id, lba, &mut buf)
+                    .map_err(|e| format!("snapshot {} LBA {lba}: {e}", snap.snap_id))?;
+                let want = expected_data(snap.vol, lba, *expected);
+                if buf != want {
+                    return Err(format!(
+                        "snapshot {} of volume {} LBA {lba}: {:?}, expected {:?}",
+                        snap.snap_id,
+                        snap.vol,
+                        crate::model::decode(&buf),
+                        crate::model::decode(&want)
+                    ));
+                }
+            }
+            kept.push(snap);
+        }
+        self.snaps = kept;
+        Ok(())
+    }
+
+    /// Checks the engine's `diff` of `vol` against snapshot `snap_id`: the
+    /// blocks born after the snapshot are exactly those whose committed
+    /// content differs from the snapshot's, holes for punches.
+    pub fn check_diff(&mut self, snap_id: u64) -> Result<usize, String> {
+        let snap = self
+            .snaps
+            .iter()
+            .find(|s| s.snap_id == snap_id)
+            .cloned()
+            .ok_or_else(|| format!("no snapshot {snap_id} in the harness"))?;
+        let vol = snap.vol;
+        let diff = self
+            .engine()
+            .live_diff(vol, Some(snap_id))
+            .map_err(|e| format!("diff of {vol} since {snap_id}: {e}"))?;
+        let mut expected = Vec::new();
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        for (lba, at_snap) in snap.image.iter().enumerate() {
+            let lba = lba as u64;
+            self.engine()
+                .peek_disk(vol, lba, &mut buf)
+                .map_err(|e| format!("peek_disk {vol}/{lba}: {e}"))?;
+            let now = crate::model::decode(&buf);
+            let differs = match (now, at_snap) {
+                (crate::model::Decoded::Zero, None | Some((_, _, true))) => {
+                    // Zeros now, and nothing or a punch then: changed only if
+                    // a later punch covered the block (over data, a hole, or
+                    // nothing at all), which the engine records with a newer
+                    // birth. The committed map tells.
+                    self.engine().map_entry(vol, lba).is_some_and(|e| {
+                        e.is_hole() && self.engine_hole_is_newer(vol, lba, snap.cp_seq)
+                    })
+                }
+                (crate::model::Decoded::Write { op, .. }, Some((e_op, _, false))) => op != *e_op,
+                _ => true,
+            };
+            if differs {
+                expected.push(lba);
+            }
+        }
+        let got: Vec<u64> = diff.iter().map(|(lba, _)| *lba).collect();
+        if got != expected {
+            return Err(format!(
+                "diff of {vol} since snapshot {snap_id}: {got:?}, expected {expected:?}"
+            ));
+        }
+        for (lba, entry) in &diff {
+            let now = {
+                self.engine()
+                    .peek_disk(vol, *lba, &mut buf)
+                    .map_err(|e| e.to_string())?;
+                crate::model::decode(&buf)
+            };
+            let hole_ok = entry.is_hole() && now == crate::model::Decoded::Zero;
+            let data_ok = entry.is_data() && matches!(now, crate::model::Decoded::Write { .. });
+            if !hole_ok && !data_ok {
+                return Err(format!(
+                    "diff of {vol} LBA {lba}: entry {entry:?} does not match the image {now:?}"
+                ));
+            }
+        }
+        Ok(diff.len())
+    }
+
+    /// `true` when the committed hole at `lba` was punched after `cp_seq`.
+    fn engine_hole_is_newer(&mut self, vol: u32, lba: u64, cp_seq: u64) -> bool {
+        self.engine()
+            .map_entry(vol, lba)
+            .is_some_and(|e| u64::from(e.birth_cp) > cp_seq)
     }
 
     /// Ticks until no CP is in progress and no generation is frozen.
@@ -653,7 +910,7 @@ impl Sim {
     /// (writes the crash lost are forgotten, writes it kept are part of the
     /// image).
     pub fn verify_recovery(&mut self) -> Result<Verdict, String> {
-        let boot = self.last_boot.ok_or("no boot to verify")?;
+        let boot = self.last_boot.clone().ok_or("no boot to verify")?;
         let image = self.image()?;
         let mut blocks = HashMap::new();
         for (vol, lba, data) in image {
@@ -677,18 +934,18 @@ impl Sim {
             Stop::Daemon | Stop::Clean => {
                 if !lost.is_empty() {
                     return Err(format!(
-                        "{:?} restart lost acknowledged writes on {lost:?}: prefix {k}",
+                        "{:?} restart lost acknowledged writes on {lost:?}: prefix {k} (boot {boot:?})",
                         self.last_stop
                     ));
                 }
                 if nvfail != held {
                     return Err(format!(
-                        "{:?} restart changed nvfail from {held:?} to {nvfail:?}",
+                        "{:?} restart changed nvfail from {held:?} to {nvfail:?} (boot {boot:?})",
                         self.last_stop
                     ));
                 }
                 if self.last_stop == Stop::Clean && boot.dirty {
-                    return Err("a clean shutdown booted dirty".into());
+                    return Err(format!("a clean shutdown booted dirty: {boot:?}"));
                 }
             }
             Stop::Power => {
@@ -732,6 +989,7 @@ impl Sim {
             }
         }
         self.model.settle(k);
+        self.verify_snapshots()?;
         Ok(Verdict {
             k,
             lost,

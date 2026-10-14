@@ -319,6 +319,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "otap-backstore"
+version = "0.1.0"
+dependencies = [
+ "otap-arena",
+ "otap-cp",
+ "otap-format",
+ "otap-sim",
+ "otap-sys",
+ "proptest",
+]
+
+[[package]]
 name = "otap-cp"
 version = "0.1.0"
 dependencies = [
@@ -326,6 +338,7 @@ dependencies = [
  "otap-arena",
  "otap-format",
  "otap-index",
+ "otap-map",
  "otap-sys",
  "proptest",
 ]
@@ -341,6 +354,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "otap-geom"
+version = "0.1.0"
+dependencies = [
+ "otap-cp",
+ "otap-format",
+ "proptest",
+]
+
+[[package]]
 name = "otap-index"
 version = "0.1.0"
 dependencies = [
@@ -348,6 +370,14 @@ dependencies = [
  "otap-arena",
  "otap-format",
  "parking_lot",
+ "proptest",
+]
+
+[[package]]
+name = "otap-map"
+version = "0.1.0"
+dependencies = [
+ "otap-format",
  "proptest",
 ]
 
@@ -383,6 +413,18 @@ dependencies = [
  "proptest",
  "rustix",
  "zerocopy",
+]
+
+[[package]]
+name = "otap-ublk"
+version = "0.1.0"
+dependencies = [
+ "otap-arena",
+ "otap-cp",
+ "otap-format",
+ "otap-sim",
+ "otap-sys",
+ "proptest",
 ]
 
 [[package]]

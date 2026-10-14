@@ -40,6 +40,7 @@ fn ext(slot: u32, blocks: u32, seq: u64) -> DirtyExtent {
         ring: ring(slot),
         blocks,
         seq,
+        hole: false,
     }
 }
 
@@ -188,6 +189,7 @@ fn many_small_writes_coalesce_and_slot_gaps_or_laps_split_them() {
             ring: RingRef { slot: 5, lap: 1 },
             blocks: 1,
             seq: 1,
+            hole: false,
         },
     );
     v.insert(
@@ -196,6 +198,7 @@ fn many_small_writes_coalesce_and_slot_gaps_or_laps_split_them() {
             ring: RingRef { slot: 6, lap: 2 },
             blocks: 1,
             seq: 2,
+            hole: false,
         },
     );
     assert_eq!(v.extents(), 2);

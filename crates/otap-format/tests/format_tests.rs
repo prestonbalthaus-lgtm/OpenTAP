@@ -7,8 +7,8 @@
 //!    fails verification, through every parent-CRC path as well;
 //! 4. packed-field encode and decode with range checks;
 //! 5. the ring ranking, boot union and stripe identity rules;
-//! 6. the golden-vector decode lane: stored v2.0 / v1.0 images under
-//!    `tests/vectors/v2.0/` with a BLAKE3 manifest, decoded by the current
+//! 6. the golden-vector decode lane: stored v2.0 and v2.1 / v1.0 images under
+//!    `tests/vectors/v2.<minor>/` with BLAKE3 manifests, decoded by the current
 //!    reader and, at the version that produced them, reproduced byte for
 //!    byte by the builders.
 //!
@@ -67,6 +67,16 @@ fn fix_page(sb: &mut Superblock) {
     sb.cp_seq &= MAX_CP_SEQ;
     sb.slot = (sb.slot & 0b10) | (sb.cp_seq & 1) as u8;
     sb.vol_count = MAX_VOLS as u32;
+    // A recorded geometry (2.2) built from the random bytes: a whole stripe
+    // of at most 8 MiB, a segment of whole stripes, a capacity of at least
+    // one segment.
+    let stripe = 4096 * (1 + sb.geom_stripe_bytes % 2048);
+    let segment = stripe * (1 + sb.geom_segment_bytes % 64);
+    let capacity = sb.geom_capacity_bytes.max(u64::from(segment));
+    sb.set_geometry(stripe, segment, capacity);
+    if sb.open_data_pseg == 0 {
+        sb.open_data_idx = 0;
+    }
     if sb.durable_log.kind.is_multiple_of(2) {
         sb.durable_log = DurableLogHdr::NONE;
     } else {
@@ -257,9 +267,15 @@ fn superblock_field_offsets() {
     assert_eq!(offset_of!(Superblock, cluster_state), 464);
     assert_eq!(offset_of!(Superblock, durable_log), 480);
     assert_eq!(offset_of!(Superblock, inbound), 544);
-    assert_eq!(offset_of!(Superblock, reserved), 1696);
+    assert_eq!(offset_of!(Superblock, open_data_pseg), 1696);
+    assert_eq!(offset_of!(Superblock, open_data_idx), 1704);
+    assert_eq!(offset_of!(Superblock, rsvd_open), 1708);
+    assert_eq!(offset_of!(Superblock, geom_stripe_bytes), 1712);
+    assert_eq!(offset_of!(Superblock, geom_segment_bytes), 1716);
+    assert_eq!(offset_of!(Superblock, geom_capacity_bytes), 1720);
+    assert_eq!(offset_of!(Superblock, reserved), 1728);
     assert_eq!(offset_of!(Superblock, crc32c), 4092);
-    assert_eq!(1696 + SUPERBLOCK_RESERVED + 4, SUPERBLOCK_SIZE);
+    assert_eq!(1728 + SUPERBLOCK_RESERVED + 4, SUPERBLOCK_SIZE);
 
     assert_eq!(offset_of!(SuperblockSlot, sb), 0);
     assert_eq!(offset_of!(SuperblockSlot, vols), 4096);
@@ -382,7 +398,7 @@ fn stream_field_offsets() {
 
 #[test]
 fn constants_and_magics() {
-    assert_eq!(FORMAT_VERSION, 0x0200);
+    assert_eq!(FORMAT_VERSION, 0x0202);
     assert_eq!(STREAM_VERSION, 0x0100);
     assert_eq!(&SUPERBLOCK_MAGIC.to_le_bytes(), b"OTSB");
     assert_eq!(&INTENT_MAGIC.to_le_bytes(), b"OTIN");
@@ -555,7 +571,7 @@ proptest! {
         prop_assert!(decoded == slot);
         prop_assert_eq!(decoded.as_bytes(), slot.as_bytes());
         prop_assert_eq!(decoded.sb.compute_crc(), decoded.sb.crc32c);
-        prop_assert_eq!(&decoded.sb.reserved[..], &bytes[1696..4092]);
+        prop_assert_eq!(&decoded.sb.reserved[..], &bytes[1728..4092]);
     }
 }
 
@@ -1989,17 +2005,23 @@ fn summary_builders_reject_bad_inputs() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. golden vectors: the v2.0 / v1.0 decode lane
+// 9. golden vectors: the v2.0 and v2.1 / v1.0 decode lanes
 // ---------------------------------------------------------------------------
 
-/// BLAKE3 of `tests/vectors/v2.0/MANIFEST.txt`. Regenerating the vectors is a
-/// format change: bump FORMAT_MINOR or STREAM_MINOR, run
-/// `cargo test -p otap-format -- --ignored write_golden_vectors` and pin the
-/// value it prints, keeping the previous directory for the N-1 lane.
-const VECTORS_MANIFEST_BLAKE3: &str =
-    "73b1f4d3a6729fe19b0d13f050aaaed33165d7f07584fd26174c7861332b3af6";
+/// A stored vector set: its directory under `tests/vectors/`, the pinned
+/// BLAKE3 of its manifest, the format version that wrote it, the manifest's
+/// first line and the files it holds. Every set is decoded by the current
+/// reader on every run, which is the N / N-1 lane; the newest set is also
+/// compared byte for byte with the current builders.
+struct VectorSet {
+    dir: &'static str,
+    manifest_blake3: &'static str,
+    format_version: u16,
+    header: &'static str,
+    names: &'static [&'static str],
+}
 
-const VECTOR_NAMES: [&str; 12] = [
+const V2_0_NAMES: [&str; 12] = [
     "superblock_slot.bin",
     "superblock_slot_minor1.bin",
     "intent_slot.bin",
@@ -2014,11 +2036,66 @@ const VECTOR_NAMES: [&str; 12] = [
     "cp_log_page.bin",
 ];
 
-fn vectors_dir() -> PathBuf {
+const V2_1_NAMES: [&str; 14] = [
+    "superblock_slot.bin",
+    "superblock_slot_minor1.bin",
+    "intent_slot.bin",
+    "stripe_summary.bin",
+    "map_page.bin",
+    "page_index_page.bin",
+    "map_root.bin",
+    "stream_frame.bin",
+    "hole_records.bin",
+    "seg_entries.bin",
+    "snap_records.bin",
+    "cp_log_page.bin",
+    "cp_log_dir.bin",
+    "snap_root_page.bin",
+];
+
+/// Format 2.2 adds fields to the superblock only; the set has the same
+/// images, rewritten by the 2.2 builders.
+const V2_2_NAMES: [&str; 14] = V2_1_NAMES;
+
+/// The stored sets, oldest first. Regenerating a set is a format change:
+/// bump `FORMAT_MINOR` or `STREAM_MINOR`, add a set here with a new
+/// directory, run `cargo test -p otap-format -- --ignored
+/// write_golden_vectors` and pin the value it prints, keeping every previous
+/// directory for the N-1 lane.
+const VECTOR_SETS: [VectorSet; 3] = [
+    VectorSet {
+        dir: "v2.0",
+        manifest_blake3: "73b1f4d3a6729fe19b0d13f050aaaed33165d7f07584fd26174c7861332b3af6",
+        format_version: 0x0200,
+        header: "otap-format golden vectors: format 2.0 stream 1.0",
+        names: &V2_0_NAMES,
+    },
+    VectorSet {
+        dir: "v2.1",
+        manifest_blake3: "e85ac0be1e18d74d8ce9d2278f5d1ca39bce5660e2e5a8fb835d38f05513ac61",
+        format_version: 0x0201,
+        header: "otap-format golden vectors: format 2.1 stream 1.0",
+        names: &V2_1_NAMES,
+    },
+    VectorSet {
+        dir: "v2.2",
+        manifest_blake3: "3f9a9651f60d7d2b1e4189517653d623c128de4ed50bc55b40c8bd953bf8168d",
+        format_version: 0x0202,
+        header: "otap-format golden vectors: format 2.2 stream 1.0",
+        names: &V2_2_NAMES,
+    },
+];
+
+/// The set the current builders write.
+fn current_set() -> &'static VectorSet {
+    &VECTOR_SETS[VECTOR_SETS.len() - 1]
+}
+
+fn vectors_dir(set: &VectorSet) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("vectors")
-        .join("v2.0")
+        .join(set.dir)
 }
 
 const GOLDEN_NONCE: u64 = 0x0123_4567_89AB_CDEF;
@@ -2036,6 +2113,7 @@ fn golden_slot() -> SuperblockSlot {
     sb.write_active.set(0).unwrap();
     sb.write_active.set(2).unwrap();
     sb.nvfail.set(1).unwrap();
+    sb.set_geometry(32 * 1024, 256 * 1024, 64 << 20);
     sb.freed_pending = [
         RootRef::new(100, 1, 0xAAAA_AAAA),
         RootRef::new(101, 2, 0xBBBB_BBBB),
@@ -2046,6 +2124,8 @@ fn golden_slot() -> SuperblockSlot {
     sb.cp_log_head = RootRef::new(400, 16, 3);
     sb.snap_table = RootRef::new(500, 1, 4);
     sb.cluster_state = RootRef::new(600, 8, 5);
+    sb.open_data_pseg = 6;
+    sb.open_data_idx = 3;
     sb.inbound[0] = InboundState {
         applied_cp_seq: 40,
         applied_owner_epoch: 6,
@@ -2291,6 +2371,34 @@ fn golden_cp_log_page() -> CpLogPage {
 }
 
 /// Every golden image, built by the current builders.
+fn golden_cp_log_dir() -> CpLogDir {
+    CpLogDir {
+        cp_seq: 42,
+        fold_cp_seq: 42,
+        deltas: vec![
+            RootRef::new(400, 16, 3),
+            RootRef::new(420, 2, 0x0A0B_0C0D),
+            RootRef::new(430, 1, 0x1111_2222),
+        ],
+        pages: vec![
+            RootRef::new(4096, 4, 0x3333_4444),
+            RootRef::new(4100, 4, 0x5555_6666),
+        ],
+    }
+}
+
+fn golden_snap_root_page() -> SnapRootPage {
+    SnapRootPage::new(
+        uuid(0),
+        1,
+        42,
+        golden_map_root(),
+        RootRef::new(702, 1, 0xDEAD_BEEF),
+    )
+    .unwrap()
+}
+
+/// Every golden image, built by the current builders.
 fn golden_images() -> Vec<(&'static str, Vec<u8>)> {
     let (stripe, stripe_len) = golden_stripe();
     let (frame, payload) = golden_frame();
@@ -2319,6 +2427,14 @@ fn golden_images() -> Vec<(&'static str, Vec<u8>)> {
             [frame.as_bytes(), payload.as_slice()].concat(),
         ),
         ("hole_records.bin", golden_holes().as_bytes().to_vec()),
+        (
+            "cp_log_dir.bin",
+            golden_cp_log_dir().encode(uuid(0)).unwrap(),
+        ),
+        (
+            "snap_root_page.bin",
+            golden_snap_root_page().as_bytes().to_vec(),
+        ),
     ]
 }
 
@@ -2339,9 +2455,14 @@ fn manifest_text(images: &[(&str, Vec<u8>)]) -> String {
 }
 
 #[test]
-#[ignore = "regenerates tests/vectors/v2.0; run on purpose with --ignored, together with a minor bump"]
+#[ignore = "regenerates the current vector set; run on purpose with --ignored, together with a minor bump"]
 fn write_golden_vectors() {
-    let dir = vectors_dir();
+    let set = current_set();
+    assert_eq!(
+        set.format_version, FORMAT_VERSION,
+        "add a VectorSet for the new version before regenerating"
+    );
+    let dir = vectors_dir(set);
     std::fs::create_dir_all(&dir).unwrap();
     let images = golden_images();
     for (name, bytes) in &images {
@@ -2350,30 +2471,32 @@ fn write_golden_vectors() {
     let manifest = manifest_text(&images);
     std::fs::write(dir.join("MANIFEST.txt"), &manifest).unwrap();
     println!(
-        "wrote {} vectors to {}\nVECTORS_MANIFEST_BLAKE3 = \"{}\"",
+        "wrote {} vectors to {}\nmanifest_blake3 = \"{}\"",
         images.len(),
         dir.display(),
         hex(&blake3_256(manifest.as_bytes()))
     );
 }
 
-#[test]
-fn golden_vectors_decode_lane() {
-    let dir = vectors_dir();
-    let manifest = std::fs::read(dir.join("MANIFEST.txt")).expect(
-        "tests/vectors/v2.0/MANIFEST.txt is missing; run `cargo test -p otap-format -- --ignored write_golden_vectors`",
-    );
+/// Reads a set's files, checking the manifest hash, the header line and the
+/// per-file hashes and sizes.
+fn read_set(set: &VectorSet) -> HashMap<String, Vec<u8>> {
+    let dir = vectors_dir(set);
+    let manifest = std::fs::read(dir.join("MANIFEST.txt")).unwrap_or_else(|_| {
+        panic!(
+            "tests/vectors/{}/MANIFEST.txt is missing; run `cargo test -p otap-format -- --ignored write_golden_vectors`",
+            set.dir
+        )
+    });
     assert_eq!(
         hex(&blake3_256(&manifest)),
-        VECTORS_MANIFEST_BLAKE3,
-        "the vector manifest changed; a format change needs a minor bump and a new pinned hash"
+        set.manifest_blake3,
+        "the {} vector manifest changed; a format change needs a minor bump, a new set and a new pinned hash",
+        set.dir
     );
     let text = String::from_utf8(manifest).unwrap();
     let mut lines = text.lines();
-    assert_eq!(
-        lines.next(),
-        Some("otap-format golden vectors: format 2.0 stream 1.0")
-    );
+    assert_eq!(lines.next(), Some(set.header));
     let mut files: HashMap<String, Vec<u8>> = HashMap::new();
     for line in lines {
         let mut parts = line.split_whitespace();
@@ -2387,13 +2510,39 @@ fn golden_vectors_decode_lane() {
         assert_eq!(hex(&blake3_256(&bytes)), hash, "{name}");
         files.insert(name.to_string(), bytes);
     }
-    for name in VECTOR_NAMES {
-        assert!(files.contains_key(name), "{name} is not in the manifest");
+    for name in set.names {
+        assert!(files.contains_key(*name), "{name} is not in the manifest");
     }
+    assert_eq!(
+        files.len(),
+        set.names.len(),
+        "{}: unexpected files",
+        set.dir
+    );
+    files
+}
 
-    // The decode lane: the current reader reads every stored image and sees
-    // the values the generator wrote.
+#[test]
+fn golden_vectors_decode_lane() {
+    for set in &VECTOR_SETS {
+        let files = read_set(set);
+        decode_set(&files, set);
+    }
+    // At the version that produced the newest set, the builders reproduce
+    // it byte for byte; the older sets are what prove N reads N-1.
+    let set = current_set();
+    assert_eq!(set.format_version, FORMAT_VERSION);
+    let files = read_set(set);
+    for (name, bytes) in golden_images() {
+        assert_eq!(files[name], bytes, "{name} no longer matches its builder");
+    }
+}
+
+/// The decode lane: the current reader reads every stored image of `set`
+/// and sees the values the generator wrote.
+fn decode_set(files: &HashMap<String, Vec<u8>>, set: &VectorSet) {
     let slot = SuperblockSlot::read(&files["superblock_slot.bin"]).unwrap();
+    assert_eq!(slot.sb.ver, set.format_version);
     assert_eq!(slot.sb.agg_id, uuid(0));
     assert_eq!(slot.sb.commit_key(), (7, 42));
     assert_eq!(slot.sb.cut_seq, 43);
@@ -2407,15 +2556,51 @@ fn golden_vectors_decode_lane() {
     assert_eq!(slot.vols.vols[1].nvfail_cause(), Some(NvCause::DirtyBoot));
     assert_eq!(slot.vols.vols[2].acked_bytes, 4096);
     assert_eq!(slot.sb.map_roots, RootRef::new(200, 4, 1));
+    if set.format_version >= 0x0201 {
+        assert_eq!((slot.sb.open_data_pseg, slot.sb.open_data_idx), (6, 3));
+    } else {
+        assert_eq!((slot.sb.open_data_pseg, slot.sb.open_data_idx), (0, 0));
+    }
+    if set.format_version >= 0x0202 {
+        assert_eq!(slot.sb.geometry(), Some((32 * 1024, 256 * 1024, 64 << 20)));
+    } else {
+        assert_eq!(slot.sb.geometry(), None);
+    }
     assert_eq!(slot.sb.inbound[0].group, 1);
     assert!(slot.sb.inbound[0].is_valid());
     assert!(slot.sb.durable_log.is_none());
 
-    let minor1 = SuperblockSlot::read(&files["superblock_slot_minor1.bin"]).unwrap();
-    assert_eq!(minor1.sb.ver, FORMAT_VERSION + 1);
-    assert_eq!(minor1.sb.reserved[..4], [1, 2, 3, 4]);
-    assert_eq!(minor1.vols.vols[0].rsvd, 0x0102);
-    assert_eq!(minor1.sb.commit_key(), slot.sb.commit_key());
+    let minor1 = SuperblockSlot::read(&files["superblock_slot_minor1.bin"]);
+    if set.format_version == 0x0201 {
+        // The 2.1 writer put its demonstration bytes where 2.2 keeps the
+        // geometry: a page that claims 2.2 must carry a valid geometry, so
+        // the 2.2 reader refuses this image on that field (not on its CRC,
+        // which still verifies). What the N-1 lane proves here is the rule.
+        assert!(
+            matches!(
+                minor1,
+                Err(FormatError::BadField {
+                    field: "geom_stripe_bytes",
+                    ..
+                })
+            ),
+            "{minor1:?}"
+        );
+    } else {
+        let minor1 = minor1.unwrap();
+        assert_eq!(minor1.sb.ver, set.format_version + 1);
+        if set.format_version >= 0x0202 {
+            assert_eq!(minor1.sb.reserved[..4], [1, 2, 3, 4]);
+            assert_eq!(minor1.sb.geometry(), slot.sb.geometry());
+        } else {
+            // The 2.0 writer put its demonstration bytes where 2.1 now keeps
+            // the open data segment: a later minor gave meaning to them.
+            assert_eq!(minor1.sb.open_data_pseg, 0x0403_0201);
+            assert_eq!(minor1.sb.reserved[..4], [0, 0, 0, 0]);
+        }
+        assert_eq!(minor1.vols.vols[0].rsvd, 0x0102);
+        assert_eq!(minor1.sb.commit_key(), slot.sb.commit_key());
+    }
 
     let intent = IntentSlot::read(&files["intent_slot.bin"]).unwrap();
     assert_eq!((intent.intent_seq, intent.slot, intent.cp_seq), (11, 1, 42));
@@ -2530,6 +2715,7 @@ fn golden_vectors_decode_lane() {
     assert_eq!(snaps[2].snap_kind(), Some(SnapKind::Crash));
 
     let cp_log = CpLogPage::read(&files["cp_log_page.bin"]).unwrap();
+    assert_eq!(cp_log.hdr.ver, set.format_version);
     assert_eq!(cp_log.hdr.agg_id, uuid(0));
     assert_eq!(
         (cp_log.hdr.cp_seq, cp_log.hdr.page_seq, cp_log.hdr.count),
@@ -2541,12 +2727,20 @@ fn golden_vectors_decode_lane() {
     assert_eq!(cp_log.records()[0].map_entry().lseg(), 17);
     assert_eq!(cp_log.records()[99].lba, 1099);
 
-    // At the version that produced the vectors, the builders reproduce them
-    // byte for byte. After a minor bump this comparison is skipped and the
-    // decode lane above is what proves N reads N-1.
-    if FORMAT_MINOR == 0 && STREAM_MINOR == 0 {
-        for (name, bytes) in golden_images() {
-            assert_eq!(files[name], bytes, "{name} no longer matches its builder");
-        }
+    // The 2.1 structures exist in the sets written at 2.1 and later.
+    if set.format_version >= 0x0201 {
+        let dir = CpLogDir::decode(&files["cp_log_dir.bin"], &uuid(0)).unwrap();
+        assert_eq!(dir, golden_cp_log_dir());
+        assert_eq!(dir.deltas[0].pba, slot.sb.cp_log_head.pba);
+        let page = CpLogDirPage::read(&files["cp_log_dir.bin"][..CP_LOG_DIR_PAGE_SIZE]).unwrap();
+        assert_eq!(page.hdr.ver, set.format_version);
+        assert_eq!((page.hdr.delta_entries, page.hdr.page_entries), (3, 2));
+
+        let snap_root = SnapRootPage::read(&files["snap_root_page.bin"]).unwrap();
+        assert_eq!(snap_root.ver, set.format_version);
+        assert_eq!((snap_root.snap_id, snap_root.birth_cp), (1, 42));
+        assert_eq!(snap_root.root, root);
+        assert_eq!(snap_root.deadlist, RootRef::new(702, 1, 0xDEAD_BEEF));
+        assert!(snap_root.root.verify_index(&index.0).is_ok());
     }
 }

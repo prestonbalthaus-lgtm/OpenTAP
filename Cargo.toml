@@ -12,8 +12,12 @@ members = [
     "crates/otap-sys",
     "crates/otap-arena",
     "crates/otap-index",
+    "crates/otap-map",
     "crates/otap-cp",
     "crates/otap-sim",
+    "crates/otap-geom",
+    "crates/otap-backstore",
+    "crates/otap-ublk",
 ]
 # The cargo-fuzz package is its own workspace: it needs nightly and links
 # libFuzzer, so it must not take part in `cargo test --workspace`.
@@ -52,7 +56,6 @@ parking_lot = "0.12.5"
 # pulled in only under `cfg(target_os = "linux")`, so the workspace resolves
 # and builds on any host.
 io-uring = "0.7.15"
-libublk = "=0.4.8"
 rustix = "1.1.5"
 memmap2 = "0.9.11"
 # libfuzzer-sys 0.4 is declared by fuzz/Cargo.toml, which is outside this

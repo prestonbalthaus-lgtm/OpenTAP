@@ -90,7 +90,9 @@ documents of section 7 updated; the step reported.
   are ported in place once the defect is fixed: same file, the review's
   scenario kept, the expectation changed to the fixed behaviour, the
   defect's number in the log named in a comment. The review's passing
-  tests stay as written. Nothing is deleted to make a suite green.
+  tests stay as written; the review's files may take the crate's
+  `review_*_tests.rs` names when they are ported. Nothing is deleted to
+  make a suite green.
 
 ## 5. Changing a format or the wire
 

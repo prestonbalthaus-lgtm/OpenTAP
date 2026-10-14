@@ -34,10 +34,10 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use crate::checksum::crc32c;
 use crate::constants::{
-    INDEX_ENTRIES_PER_PAGE, INDEX_ENTRY_SIZE, INDEX_PAGE_SHIFT, INDEX_PAGE_SIZE, LSEG_BITS,
-    MAP_ENTRIES_PER_PAGE, MAP_ENTRY_SIZE, MAP_PAGE_SHIFT, MAP_PAGE_SIZE, MAP_ROOT_SIZE, MAX_CP_SEQ,
-    MAX_LBA, MAX_LSEG, MAX_PLEN, MAX_SEG_OFF, MAX_VOL, NULL_LSEG, OFF_BITS, PLEN_BITS,
-    SECTORS_PER_BLOCK,
+    BLOCK_SIZE, INDEX_ENTRIES_PER_PAGE, INDEX_ENTRY_SIZE, INDEX_PAGE_SHIFT, INDEX_PAGE_SIZE,
+    LSEG_BITS, MAP_ENTRIES_PER_PAGE, MAP_ENTRY_SIZE, MAP_PAGE_SHIFT, MAP_PAGE_SIZE, MAP_ROOT_SIZE,
+    MAX_CP_SEQ, MAX_LBA, MAX_LSEG, MAX_PLEN, MAX_SEG_OFF, MAX_VOL, MAX_VOLS, NULL_LSEG, OFF_BITS,
+    PLEN_BITS, SECTORS_PER_BLOCK,
 };
 use crate::types::{bad_field, check_crc, copy_out, view, FormatError};
 
@@ -381,7 +381,7 @@ impl PageIndexPage {
 )]
 #[repr(C)]
 pub struct MapRoot {
-    /// The volume index, below [`MAX_VOLS`](crate::MAX_VOLS).
+    /// The volume index, below [`MAX_VOLS`].
     pub vol: u32,
     /// Reserved flag bits, zero; ignored by readers.
     pub flags: u32,
@@ -509,3 +509,88 @@ const _: () = {
     assert!(MAP_OFF_SHIFT == 12);
     assert!(MAP_LSEG_SHIFT + LSEG_BITS == 64);
 };
+
+impl MapRoot {
+    /// The absent slot of a map-roots table: all zero (`lba_count == 0`).
+    pub const ABSENT: Self = Self {
+        vol: 0,
+        flags: 0,
+        index_pba: 0,
+        index_pages: 0,
+        index_crc: 0,
+        lba_count: 0,
+        checkpoint_cp_seq: 0,
+        max_birth: 0,
+        rsvd0: 0,
+        rsvd1: [0; 16],
+    };
+
+    /// `true` for an absent slot. A present root has a size of at least one
+    /// block.
+    #[must_use]
+    pub const fn is_absent(&self) -> bool {
+        self.lba_count == 0
+    }
+}
+
+/// The map-roots table region (F14): one [`MapRoot`] per volume index, the
+/// slot of an absent volume all zero, `roots.len()` the superblock's
+/// `vol_count`, padded with zero bytes to whole 4 KiB pages. An empty table
+/// is at least one page.
+pub fn map_roots_image(roots: &[MapRoot]) -> Result<Vec<u8>, FormatError> {
+    for (i, root) in roots.iter().enumerate() {
+        if root.is_absent() {
+            if *root != MapRoot::ABSENT {
+                return Err(bad_field("lba_count", 0));
+            }
+            continue;
+        }
+        root.validate()?;
+        if root.vol as usize != i {
+            return Err(bad_field("vol", u64::from(root.vol)));
+        }
+    }
+    let mut bytes = roots.as_bytes().to_vec();
+    let padded = bytes.len().div_ceil(BLOCK_SIZE).max(1) * BLOCK_SIZE;
+    bytes.resize(padded, 0);
+    Ok(bytes)
+}
+
+/// Parses a map-roots table region of `vol_count` slots: every present root
+/// validates and sits at its own volume index, absent slots are all zero,
+/// and only zero bytes follow the table.
+pub fn parse_map_roots(bytes: &[u8], vol_count: u32) -> Result<Vec<MapRoot>, FormatError> {
+    if !bytes.len().is_multiple_of(BLOCK_SIZE) {
+        return Err(FormatError::BadLength {
+            expected: bytes.len().div_ceil(BLOCK_SIZE) * BLOCK_SIZE,
+            found: bytes.len(),
+        });
+    }
+    let count = vol_count as usize;
+    if count > MAX_VOLS || bytes.len() < count * MAP_ROOT_SIZE {
+        return Err(FormatError::BadLength {
+            expected: count * MAP_ROOT_SIZE,
+            found: bytes.len(),
+        });
+    }
+    let mut roots = Vec::with_capacity(count);
+    for i in 0..count {
+        let chunk = &bytes[i * MAP_ROOT_SIZE..(i + 1) * MAP_ROOT_SIZE];
+        let root: MapRoot = copy_out(chunk)?;
+        if root.is_absent() {
+            if root != MapRoot::ABSENT {
+                return Err(bad_field("lba_count", 0));
+            }
+        } else {
+            root.validate()?;
+            if root.vol as usize != i {
+                return Err(bad_field("vol", u64::from(root.vol)));
+            }
+        }
+        roots.push(root);
+    }
+    if bytes[count * MAP_ROOT_SIZE..].iter().any(|b| *b != 0) {
+        return Err(bad_field("vol", u64::from(vol_count)));
+    }
+    Ok(roots)
+}

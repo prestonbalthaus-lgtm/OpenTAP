@@ -1,0 +1,20 @@
+[package]
+name = "otap-ublk"
+description = "OpenTAP's ublk front door: the state machine that turns a ublk queue's requests (read, write, flush, discard, write zeroes) into the engine's FrontDoor requests and their statuses back into ublk results, with back-pressure watermarks, offline and nvfail rejection, and stale-completion defence, tested on any host through a mock transport; and, on Linux, the device lifecycle over otap-sys (UBLK_F_USER_COPY) and a runner. No unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-cp = { path = "../otap-cp" }
+otap-format = { path = "../otap-format" }
+otap-sys = { path = "../otap-sys" }
+
+[dev-dependencies]
+otap-sim = { path = "../otap-sim" }
+otap-arena = { path = "../otap-arena" }
+proptest.workspace = true

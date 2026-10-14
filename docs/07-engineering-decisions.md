@@ -5,7 +5,7 @@ Living log of the decisions the implementation made that the design documents
 did not make, or made differently. Entries are numbered E01 onward and never
 renumbered; a reversed decision gets a new entry that points back. The format
 rulings F1 to F11 are owned by the code (`crates/otap-format/src/lib.rs`) and
-only summarised here; the stream rules S1 to S10 are owned by this file and
+only summarised here (F12 to F14 since format 2.1); the stream rules S1 to S10 are owned by this file and
 enforced by the tests named under each.
 
 Each entry: date, status, context, decision, consequences, where it is
@@ -554,3 +554,466 @@ FrontDoor, and Clock traits").
   exactly the newest write it holds.
 - **Enforced by** `crates/otap-index/src/lib.rs`, `index_tests.rs`,
   `adversarial_index_tests.rs`.
+
+## E21. E19 is closed by the owner: flush-opaque backstores are trusted, not refused
+
+2026-10-13. Accepted (owner ruling, Step 4 brief, section 1). Supersedes
+the refusal in E19.
+
+- **Context.** E19 refused flush-opaque backstores (a hardware RAID
+  virtual drive, any LUN whose cache the kernel cannot see) until the
+  owner decided between a three-CP ring and a post-commit flush
+  discipline. The owner ruled that OpenTAP must not hard-refuse them in
+  production: hardware agnosticism across PERC, MegaRAID, Smart Array
+  virtual disks, `mdadm` and raw drives is a core requirement.
+- **Decision.** `MediaProfile` carries a `FlushPolicy`
+  (`otap_cp::traits`): `RequireFuaOrFlush` (strict: a flush-opaque
+  geometry is refused at format and boot with
+  `EngineError::FlushOpaqueRefused`, as E19 did) and
+  `TrustBarrierWithNvfail`, the default and the mode for hardware RAID and
+  opaque LUNs. Under the trust policy the engine keeps its host-side
+  barrier exactly where E17 put it (the pool flush after the stripes and
+  the metadata, before the `A` and `B` commits; on Linux an
+  `IORING_OP_FSYNC` with `FSYNC_DATASYNC`), trusts it, pushes a structured
+  `OperatorWarning::FlushOpaqueTrusted { policy }` into
+  `pool_status().warnings` and emits `Event::OperatorWarning` at boot,
+  defers every segment free one more consistency point (regions freed by
+  CP `N` are reusable after `N+2` instead of `N+1`), and relies on nvfail
+  to quarantine every volume after a power loss, which a dirty boot does
+  anyway. `MediaProfile::flash` and `::hdd` default to the trust policy;
+  `otap-geom` derives it (E26). The third option of E19 (falling back to
+  the N-2 CP when N-1 is torn) is not reachable with the two-slot ring the
+  format has and was not built; the ruling does not ask for it.
+- **The other rulings recorded with it.** D1: Phase C (single node) then
+  Phase B (dual node, internal drives, asynchronous delta shipping) then
+  Phase A (shared SAS shelf). D2: `unmirrored_flush = placed` is the
+  default; client writes are never throttled to disk speed when a partner
+  or witness is unreachable; they are acknowledged at DRAM speed and the
+  cluster health degrades. D8: iSCSI (LIO over ublk), then NFSv3/v4.1 and
+  SMB3 in SVM namespaces, then Fibre Channel (`tcm_qla2xxx`) and S3
+  (`versitygw`). D9: volumes are thin-provisioned by default and `nvfail`
+  is on by default; segment reclamation discards whole segments
+  (`BLKDISCARD`) on flash and overwrites sequentially without discards on
+  rotational drives and hardware RAID. D10: the third Raft voter runs on
+  the local LAN under 100 ms; a witness failure never degrades or
+  throttles I/O. Of these only D2 and D9 have code behind them today: a
+  flush is acknowledged when the writes it covers are placed (the engine's
+  `Flush` completes at once), and `DiscardPolicy` (`WholeSegment`,
+  `Never`) is a `MediaProfile` field the engine honours when it frees a
+  segment.
+- **Consequences.** A pool on a lying controller with a dead battery can
+  lose the writes the barrier was trusted for; the simulator models that
+  (`cache_protected = false`) and the tests show the engine then either
+  boots dirty with every volume quarantined behind a consistent prefix, or
+  refuses to boot, never serves a torn image. An operator who wants the
+  refusal back sets the strict policy.
+- **Enforced by** `crates/otap-cp/src/traits.rs` (`FlushPolicy`,
+  `DiscardPolicy`, `MediaProfile`), `engine.rs` (`check_flush_policy`,
+  the warning, the deferred frees), `otap-sim/src/backstore.rs`
+  (`cache_protected`), `adversarial_sim_tests.rs`
+  (`flush_opaque_geometries_follow_the_flush_policy`),
+  `step4_sim_tests.rs` (the two opaque-cache tests, the discard-policy
+  test).
+
+## E22. The persistent map: overlays, a CP log of delta regions, folds, and format 2.1
+
+2026-10-13. Accepted. Lifts the whole-map image of E14.
+
+- **Context.** E14 wrote the whole block map at every consistency point
+  and bounded the metadata of a CP to one segment. The Step 4 brief asks
+  for the two-level radix map with copy-on-write dirty pages, fast CP
+  logging through `CpLogPage`/`CpLogRec` with periodic folds, snapshot
+  pinning and the `birth_cp` walk.
+- **Decision.** `crates/otap-map` (no `unsafe`, no I/O: it reads pages
+  through a `PageReader` and places regions through a `RegionWriter`) holds
+  one `VolumeMap` per volume: the on-disk `MapRoot`, the page index (one
+  `PageIndexEntry` per 1,024-entry `MapPage`), and an in-memory *overlay*
+  of the entries changed since the last fold. A lookup reads the overlay
+  first, then the page through a pba-keyed cache. Every CP writes its
+  changes as a *delta region* (a run of `CpLogPage`s, one `CpLogRec` per
+  block written or hole punched) and a *directory* (`CpLogDirPage`, F12)
+  that names every delta region since the last fold in CP order; the
+  superblock's `cp_log_head` names the directory and `map_roots` the
+  table of roots (F14). A *fold* rewrites, copy on write, every map page
+  the overlay and the CP's own records touch, writes the page indexes and
+  roots of the volumes concerned, and empties the directory; a fold CP
+  writes no delta region of its own (its records are in the pages).
+  Replay at boot applies a delta region's records iff the region's CP is
+  above the fold CP, which lets a later relocation preserve births. The
+  fold policy is the engine's (`FoldPolicy`: log bytes, time, CPs with
+  changes, committed dirty pages, committed overlay entries; defaults
+  1 GiB, ten minutes, 1,024, 65,536, 8 million), and the engine also folds
+  on request, for a snapshot and at a clean shutdown. A volume's index is
+  bounded to a quarter of the pool (`EngineError::MetadataTooLarge`)
+  instead of E14's one-segment bound.
+- **Format 2.1.** `FORMAT_MINOR` 1; rulings F12 (the directory), F13 (the
+  `SnapRootPage`) and F14 (the table regions) in
+  `crates/otap-format/src/lib.rs`; the superblock's reserved area yields
+  `open_data_pseg` and `open_data_idx` so a boot restores the open data
+  segment; a new golden-vector set `tests/vectors/v2.1/` (14 files,
+  manifest `e85ac0be…13ac61`) next to the kept 2.0 set, both decoded by
+  the lane. A pool written by 2.0 is refused at boot (`BootError::
+  OldLayout`); none was ever released.
+- **Consequences.** The metadata of a CP is a handful of pages (the
+  deltas, the directory, the tables) until a fold, whose cost is the dirty
+  pages plus the indexes of the volumes touched. Reads of unfolded entries
+  hit the overlay (memory); the overlay's size is bounded by the policy.
+  The delta regions of a fold are freed under the deferred-free rule of
+  E24 so a crash during the fold still has them.
+- **Enforced by** `crates/otap-map/src/lib.rs`, `map_tests.rs` (a model
+  across random CPs, folds, replays and reboots; damage and misdirection;
+  replay disorder), `otap-format/src/lib.rs` (F12 to F14), `records.rs`,
+  `records_tests.rs`, `format_tests.rs` (the 2.1 vectors),
+  `step4_sim_tests.rs` (`a_map_spanning_many_pages…`,
+  `cp_log_records_replay…`, `the_fold_policy_folds_on_each_of_its_triggers`).
+
+## E23. Discards and writes of zeros are holes: an arena record, an index extent, a map entry with a birth
+
+2026-10-13. Accepted.
+
+- **Context.** The ublk front door delivers `Discard` and `WriteZeroes`;
+  the format has had a hole entry with a birth since Step 2; the arena and
+  the index knew only data.
+- **Decision.** A punch is served like a write but without data: one arena
+  slot takes a `HoleRecordBlock` (arena layout 1.2: `SlotDesc.kind`
+  distinguishes `Data` from `Hole`), the index gets a `DirtyExtent` with
+  `hole = true` (it wins its range like a write; a superseded hole releases
+  nothing), reads of it return zeros (`PeekSource::Hole`), and the CP
+  writes it as a `CpLogRec` hole with the CP as birth, never into a
+  stripe; the record slot is released when the generation's CP commits.
+  Both request kinds share the path (`serve_punch`), bounded by
+  `MAX_PUNCH_BLOCKS` (262,144 blocks, 1 GiB) per request and the volume's
+  range. A punch survives a daemon crash through the re-attached arena
+  (the record is placed and verified like data) and a power cut through
+  the map once committed. `diff` reports every entry born after the base,
+  data or hole, including a hole punched over a block that was unmapped
+  (a delta shipper punches zeros over zeros; "what changed" is what the
+  map knows).
+- **Consequences.** A discard costs one arena slot and one log record,
+  not a stripe; a volume-wide punch is one request. The simulator's
+  checker treats a punched block as expected zeros and, because zeros are
+  ambiguous (a punch over a write leaves what nothing at all would), takes
+  the largest operation number the image is consistent with.
+- **Enforced by** `crates/otap-arena/src/lib.rs` (`fill_hole`,
+  `hole_record`, layout 1.2), `otap-index/src/lib.rs` (`DirtyExtent::hole`),
+  `otap-cp/src/engine.rs` (`serve_punch`, `gen_holes`), `arena_tests.rs`,
+  `index_tests.rs`, `step4_sim_tests.rs` (`punches_persist…`,
+  `punches_are_refused_like_writes`,
+  `a_punch_over_a_write_is_not_a_loss…`), `otap-ublk/tests/engine_tests.rs`.
+
+## E24. The metadata stream, liveness accounting and deferred frees
+
+2026-10-13. Accepted.
+
+- **Context.** With the map in regions of varying size, a CP's metadata no
+  longer fits one image in one segment, and freed regions must not be
+  reused while a crash could still boot the CP that references them.
+- **Decision.** `MetaStream` (`otap-cp/src/meta.rs`) packs every region of
+  a CP (deltas, fold pages and indexes, snapshot root pages, the snapshot
+  table, the roots table, the directory, then the segment table, reserved
+  first so its own bytes count) back to back into whole stripes of the
+  open metadata segment, and into a run of adjacent free segments
+  (`SegmentTable::allocate_run`) when a region does not fit what is left;
+  it works on a copy of the segment table that the engine swaps in at
+  commit. The table keeps `data_live` and `meta_live` per segment; a
+  region a CP stops referencing is queued and released after the next CP
+  commits (`N+1`; `N+2` under a flush-opaque profile, E21), and the two
+  segments of the boot CP are protected for two commits. A freed data or
+  metadata segment is discarded whole or merely returned, per the
+  `DiscardPolicy`; a segment whose discard is in flight stays allocated
+  until the discard completes, because a reordering device completed a
+  late discard over a segment the engine had already reused. Data
+  allocations keep `META_RESERVE_SEGMENTS` (2) free for the boot and
+  shutdown commits.
+- **Consequences.** A pool's metadata can span as many segments as it
+  needs; the cleaner for data segments is still not written (a segment
+  with one live block stays allocated). Events `SegmentFreed { pseg,
+  discarded }` and `Folded` make the accounting visible.
+- **Enforced by** `crates/otap-cp/src/meta.rs`, `segments.rs`,
+  `engine.rs` (`freed_pending`, `boot_protect`, `discarding`,
+  `free_segment`), `step4_sim_tests.rs`
+  (`a_segment_stays_allocated_until_its_discard_completes`,
+  `segment_reclamation_follows_the_discard_policy`,
+  `a_map_spanning_many_pages_and_segments…`), the simulator's
+  random-geometry walk.
+
+## E25. Snapshots in Step 4: taken at a fold, pinned by a root page, read and diffed, not yet deleted
+
+2026-10-13. Accepted.
+
+- **Context.** The brief asks for pinning a volume's root into a
+  `SnapRecord` and the `birth_cp > base_cp` walk for delta shipping.
+- **Decision.** `create_snapshot(vol, uuid, kind, origin)` is taken at the
+  next consistency point, which the engine makes a fold so the root is
+  complete; the CP writes a `SnapRootPage` (F13) with the pinned
+  `MapRoot`, lists the `SnapRecord` in the snapshot table (F14), and
+  announces `Event::SnapshotCreated` when it commits. `snapshot_read`
+  resolves through the pinned root (overlay-free), `snapshot_diff` and
+  `live_diff` walk births above the snapshot's CP (`pinned_diff`, `diff`),
+  reading only the pages whose `max_birth` says they may hold one. A
+  snapshot pins what it references: a data block stays live while a
+  snapshot of the volume has a birth at or above the block's; a map page
+  or index region stays live while a pinned root references it. Snapshot
+  deletion and deadlists are not written (`deadlist` is `NONE`); a boot
+  that rewinds below a snapshot's CP loses the snapshot with the CP, which
+  the simulator's checker allows and nothing else does. Names stay off the
+  disk (F11).
+- **Consequences.** A snapshot costs one fold; the space it pins is
+  returned only by deletion, which is Step 5 work with the cleaner.
+- **Enforced by** `crates/otap-cp/src/engine.rs` (`create_snapshot`,
+  `snapshots`, `snapshot_read`, `snapshot_diff`, `live_diff`, the liveness
+  rules), `otap-map/src/lib.rs` (`pin`, `pinned_get`, `pinned_diff`),
+  `otap-sim/src/harness.rs` (`snapshot`, `verify_snapshots`,
+  `check_diff`), `step4_sim_tests.rs` (`snapshots_keep_their_image…`,
+  `a_snapshot_is_isolated…`), the extended random walk.
+
+## E26. Geometry discovery: sysfs facts, a classification, and a plan with overrides
+
+2026-10-13. Accepted.
+
+- **Context.** The brief asks for sysfs queue parameters with deterministic
+  mock inputs and a `StripeGeometry` aligned to md or hardware RAID, with
+  the segment size by media and the E19 policy derived.
+- **Decision.** `crates/otap-geom` (no `unsafe`, no I/O of its own) reads
+  a `SysfsSource` (`Sysfs` on Linux, `MockSysfs` everywhere) for
+  `rotational`, `minimum_io_size`, `optimal_io_size`, `alignment_offset`,
+  `discard_granularity`, `write_cache`, `fua`, the device size, the md
+  level, chunk and member count, the vendor and model; classifies the
+  device (`Md`, `Nvme`, `HwRaidVd`, `Disk`, `Virtual`, `Loop`, `Dm`,
+  `Other`); and plans: the stripe is the md chunk times the data disks
+  (RAID 10 by its layout), else `optimal_io_size` when it is at least
+  64 KiB (below that it describes a physical block), else 1 MiB; the
+  segment is 80 MiB rotational, 64 MiB NVMe, 8 MiB other flash, shrunk
+  until the device holds eight, or `TooSmall`; a misaligned device is
+  refused unless `allow_misaligned`; a hardware RAID virtual disk is
+  flush-opaque and gets the trust policy, everything else the strict
+  policy; flash with a discard granularity gets `WholeSegment` discards;
+  warnings explain each choice. `Overrides` let an operator set any of
+  these. `StripeGeometry::geometry()` and `media_profile()` feed the
+  engine.
+- **Consequences.** The planner has run only against mocks; the first real
+  hosts will teach it vendor strings and md layouts it does not know
+  (the `Other` and `Virtual` classes exist for that).
+- **Enforced by** `crates/otap-geom/src/lib.rs`, `geom_tests.rs`.
+
+## E27. The Linux backstore and its portable fallback live in `otap-backstore`
+
+2026-10-13. Accepted.
+
+- **Context.** The brief allowed the production `Backstore` in `otap-cp`
+  or in its own crate. `otap-cp` is pure and forbids `unsafe`; the Linux
+  driver needs `otap-sys`.
+- **Decision.** `crates/otap-backstore` (no `unsafe`) holds
+  `UringBackstore`, the Linux driver over `otap_sys::block::BlockRing`:
+  the device opened `O_DIRECT`, every stripe and metadata write staged
+  into a page-aligned pool slot the ring owns until the completion is
+  reaped, superblock and intent writes with `RWF_DSYNC`, the barrier as
+  `IORING_OP_FSYNC` with `FSYNC_DATASYNC`, segment discards as
+  `BLKDISCARD`, the capacity checked against the profile at open; the
+  engine orders `A` before `B` (E17) and the driver completes in order of
+  reaping. `FileBackstore` is the portable fallback: a plain file,
+  synchronous, honest (whole blocks only, bounds checked, `sync_data` on
+  commits, intents and flushes, discards complete and keep the data), so
+  `cargo test --workspace` drives a real `Engine` over a file on any host.
+  The ring itself (`BlockRing`, `block.rs` in `otap-sys`) is where the
+  five new `unsafe` blocks live, with their proofs.
+- **Consequences.** The Linux half is type-checked for
+  `x86_64-unknown-linux-gnu` and has never executed; the file fallback
+  is what the Windows host runs. The first Linux run is a Step 5 item with
+  the dm-flakey and dm-log-writes lanes.
+- **Enforced by** `crates/otap-backstore/src/{file,uring}.rs`,
+  `otap-sys/src/block.rs`, `file_backstore_tests.rs`.
+
+## E28. The ublk front door: a transport, a tag state machine, and no `libublk`
+
+2026-10-13. Accepted.
+
+- **Context.** The brief asks for the `FrontDoor` over `UBLK_F_USER_COPY`
+  with the whole command state machine testable on Windows.
+- **Decision.** `crates/otap-ublk` (no `unsafe`) separates the queue
+  (`Transport`: poll events, read and write the request data at the
+  user-copy offset, commit a result) from the state machine
+  (`UblkFrontDoor<T>`). A tag is `Idle`, `Ready`, `InEngine` or `Aborted`;
+  a descriptor decodes into the engine's request (`Flush`; `Read`,
+  `Write`, `Discard`, `WriteZeroes` in whole 4 KiB blocks inside the
+  volume) or is answered at once (`EOPNOTSUPP` for every other operation,
+  `EINVAL` for a partial block or a range past the end, `ENODEV` while
+  offline); the engine's status maps to the result (bytes moved, or `EIO`
+  for `NvFailed`/`Corrupt`/`Failed`, `ENODEV` for `NoSuchVolume`/`Stopped`,
+  `ENOSPC`, `EINVAL` for `OutOfRange`/`TooLarge`); the request id is
+  `generation << 32 | queue << 16 | tag`, the generation advancing at every
+  completion or abort so a stale completion is dropped; watermarks close
+  the gate to the engine at `high` requests in flight and reopen it at
+  `low`; a refused commit retires the tag. `MockTransport` drives all of
+  it on any host, including abort, copy and commit failures. On Linux
+  `device.rs` creates the device (`ADD_DEV` with `USER_COPY`,
+  `USER_RECOVERY` and the ioctl encoding; `SET_PARAMS` with 4 KiB logical
+  and physical blocks, `VOLATILE_CACHE` and `FUA` so the block layer
+  sends flushes, discard limits, 8 MiB requests; one queue; a fetch on
+  every tag before `START_DEV`) and runs the engine's tick loop. The
+  `libublk` pin is dropped from the workspace: `otap-sys` encodes the UAPI
+  and owns the rings, which keeps the `unsafe` inventory in one place.
+- **Consequences.** One queue per device for now; the multi-queue and
+  multi-reactor arena access of E16 remain Step 5 items. The Linux module
+  is type-checked only. The kernel facts it relies on were checked against
+  the saved 6.12 `ublk_drv.c` (Step 2's sources): the command buffer is
+  mapped read-only at `UBLKSRV_CMD_BUF_OFFSET + q_id * 4096 * 24` with
+  exactly the page-rounded size of the queue's descriptors, by the
+  process that serves it; `START_DEV` waits until every queue has a fetch
+  on every tag; a queue's commands must come from the task that issued its
+  first fetch; a fetch or commit under `USER_COPY` must carry `addr = 0`;
+  a read or write completes with its full byte count (a short count
+  requeues the rest, a zero read is `EIO`) and a flush, discard or write
+  of zeros with any non-negative result. The first Linux run still has to
+  exercise them.
+- **Enforced by** `crates/otap-ublk/src/{frontdoor,mock}.rs`,
+  `frontdoor_tests.rs`, `frontdoor_proptests.rs` (a model of the tag
+  states, the gate and every commit under random interleavings),
+  `engine_tests.rs` (the engine behind the front door over the simulator's
+  device: round trips, watermarks, nvfail, stop, aborts).
+
+## E29. Format 2.2: the superblock records the geometry
+
+2026-10-14. Accepted (from the Step 4 review, defect 3).
+
+- **Context.** The superblock recorded no geometry, and slot `A0` sits at
+  block 0 under every stripe size, so a pool opened under another stripe
+  (an operator override, a planner that decided differently after a
+  kernel or md change) found a verified `A0`, laid itself out anew, could
+  miss the newest CP whose slots had moved, and its boot commit wrote
+  over the old layout's segments and slots.
+- **Decision.** Format 2.2 (F15): every commit carries `geom_stripe_bytes`,
+  `geom_segment_bytes` and `geom_capacity_bytes` in the former reserved
+  area; a recorded geometry is verified whole and consistent; the boot
+  compares the newest slot's geometry with the profile and refuses a
+  difference (`BootError::Geometry`) before it writes anything. Pools
+  written by 2.0 or 2.1 are refused like before; none was released. A new
+  golden-vector set `tests/vectors/v2.2/` (manifest `3f9a9651…f8168d`)
+  sits next to the kept 2.0 and 2.1 sets.
+- **Consequences.** A geometry change is a re-format (or, later, a
+  migration tool); a planner that learns cannot silently re-lay an
+  existing pool.
+- **Enforced by** `crates/otap-format/src/{constants,superblock}.rs`,
+  `format_tests.rs` (the 2.2 set and lane), `adversarial_tests.rs` (the
+  oracle's geometry rule), `otap-cp/src/boot.rs` (`evaluate`),
+  `otap-backstore/tests/review_backstore_tests.rs`.
+
+## E30. What a boot verifies, what tears a candidate, and what fails the boot
+
+2026-10-14. Accepted (from the Step 4 review, defects 1, 4, 5, 15, 16).
+
+- **Context.** The review found four gaps in the boot: the stripes a fold
+  CP wrote were never checked (a fold writes no delta region, and the
+  stripes to check came from the delta records); under the trust policy a
+  stripe whose summary landed but whose data block did not was taken as
+  good; a transient read error made a sound CP torn, and the boot commit
+  then overwrote its slots; and damage to an old snapshot's root page or
+  pinned index tore every candidate, taking the whole pool offline over
+  secondary data. It also found that the boot CP's own segment-table
+  region was never released, leaking one segment per boot.
+- **Decision.** For a fold CP the stripes to check come from the entries
+  born at that CP in the fold's pages. Under a trusted opaque barrier
+  (E21) after an unclean stop, every data block of those stripes is
+  checked against its descriptor's CRC as well: one CP's worth of reads,
+  at a boot after a power loss only. A read error while loading a
+  candidate fails the boot (`BootError::Io`), to be retried, instead of
+  marking the candidate torn; only a region that reads back and does not
+  verify tears a candidate. A snapshot root page or pinned index that
+  does not verify tears the candidate only when the candidate itself
+  wrote it (the snapshot's birth is the candidate's CP); otherwise the
+  snapshot is kept in the table, flagged damaged
+  (`OperatorWarning::SnapshotDamaged`, `SnapshotInfo::damaged`), its reads
+  and diffs refused (`EngineError::SnapshotDamaged`), its data still
+  pinned by birth, and the boot goes on. The selected slot's `seg_table`
+  region joins the table regions the next CP releases.
+- **Consequences.** A permanently unreadable sector in the newest CP's
+  regions makes the pool refuse to boot until the operator intervenes (a
+  zeroed sector then reads back wrong, tears the candidate, and the boot
+  rewinds); the review judged a transient error far more common than a
+  permanent one, and a silent rewind the worse outcome.
+- **Enforced by** `crates/otap-cp/src/boot.rs`, `engine.rs`
+  (`assemble`, `snapshot_read`, `snapshot_diff`),
+  `otap-sim/tests/review_sim_tests.rs` (the five regressions).
+
+## E31. Space, folds and a full pool: the reserve, a fold that does not fit, and dead data segments
+
+2026-10-14. Accepted (from the Step 4 review, defects 10, 11, 12, 24).
+
+- **Context.** Running out of metadata space while placing the engine's
+  own regions failed the tick instead of reporting a full pool; metadata
+  runs could take the two segments the data allocations keep for the
+  boot and shutdown commits, so a pool filled by snapshot metadata could
+  no longer boot; a fold the policy forced on a nearly full pool failed
+  for space at every retry although a plain CP would fit; and dead data
+  segments were never freed although E24 and the status document said
+  they were.
+- **Decision.** Every out-of-space failure of a CP, whoever placed the
+  region, is a full pool. The metadata stream of a regular CP leaves
+  `META_RESERVE_SEGMENTS` (2) free, a shutdown commit leaves one (the
+  boot's), and a boot commit may take the last. A fold that fails for
+  space is dropped: the policy's folds wait, and snapshot requests wait,
+  until more segments are free than there were at the failure; a
+  shutdown's fold is retried at once as a plain CP so the clean marker
+  still lands; a fold that failed because a map page it had to rewrite
+  does not verify blocks every fold until the volume is repaired
+  (`EngineError::MapDamaged` for new requests, `Event::SnapshotFailed` for
+  the ones it held). A snapshot request waits for the CP that carries the
+  generation active when it was made, so the snapshot sees every write
+  acknowledged before the request (a fold already in flight does not take
+  it). A sealed data segment whose live count reaches zero is freed after
+  the same deferral as a metadata region (discarded under
+  `WholeSegment`), so a workload that rewrites the same blocks no longer
+  fills the pool. A free that lands while a CP past its metadata
+  preparation is in flight is re-applied to that CP's table copy when it
+  lands.
+- **Consequences.** A full pool is reported where it happens; the boot
+  and the shutdown always find their room on a pool that has any; a
+  policy fold never wedges a pool. Snapshot deletion (the pins) and the
+  cleaner for data segments with live blocks remain Step 5.
+- **Enforced by** `crates/otap-cp/src/engine.rs` (`step_staging`,
+  `should_fold`, `prepare_meta`, `release_freed`, `note_dead_data`,
+  `free_segment`, `finalize`), `meta.rs` (the reserve),
+  `otap-sim/tests/review_sim_tests.rs`, `adversarial_sim_tests.rs`
+  (`a_full_pool_refuses_writes…`,
+  `a_free_that_lands_while_a_cp_is_staging…`).
+
+## E32. Containment: a damaged map page, a configuration that disagrees with the disk, a diff's base
+
+2026-10-14. Accepted (from the Step 4 review, defects 2, 6, 7, 8, 9, 13, 14).
+
+- **Decision.** A map page that does not verify answers `Corrupt` to the
+  reads of its blocks (and a device read error answers `Failed`), never
+  failing the engine's tick; a CP that replaces entries of such a page
+  commits with the old entries unknown (their bytes stay counted live, the
+  safe direction) and reports the page
+  (`OperatorWarning::MapPageDamaged`); folds stop until the volume is
+  repaired (E31). A volume's size is its root's; a configuration that
+  lists another size refuses the boot (`EngineError::VolumeSizeMismatch`:
+  a resize is a CP that rewrites the root, not a boot), and a volume the
+  configuration lists that a rewind made absent is created held with
+  cause `TornCp`. `snapshot_diff` refuses a base that is not older than
+  the snapshot (`EngineError::SnapshotOrder`). A fold folds the records of
+  a volume created by the same CP into its pages. The ublk front door
+  answers the requests already decoded when it goes offline, clamps a zero
+  high watermark to one, and bounds the device's request size by the
+  arena (`DeviceSpec::for_arena`).
+- **Enforced by** `crates/otap-cp/src/engine.rs`, `otap-map/src/lib.rs`,
+  `otap-ublk/src/{frontdoor,device}.rs`, the review's test files.
+
+## E33. Geometry discovery after the review
+
+2026-10-14. Accepted (from the Step 4 review, defects 19 to 23).
+
+- **Decision.** A hypervisor's virtual disk (QEMU, VMware, Hyper-V,
+  VirtualBox, Xen) is `Virtual` before any controller marker is tried,
+  and a short controller marker (`LSI`, `ASR`, `AAC`, `MR9`) must be a
+  whole word of the vendor and model string. A logical block must be a
+  power of two dividing 4 KiB. A striped md array without `md/chunk_size`
+  is refused (`GeomError::Missing`) rather than given the default stripe.
+  A `discard_max_bytes` of zero plans no discards. A device with more
+  segments than a `u32` counts gets a larger segment (whole stripes, up to
+  the format's bound) with a warning, or is refused; the layout refuses
+  rather than clamps (`LayoutError::TooManySegments`). A file backstore
+  sizes a block device by its end and refuses an empty write.
+- **Enforced by** `crates/otap-geom/src/lib.rs`, `otap-cp/src/layout.rs`,
+  `otap-backstore/src/file.rs`, the review's test files.

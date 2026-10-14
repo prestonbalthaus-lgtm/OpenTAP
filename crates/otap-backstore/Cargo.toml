@@ -1,0 +1,20 @@
+[package]
+name = "otap-backstore"
+description = "OpenTAP's real backstores: the Linux io_uring driver over a block device (O_DIRECT staged writes, FSYNC_DATASYNC barriers, RWF_DSYNC superblock and intent writes, BLKDISCARD for freed segments) and a portable file-backed driver that runs the same engine over an ordinary file on any host. No unsafe code: the ring lives in otap-sys."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-cp = { path = "../otap-cp" }
+otap-format = { path = "../otap-format" }
+otap-sys = { path = "../otap-sys" }
+
+[dev-dependencies]
+otap-sim = { path = "../otap-sim" }
+otap-arena = { path = "../otap-arena" }
+proptest.workspace = true

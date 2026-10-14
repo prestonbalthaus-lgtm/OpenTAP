@@ -36,6 +36,8 @@ pub enum OpKind {
     Commit,
     /// An intent slot (FUA).
     Intent,
+    /// A whole-segment discard.
+    Discard,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +118,8 @@ pub struct BackstoreStats {
     pub reads: u64,
     /// Submissions refused with `Busy`.
     pub busy: u64,
+    /// Segment discards submitted.
+    pub discards: u64,
 }
 
 /// The fake device.
@@ -132,10 +136,16 @@ pub struct SimBackstore {
     schedule: Schedule,
     tear: TearPolicy,
     stats: BackstoreStats,
+    /// On a flush-opaque device: the controller cache survives a power
+    /// cut (a healthy battery), so completed writes land whole. When
+    /// `false` the cache is lost with the power and completed, unflushed
+    /// writes are dropped or torn like pending ones.
+    cache_protected: bool,
 }
 
 impl SimBackstore {
-    /// A zeroed device for `profile`, with a scheduler seeded by `seed`.
+    /// A zeroed device for `profile`, with a scheduler seeded by `seed`. A
+    /// flush-opaque profile starts with a protected cache.
     pub fn new(profile: MediaProfile, seed: u64) -> Result<Self, otap_cp::LayoutError> {
         let layout = DiskLayout::new(&profile.geom)?;
         let capacity = profile.geom.capacity_bytes as usize;
@@ -151,7 +161,19 @@ impl SimBackstore {
             schedule: Schedule::default(),
             tear: TearPolicy::default(),
             stats: BackstoreStats::default(),
+            cache_protected: true,
         })
+    }
+
+    /// Changes whether a flush-opaque device's cache survives a power cut.
+    pub fn set_cache_protected(&mut self, protected: bool) {
+        self.cache_protected = protected;
+    }
+
+    /// Whether a flush-opaque device's cache survives a power cut.
+    #[must_use]
+    pub const fn cache_protected(&self) -> bool {
+        self.cache_protected
     }
 
     /// The layout.
@@ -216,21 +238,29 @@ impl SimBackstore {
         }
     }
 
-    /// A power cut: pending and cached writes are dropped, applied whole or
-    /// torn; the device forgets everything else.
+    /// A power cut: pending writes are dropped, applied whole or torn;
+    /// cached (completed, unflushed) writes likewise, except on a
+    /// flush-opaque device whose cache is protected, where they land whole;
+    /// the device forgets everything else.
     pub fn crash_power(&mut self) -> CrashReport {
         let mut report = CrashReport::default();
         let pending: Vec<Pending> = self.pending.drain(..).collect();
         for p in pending {
-            if p.kind == OpKind::Flush {
+            if matches!(p.kind, OpKind::Flush | OpKind::Discard) {
                 continue;
             }
             self.land_unsafely(p.offset, &p.data, &mut report);
         }
         let cached = std::mem::take(&mut self.cached);
+        let protected = self.profile.geom.flush_opaque && self.cache_protected;
         for (offset, len) in cached {
             let data = self.current[offset..offset + len].to_vec();
-            self.land_unsafely(offset, &data, &mut report);
+            if protected {
+                report.whole += 1;
+                self.durable[offset..offset + len].copy_from_slice(&data);
+            } else {
+                self.land_unsafely(offset, &data, &mut report);
+            }
         }
         self.current.copy_from_slice(&self.durable);
         self.completions.clear();
@@ -291,6 +321,14 @@ impl SimBackstore {
                 let end = p.offset + p.data.len();
                 self.current[p.offset..end].copy_from_slice(&p.data);
                 self.cached.push((p.offset, p.data.len()));
+            }
+            OpKind::Discard => {
+                // The range reads as zeros from now on; a discard is not a
+                // write the cache holds, so nothing of it can tear.
+                let end = p.offset + p.data.len();
+                self.current[p.offset..end].fill(0);
+                self.durable[p.offset..end].fill(0);
+                self.cached.retain(|(o, l)| o + l <= p.offset || *o >= end);
             }
         }
         self.completions.push(Done {
@@ -353,6 +391,20 @@ impl Backstore for SimBackstore {
     fn write_intent(&mut self, pba: u64, slot: &IntentSlot, tag: Tag) -> Result<(), Busy> {
         self.stats.intents += 1;
         self.submit(OpKind::Intent, pba, slot.as_bytes().to_vec(), tag)
+    }
+
+    fn discard_segment(&mut self, pba: u64, bytes: u64, tag: Tag) -> Result<(), Busy> {
+        self.stats.discards += 1;
+        // The data vector only sizes the range; a discard carries no bytes.
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        if len > self.durable.len() {
+            self.completions.push(Done {
+                tag,
+                result: Err(IoError::OutOfRange { pba, bytes: len }),
+            });
+            return Ok(());
+        }
+        self.submit(OpKind::Discard, pba, vec![0u8; len], tag)
     }
 
     fn read(&mut self, pba: u64, dst: &mut [u8]) -> Result<(), IoError> {

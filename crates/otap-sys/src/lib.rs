@@ -13,6 +13,9 @@
 //!   devices.
 //! - [`uring`]: the io_uring opcode table and [`FixedBufferLayout`]; on Linux
 //!   [`RegisteredBuffers`], buffer-table cloning and the user-copy read.
+//! - [`block`]: [`BlockRing`], a block device on io_uring behind the Linux
+//!   `Backstore`: `O_DIRECT` writes staged in a page-aligned pool, `fsync`
+//!   barriers, `BLKDISCARD`; a fallback that refuses to open elsewhere.
 //! - [`probe`]: [`Allowlist`], the opcodes and ublk features the kernel
 //!   offers, and the v0.1 requirement check.
 //!
@@ -47,7 +50,7 @@
 //!   every address the entry names until its CQE is reaped.
 //!
 //! # Unsafe inventory
-//! Five blocks, all Linux-only; the fallback contains none.
+//! Thirteen blocks, all Linux-only; the fallback contains none.
 //!
 //! 1. `hugetlb`, `Mapping::map_file`: `MmapOptions::map_mut`. The file is on
 //!    hugetlbfs (no write path), sized by us and exclusively `flock`ed for
@@ -63,6 +66,26 @@
 //!    The 8-byte reply buffer is freed only after the CQE, or leaked.
 //! 5. `probe`, `ublk_features`: `Box::from_raw` of that buffer, once the
 //!    kernel is done with it (CQE reaped, or SQE never submitted).
+//! 6. `block`, `Pool::slot_mut`: `slice::from_raw_parts_mut` over one slot
+//!    of the page-aligned staging pool. The pool owns the allocation, the
+//!    slot is inside it, and a slot is handed out to one write at a time.
+//! 7. `block`, `Pool::slot`: the shared counterpart, same bounds.
+//! 8. `block`, `BlockRing::write`: `SubmissionQueue::push` of a write. The
+//!    entry names a staged slot the pool keeps reserved until the write's
+//!    completion is reaped (or the ring is dropped, which waits).
+//! 9. `block`, `BlockRing::fsync`: `push` of an fsync. The entry names no
+//!    memory of ours.
+//! 10. `block`, `BlockRing::discard`: the `BLKDISCARD` ioctl through
+//!     `rustix::ioctl::Setter`. The opcode takes a `[u64; 2]` by pointer,
+//!     which is what the setter passes, and the descriptor is ours.
+//! 11. `ublk`, `UblkControlRing::execute`: `push` of a control command.
+//!     The command area is inline in the entry; a reply buffer, when one is
+//!     given, is the caller's and outlives the wait for the CQE.
+//! 12. `ublk`, `UblkQueue::new`: `MmapOptions::map` of the queue's command
+//!     buffer at the UAPI offset, read-only, the length the stride rule
+//!     gives; the mapping is dropped with the queue after the ring.
+//! 13. `ublk`, `UblkQueue::push_command`: `push` of a fetch or a commit.
+//!     Under `UBLK_F_USER_COPY` the entry names no buffer of ours.
 //!
 //! # Example
 //! ```
@@ -92,11 +115,13 @@ compile_error!(
      8-byte alignment of u64"
 );
 
+pub mod block;
 pub mod hugetlb;
 pub mod probe;
 pub mod ublk;
 pub mod uring;
 
+pub use block::{open_block_device, BlockRing, Full, Reaped};
 pub use hugetlb::{HugeArena, HugePageSize};
 pub use probe::{
     Allowlist, MissingCapability, OpcodeSet, REQUIRED_OPCODES, REQUIRED_UBLK_FEATURES,

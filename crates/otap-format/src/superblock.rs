@@ -66,14 +66,15 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use crate::checksum::crc32c;
 use crate::constants::{
-    DURABLE_LOG_HDR_SIZE, FORMAT_MAJOR, FORMAT_VERSION, INBOUND_STATE_SIZE, INTENT_CRC_OFFSET,
-    INTENT_MAGIC, INTENT_RESERVED, INTENT_SLOTS, INTENT_SLOT_SIZE, MAX_CP_SEQ, MAX_GROUPS,
-    MAX_VOLS, SUPERBLOCK_CRC_OFFSET, SUPERBLOCK_MAGIC, SUPERBLOCK_RESERVED, SUPERBLOCK_SIZE,
-    SUPERBLOCK_SLOTS, SUPERBLOCK_SLOT_SIZE, VOL_STATE_SIZE, VOL_TABLE_SIZE,
+    BLOCK_SIZE, DURABLE_LOG_HDR_SIZE, FORMAT_MAJOR, FORMAT_VERSION, INBOUND_STATE_SIZE,
+    INTENT_CRC_OFFSET, INTENT_MAGIC, INTENT_RESERVED, INTENT_SLOTS, INTENT_SLOT_SIZE, MAX_CP_SEQ,
+    MAX_GROUPS, MAX_STRIPE_BYTES, MAX_VOLS, SUPERBLOCK_CRC_OFFSET, SUPERBLOCK_MAGIC,
+    SUPERBLOCK_RESERVED, SUPERBLOCK_SIZE, SUPERBLOCK_SLOTS, SUPERBLOCK_SLOT_SIZE, VOL_STATE_SIZE,
+    VOL_TABLE_SIZE,
 };
 use crate::types::{
-    bad_field, check_crc, check_magic, check_major, copy_out, major_of, view, FormatError, RootRef,
-    Uuid, VolBitSet,
+    bad_field, check_crc, check_magic, check_major, copy_out, major_of, minor_of, view,
+    FormatError, RootRef, Uuid, VolBitSet,
 };
 
 /// The run state the last commit recorded.
@@ -456,6 +457,8 @@ pub struct Superblock {
     pub nvfail: VolBitSet,
     /// Segments freed by this CP, reusable after the next one (`[0]`) and the
     /// one after (`[1]`, `flush-opaque` backstores): the deferred-reuse lists.
+    /// Reserved: the Step 4 engine keeps the deferral in memory (a boot
+    /// recomputes it from the two slots' regions) and writes `NONE` here.
     pub freed_pending: [RootRef; 2],
     /// The per-volume map roots table.
     pub map_roots: RootRef,
@@ -473,6 +476,21 @@ pub struct Superblock {
     pub durable_log: DurableLogHdr,
     /// Inbound replication state per consistency group.
     pub inbound: [InboundState; MAX_GROUPS],
+    /// Format 2.1: the open data segment at this commit (0 for none), so a
+    /// boot appends after the last stripe a committed CP wrote.
+    pub open_data_pseg: u64,
+    /// Format 2.1: the next stripe index of the open data segment.
+    pub open_data_idx: u32,
+    /// Reserved, zero.
+    pub rsvd_open: u32,
+    /// Format 2.2: the stripe the pool was laid out with, in bytes (F15).
+    /// A boot under a profile whose stripe differs is refused.
+    pub geom_stripe_bytes: u32,
+    /// Format 2.2: the segment the pool was laid out with, in bytes.
+    pub geom_segment_bytes: u32,
+    /// Format 2.2: the device capacity the pool was laid out over, in
+    /// bytes.
+    pub geom_capacity_bytes: u64,
     /// Reserved, zero.
     pub reserved: [u8; SUPERBLOCK_RESERVED],
     /// CRC-32C over bytes `0..4092`.
@@ -495,6 +513,32 @@ impl Superblock {
         sb
     }
 
+    /// Records the layout's geometry (format 2.2, F15): every commit of a
+    /// pool carries the stripe, the segment and the capacity it was laid
+    /// out with, so a boot can refuse a profile that differs.
+    pub fn set_geometry(&mut self, stripe_bytes: u32, segment_bytes: u32, capacity_bytes: u64) {
+        self.geom_stripe_bytes = stripe_bytes;
+        self.geom_segment_bytes = segment_bytes;
+        self.geom_capacity_bytes = capacity_bytes;
+    }
+
+    /// The recorded geometry as `(stripe, segment, capacity)` in bytes, or
+    /// `None` on a page written before format 2.2.
+    #[must_use]
+    pub const fn geometry(&self) -> Option<(u32, u32, u64)> {
+        let recorded = self.geom_stripe_bytes != 0
+            || self.geom_segment_bytes != 0
+            || self.geom_capacity_bytes != 0;
+        if minor_of(self.ver) >= 2 && recorded {
+            Some((
+                self.geom_stripe_bytes,
+                self.geom_segment_bytes,
+                self.geom_capacity_bytes,
+            ))
+        } else {
+            None
+        }
+    }
     /// The slot commit `cp_seq` occupies at `location` (F7).
     #[must_use]
     pub const fn slot_for(cp_seq: u64, location: SbLocation) -> SbSlot {
@@ -553,6 +597,31 @@ impl Superblock {
         if let Some(v) = self.nvfail.highest() {
             if v >= self.vol_count {
                 return Err(bad_field("nvfail", u64::from(v)));
+            }
+        }
+        if self.open_data_pseg == 0 && self.open_data_idx != 0 {
+            return Err(bad_field("open_data_idx", u64::from(self.open_data_idx)));
+        }
+        let recorded = self.geom_stripe_bytes != 0
+            || self.geom_segment_bytes != 0
+            || self.geom_capacity_bytes != 0;
+        if minor_of(self.ver) >= 2 && recorded {
+            // Format 2.2: a recorded geometry is whole and consistent (an
+            // engine commit always records one; a page without one is
+            // refused by the boot).
+            let stripe = self.geom_stripe_bytes;
+            let segment = self.geom_segment_bytes;
+            if stripe == 0
+                || !(stripe as usize).is_multiple_of(BLOCK_SIZE)
+                || stripe as usize > MAX_STRIPE_BYTES
+            {
+                return Err(bad_field("geom_stripe_bytes", u64::from(stripe)));
+            }
+            if segment == 0 || !segment.is_multiple_of(stripe) {
+                return Err(bad_field("geom_segment_bytes", u64::from(segment)));
+            }
+            if self.geom_capacity_bytes < u64::from(segment) {
+                return Err(bad_field("geom_capacity_bytes", self.geom_capacity_bytes));
             }
         }
         self.durable_log.validate()
@@ -954,7 +1023,13 @@ const _: () = {
     assert!(offset_of!(Superblock, cluster_state) == 464);
     assert!(offset_of!(Superblock, durable_log) == 480);
     assert!(offset_of!(Superblock, inbound) == 544);
-    assert!(offset_of!(Superblock, reserved) == 1696);
+    assert!(offset_of!(Superblock, open_data_pseg) == 1696);
+    assert!(offset_of!(Superblock, open_data_idx) == 1704);
+    assert!(offset_of!(Superblock, rsvd_open) == 1708);
+    assert!(offset_of!(Superblock, geom_stripe_bytes) == 1712);
+    assert!(offset_of!(Superblock, geom_segment_bytes) == 1716);
+    assert!(offset_of!(Superblock, geom_capacity_bytes) == 1720);
+    assert!(offset_of!(Superblock, reserved) == 1728);
     assert!(offset_of!(Superblock, crc32c) == SUPERBLOCK_CRC_OFFSET);
 
     assert!(size_of::<SuperblockSlot>() == SUPERBLOCK_SLOT_SIZE);

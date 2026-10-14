@@ -444,6 +444,216 @@ repository `github.com/prestonbalthaus-lgtm/OpenTAP` and pushed `main`.
 The ignore file gained the fuzz crate's build output. The rules are in
 `09-working-agreements.md`, section 8.
 
+## 2026-10-13: Phase C Step 4, the persistent map, geometry, the Linux backstore and the ublk front door
+
+**Brief.** The owner's Step 4 brief (verbatim in
+`10-phase-c-step-briefs.md`) opened with the rulings on E19 and D1, D2,
+D8, D9, D10, recorded as E21, and asked for four deliverables: `otap-map`
+(the two-level radix map, `CpLogRec` logging with periodic folds,
+snapshot pinning and the `birth_cp` walk) wired into `otap-cp`;
+`otap-geom` (sysfs discovery with mocks, `StripeGeometry`, the E19
+policy) plus the production Linux `Backstore` over io_uring with a
+portable fallback; `otap-ublk` (the `FrontDoor` over `UBLK_F_USER_COPY`
+with the whole state machine tested on Windows); and an independent
+adversarial review with proptest suites in `otap-sim`.
+
+**Design before code.** Recorded as E21 to E28 before or while the code
+was written: the trust policy and the deferred free; the map's overlay,
+delta regions, directory and folds, with format 2.1 (F12 to F14) and a
+second golden-vector set; holes as arena records, index extents and map
+entries; the metadata stream and liveness accounting; snapshots at folds;
+the geometry planner; the backstore crate and its file fallback; the ublk
+transport and tag state machine, and the end of the `libublk` pin.
+
+**Code.** The lead wrote `otap-map`, `otap-geom`, `otap-backstore`,
+`otap-ublk`, the `block` module of `otap-sys` and the ublk queue mapping,
+the `meta` module and the new engine paths of `otap-cp`, the format 2.1
+structures, the arena's hole records (layout 1.2), the index's hole
+extents, and the simulator's punches, snapshots, discards and controller
+cache. `otap-cp` lost `blockmap.rs` (the whole-map image of E14). The
+lead's own suites found these defects before any review:
+
+1. **A late discard landed on a reused segment.** The engine freed a
+   metadata segment when it issued the discard, reused it for the next
+   CP's pages, and a reordering device completed the discard afterwards
+   over the new pages ("index: crc32c mismatch" as a torn CP in the
+   random-geometry walk). A freed segment now stays allocated until its
+   discard completes (E24); the regression test holds every discard back
+   while the engine runs forty CPs and folds, and checks that no write
+   lands inside a held segment.
+2. **The boot CP was not retried** after a failure that was not a lack
+   of space, so a transient refusal left the engine never serving; it is
+   retried now.
+3. **A volume created in a CP attempt that failed** kept its `created_in`
+   mark, so the retry treated it as already carried; the mark is reset
+   with the attempt.
+4. **A fold CP wrote its own delta region**, listed it in the directory
+   and kept it alive until the next fold although its records were
+   already in the pages it rewrote and a region with the fold's own CP is
+   never replayed; found by the Step 4 fold-policy test as a non-zero log
+   size right after a fold. A fold writes no delta region now (F12, E22).
+5. **The geometry planner's test expectations** were wrong about the
+   segment shrink and the misalignment rule; the planner was right and
+   the tests were fixed to it.
+
+Two simulator defects were fixed on the way: the checker took the
+smallest operation number an image agreed with, so a punch over an
+acknowledged write (zeros where the write had been, as nothing at all
+would leave) counted as a lost write after a daemon restart that had kept
+both; it now takes the largest consistent number (E23). And its diff
+check expected a hole punched over an unmapped block to be absent from
+the live diff; the engine reports every entry born after the base, holes
+over nothing included, and the harness now expects that (E23). A
+third scenario the Step 4 tests exposed was a test expectation, not a
+defect: the dirty-page and overlay bounds of the fold policy read the
+committed state, so the CP after the one that crosses them folds; the
+policy's documentation says so now.
+
+The ublk mock was tightened twice by its own property test: an abort
+withdraws a request the server has not pumped (the driver answers the
+fetch with the abort instead), and nothing is ever delivered on an
+aborted tag (no fetch is pending there); both are the driver's behaviour
+and both changed what the state machine had to defend against (a copy
+that fails after an abort fails the request, whose commit the queue then
+refuses, and the tag is retired).
+
+**Tests added.** `otap-map/tests/map_tests.rs` (a model across random CPs,
+folds, replays and reboots; damage; misdirection; replay disorder),
+`otap-geom/tests/geom_tests.rs`, `otap-backstore/tests/file_backstore_tests.rs`
+(the whole engine over a file, with a restart),
+`otap-ublk/tests/{frontdoor_tests,frontdoor_proptests,engine_tests}.rs`,
+`otap-sim/tests/step4_sim_tests.rs` (the map across pages and segments
+with crashes, CP log replay from the last fold, snapshot images and diffs
+across random crashes and isolation from later writes, punches through
+every crash, the hybrid read path over the active index, a frozen
+generation and the map, every fold trigger, both discard policies, the
+trust policy over a protected and an unprotected controller cache, the
+late-discard regression, a mixed seeded walk, the checker regression, and
+a property walk over volumes wider than a map page with punches,
+snapshots, folds and crashes of every kind), the hole tests of the arena
+and index suites, the format
+2.1 structures in `records_tests.rs`, and the simulator's random walk
+extended with punches, snapshots, folds and snapshot checks.
+`format_tests.proptest-regressions` and the front door's
+`frontdoor_proptests.proptest-regressions` are new and checked in:
+proptest's records of shrunk inputs from the format and front-door work,
+replayed before every run.
+
+**Independent review (worker "Opus-QA-Adversarial", Opus, 2026-10-13 to
+14).** The worker read the brief, the format rulings, the crate docs and
+the suites, then wrote 60 tests in five files of its own (`qa_*.rs`, kept
+as `review_*_tests.rs`), 24 of them `bug_*` reproductions that failed
+against the tree, plus two defects it could only cite, seventeen hazards
+it saw but did not test, and eleven documentation faults. Every
+reproduction failed as claimed. The lead fixed every defect and ported
+the reproductions in place as regression tests, each naming its defect
+number below in its doc comment; the decisions the fixes needed are E29
+to E33. The defects, numbered as in the worker's report:
+
+1. (durability) The boot never checked the data stripes of a fold CP: the
+   stripes to check came from the delta records, and a fold writes none,
+   so a fold CP whose stripe never landed (every snapshot fold, every
+   clean shutdown) was selected as good. Fix: the stripes of a fold CP
+   come from the entries born at it in the fold's pages (E30).
+2. (durability) A rewind below the CP that created a volume re-created it
+   empty and served it without nvfail. Fix: created held, `TornCp` (E32).
+3. (durability) A pool booted under another stripe geometry, and its boot
+   commit rewrote the old layout. Fix: format 2.2 records the geometry and
+   the boot refuses a difference (E29).
+4. (durability, E19 path) A stripe that lost a data block behind an intact
+   summary was selected as good under the trust policy. Fix: the data
+   blocks are checked against their descriptors after an unclean stop
+   (E30).
+5. (durability) A transient read error at boot made the newest CP torn for
+   good, and the boot commit overwrote its slots. Fix: a read error fails
+   the boot, to be retried (E30).
+6. (correctness) A snapshot requested while a fold CP was in flight was
+   dropped by that CP's finalize. Fix: a CP owns only the requests it took
+   (E31), and a request waits for the CP that carries the generation
+   active when it was made.
+7. (correctness, latent) A fold dropped the records of a volume created by
+   the same CP. Fix: folded like any other volume's (E32).
+8. (correctness) A volume grown in the configuration was served at the
+   larger size and the writes past its root wedged every CP. Fix: the size
+   is the root's; a differing configuration refuses the boot (E32).
+9. (correctness) `snapshot_diff` accepted a base newer than the snapshot
+   and answered "nothing changed". Fix: refused (E32).
+10. (robustness) Running out of metadata space while placing the engine's
+    own regions failed the tick instead of reporting a full pool. Fix:
+    every out-of-space failure of a CP is a full pool (E31).
+11. (robustness) A pool filled by snapshot metadata could no longer boot:
+    the reserve held only against data. Fix: regular CPs leave two
+    segments, a shutdown one, a boot may take the last (E31).
+12. (robustness) A policy fold that did not fit wedged a nearly full pool.
+    Fix: a fold that fails for space is dropped and the plain CP commits
+    (E31).
+13. (robustness) A damaged map page failed the tick on a read. Fix: the
+    read answers `Corrupt` (E32).
+14. (robustness) A damaged map page wedged every CP, each retry restaging
+    its stripes. Fix: the CP commits with the old entries unknown; folds
+    stop until the volume is repaired (E32).
+15. (robustness) The boot CP's segment-table region was never released:
+    one segment leaked per boot. Fix: it joins the table regions (E30).
+16. (robustness) One damaged sector in an old snapshot's root page made the
+    pool unbootable. Fix: the snapshot is flagged damaged and the boot
+    goes on (E30).
+17. (robustness) The ublk front door handed requests decoded before going
+    offline to the engine. Fix: they are answered `ENODEV` (E32).
+18. (robustness) A zero high watermark starved every request. Fix: taken
+    as one (E32).
+19. (correctness) VMware and Hyper-V disks were classified as hardware
+    RAID. Fix: hypervisor markers first (E33).
+20. (robustness) A logical block that does not divide 4 KiB was accepted.
+    Fix: a power of two dividing 4096 (E33).
+21. (robustness) A striped md array without a chunk size got the default
+    stripe silently. Fix: refused (E33).
+22. (robustness) Discards an administrator switched off were still
+    planned. Fix: `discard_max_bytes` of zero plans none (E33).
+23. (robustness) A device with more segments than a `u32` was silently cut
+    short. Fix: larger segments, or a refusal; the layout refuses rather
+    than clamps (E33).
+24. (documentation, robustness) Dead data segments were never freed though
+    E24 and the status document said they were. Fix: freed after the
+    deferral (E31).
+25. (durability, cited) A volume whose page index exceeds 4 GiB could not
+    boot. Fix: the index bound includes the 4 GiB region limit (E32).
+26. (robustness, cited) `FileBackstore::open` refused block devices. Fix:
+    sized by their end (E33).
+
+Of the hazards, the lead fixed six (the boot protection's deferral under
+the trust policy, a free landing during a CP, the file backstore's empty
+write, the layout helper's overflow, the ublk request bound against the
+arena, replay's validation of a region's CP and first page) and recorded
+the rest as limits in `06-implementation-status.md`, section 8, or as doc
+notes on the structures concerned (`SegEntry::lap`, the `freed_pending`
+roots and the `FreedPending` state, snapshot ids across a rewind, the FUA
+flag the front door drops by design under D2, daemon recovery over
+`USER_RECOVERY`).
+
+Two of the fixes needed a correction of their own, found by the suites at
+once: the rule for re-applying a free that landed during a CP had to
+exclude CPs that had not yet copied the table (a walk scenario handed a
+snapshot's pinned page to the next CP; pinned as
+`a_free_that_lands_while_a_cp_is_staging_is_not_applied_twice`), and a
+snapshot request now waits for the CP that carries the generation active
+when it was made, because a fold already in flight took the request and
+pinned a root without the write acknowledged just before it (found by the
+extended random walk).
+
+**Gates (2026-10-14).** fmt clean (workspace and fuzz); clippy clean on
+the host, on `x86_64-unknown-linux-gnu` (the Linux halves of `otap-sys`,
+`otap-backstore` and `otap-ublk` included) and on the fuzz crate; rustdoc
+clean with warnings denied; `cargo test --workspace`: 458 tests and 2
+doctests passed, 1 ignored (the vector writer). The clippy and rustdoc
+runs each flagged a handful of lints and two redundant doc links in code
+written this step (`chunks_exact` with a constant size, manual
+`is_multiple_of`, a boxed error, two type aliases, a `drop` of a
+reference, a `const fn` calling `max`), fixed before the gates were
+rerun. `PROPTEST_CASES=10000 cargo test --workspace`: all 458 tests and 2
+doctests passed, 1 ignored, in 116 min 6 s on this host
+(`step4_sim_tests` 52 min, `map_tests` 19 min, `adversarial_sim_tests`
+17 min, `sim_tests` 14 min; every other suite under six minutes).
+
 ## Lessons, running list
 
 - `prop_assert!(cond)` without a message fails to compile when `cond`
@@ -482,3 +692,28 @@ The ignore file gained the fuzz crate's build output. The rules are in
 - When a review's reproductions depend on a mode the engine does not
   really support, separate the mode from the defect: two of the four
   "flush-opaque" findings were plain engine bugs.
+- A fold must not write what its pages already hold: a counter that is
+  not zero right after the event that resets it is the smell (Step 4,
+  the fold's own delta region).
+- When an image is ambiguous (zeros after a punch over a write), the
+  checker's prefix must be the largest consistent operation number, or
+  the checker reports losses that did not happen.
+- A mock of a kernel driver must follow the driver's rules, or the state
+  machine ends up defending against ghosts: two of the ublk "defects"
+  were the mock delivering what the driver never would (a request on an
+  aborted tag, a request the abort had already withdrawn).
+- A discard is a write that lands late: a segment is free when its
+  discard completes, not when the discard was issued.
+- One-line text substitutions over Rust source (perl, sed with regexes)
+  mangled files three times in Step 4; splice whole blocks from files, or
+  use the editor's exact-match replace, and re-read before the next edit.
+- A free that lands while a CP is in flight belongs to whichever table
+  copy exists: re-apply it only to a CP that copied the table before the
+  free, or the CP's own allocation of that segment is undone.
+- A snapshot's content is "everything acknowledged before the request":
+  the CP that takes the request must carry the generation that was active
+  when it was made, never one cut before.
+- A reviewer's severity list is worth reading in order: the five
+  durability defects of the Step 4 review were all in the boot, which
+  the lead's own suites exercised through the simulator's crashes but
+  never with a fold as the newest CP.

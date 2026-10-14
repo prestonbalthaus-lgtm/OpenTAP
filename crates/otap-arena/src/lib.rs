@@ -90,8 +90,14 @@ use otap_sys::HugeArena;
 /// The arena header magic: `OTAR`.
 pub const ARENA_MAGIC: u32 = u32::from_le_bytes(*b"OTAR");
 /// The arena layout version, `major << 8 | minor`. Minor 1: sealed
-/// descriptor words, the attach counter outside the header seal.
-pub const ARENA_VERSION: u16 = 0x0101;
+/// descriptor words, the attach counter outside the header seal. Minor 2
+/// (Step 4): the descriptor's `kind` word and hole record slots.
+pub const ARENA_VERSION: u16 = 0x0102;
+/// The magic of a hole record block: `OTHL`.
+pub const HOLE_RECORD_MAGIC: u32 = u32::from_le_bytes(*b"OTHL");
+/// Bytes of a [`HoleRecordBlock`] that carry the record; the rest of the
+/// slot is zero.
+pub const HOLE_RECORD_SIZE: usize = 32;
 /// Bytes per slot: one 4 KiB block.
 pub const SLOT_BYTES: usize = BLOCK_SIZE;
 /// Bytes per slot descriptor.
@@ -239,10 +245,98 @@ impl ArenaHeader {
     }
 }
 
+/// What a slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum SlotKind {
+    /// One 4 KiB block of a write.
+    Data = 0,
+    /// A [`HoleRecordBlock`]: a discard of a run of blocks, held until the
+    /// consistency point that records the holes commits (Step 4, E23).
+    Hole = 1,
+}
+
+impl SlotKind {
+    /// Decodes the descriptor's kind word.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Data),
+            1 => Some(Self::Hole),
+            _ => None,
+        }
+    }
+
+    /// The kind word.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// The record a hole slot's data block carries: the discard of `blocks`
+/// blocks from `lba` of `vol`. The descriptor names the same volume and
+/// LBA and seals the whole block under its CRC; the magic and the repeated
+/// address are a second check at re-attach.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(C)]
+pub struct HoleRecordBlock {
+    /// [`HOLE_RECORD_MAGIC`].
+    pub magic: u32,
+    /// The volume.
+    pub vol: u32,
+    /// The first LBA.
+    pub lba: u64,
+    /// Blocks punched, at least 1.
+    pub blocks: u32,
+    /// Reserved, zero.
+    pub rsvd0: u32,
+    /// Reserved, zero.
+    pub rsvd1: u64,
+}
+
+impl HoleRecordBlock {
+    /// The 4 KiB block image of a record: the record, then zeros.
+    #[must_use]
+    pub fn image(vol: u32, lba: u64, blocks: u32) -> [u8; SLOT_BYTES] {
+        let rec = Self {
+            magic: HOLE_RECORD_MAGIC,
+            vol,
+            lba,
+            blocks,
+            rsvd0: 0,
+            rsvd1: 0,
+        };
+        let mut block = [0u8; SLOT_BYTES];
+        block[..HOLE_RECORD_SIZE].copy_from_slice(rec.as_bytes());
+        block
+    }
+
+    /// Decodes a slot's data block as a record of `vol`/`lba` (what its
+    /// descriptor says): the magic, the address and a positive count must
+    /// agree, and the rest of the block must be zero.
+    #[must_use]
+    pub fn decode(block: &[u8], vol: u32, lba: u64) -> Option<Self> {
+        if block.len() != SLOT_BYTES {
+            return None;
+        }
+        let rec = Self::read_from_bytes(&block[..HOLE_RECORD_SIZE]).ok()?;
+        let ok = rec.magic == HOLE_RECORD_MAGIC
+            && rec.vol == vol
+            && rec.lba == lba
+            && rec.blocks >= 1
+            && rec.rsvd0 == 0
+            && rec.rsvd1 == 0
+            && lba.saturating_add(u64::from(rec.blocks)) <= MAX_LBA + 1
+            && block[HOLE_RECORD_SIZE..].iter().all(|b| *b == 0);
+        ok.then_some(rec)
+    }
+}
+
 /// A slot descriptor: what the slot holds and where it is in the slot's life.
 ///
-/// `addr`, `seq` and `crc32c` change only while the slot is `Free`; `word`
-/// is written last, by one store, and seals the whole descriptor.
+/// `addr`, `seq`, `crc32c` and `kind` change only while the slot is `Free`;
+/// `word` is written last, by one store, and seals the whole descriptor.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(C)]
 pub struct SlotDesc {
@@ -252,14 +346,26 @@ pub struct SlotDesc {
     pub seq: u64,
     /// CRC-32C of the block.
     pub crc32c: u32,
-    /// Reserved, zero.
-    pub rsvd: u32,
+    /// A [`SlotKind`] word (layout 1.2; zero, data, before it).
+    pub kind: u32,
     /// Low 32 bits: `lap << 2 | state`; high 32 bits: CRC-32C over bytes
     /// `0..24` followed by those low 32 bits.
     pub word: u64,
 }
 
 impl SlotDesc {
+    /// The decoded kind, if defined.
+    #[must_use]
+    pub const fn slot_kind(&self) -> Option<SlotKind> {
+        SlotKind::from_u32(self.kind)
+    }
+
+    /// `true` for a hole record slot.
+    #[must_use]
+    pub const fn is_hole(&self) -> bool {
+        self.kind == SlotKind::Hole.as_u32()
+    }
+
     /// Packs a volume and an LBA into `addr`.
     #[must_use]
     pub const fn pack_addr(vol: u32, lba: u64) -> u64 {
@@ -351,7 +457,7 @@ impl RingRef {
 /// verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlacedSlot {
-    /// Where the data is.
+    /// Where the data (or the hole record) is.
     pub ring: RingRef,
     /// The volume.
     pub vol: u32,
@@ -361,6 +467,17 @@ pub struct PlacedSlot {
     pub seq: u64,
     /// The block's CRC-32C, as recorded at fill time and verified at attach.
     pub crc32c: u32,
+    /// For a hole record slot, the blocks the discard punched from `lba`;
+    /// 0 for a data block.
+    pub hole_blocks: u32,
+}
+
+impl PlacedSlot {
+    /// `true` for a hole record.
+    #[must_use]
+    pub const fn is_hole(&self) -> bool {
+        self.hole_blocks != 0
+    }
 }
 
 /// What was wrong with a damaged slot.
@@ -370,6 +487,9 @@ pub enum Damage {
     Descriptor,
     /// The descriptor verifies but the block fails its recorded CRC.
     Data,
+    /// The descriptor verifies and names a kind this layout does not
+    /// define, or a hole record whose block does not decode.
+    Kind,
 }
 
 /// A slot [`Arena::attach`] could not trust: a `Placed` or `Committed` slot
@@ -747,12 +867,43 @@ impl Arena {
                         rewrite.push((slot, SlotState::Committed, lap));
                         continue;
                     }
+                    let hole_blocks = match desc.slot_kind() {
+                        Some(SlotKind::Data) => 0,
+                        Some(SlotKind::Hole) => {
+                            match HoleRecordBlock::decode(
+                                arena.data_of(slot),
+                                desc.vol(),
+                                desc.lba(),
+                            ) {
+                                Some(rec) => rec.blocks,
+                                None => {
+                                    report.damaged.push(DamagedSlot {
+                                        slot,
+                                        desc,
+                                        damage: Damage::Kind,
+                                    });
+                                    rewrite.push((slot, SlotState::Committed, lap));
+                                    continue;
+                                }
+                            }
+                        }
+                        None => {
+                            report.damaged.push(DamagedSlot {
+                                slot,
+                                desc,
+                                damage: Damage::Kind,
+                            });
+                            rewrite.push((slot, SlotState::Committed, lap));
+                            continue;
+                        }
+                    };
                     report.placed.push(PlacedSlot {
                         ring: RingRef { slot, lap },
                         vol: desc.vol(),
                         lba: desc.lba(),
                         seq: desc.seq,
                         crc32c: desc.crc32c,
+                        hole_blocks,
                     });
                     min_placed = Some(min_placed.map_or(pos, |m| m.min(pos)));
                 }
@@ -957,10 +1108,54 @@ impl Arena {
             desc.addr = SlotDesc::pack_addr(vol, lba + i as u64);
             desc.seq = seq;
             desc.crc32c = *crc;
-            desc.rsvd = 0;
+            desc.kind = SlotKind::Data.as_u32();
             self.write_word(slot, SlotState::Filled, ring.lap);
         }
         Ok(())
+    }
+
+    /// Records a discard in a reserved run of one slot: the slot's block
+    /// becomes a [`HoleRecordBlock`] for `blocks` blocks from `lba` of
+    /// `vol`, written by request `seq`, and the slot becomes `Filled` with
+    /// the hole kind. The slot is placed, committed and re-attached like a
+    /// data slot, so an acknowledged discard survives a daemon crash.
+    pub fn fill_hole(
+        &mut self,
+        ring: RingRef,
+        vol: u32,
+        lba: u64,
+        blocks: u32,
+        seq: u64,
+    ) -> Result<(), ArenaError> {
+        self.check_run(ring, 1)?;
+        if blocks == 0 || vol > MAX_VOL || lba.saturating_add(u64::from(blocks)) > MAX_LBA + 1 {
+            return Err(ArenaError::BadAddress { vol, lba });
+        }
+        self.check_states(ring, 1, &[SlotState::Free])?;
+        let image = HoleRecordBlock::image(vol, lba, blocks);
+        let crc = crc32c(&image);
+        self.run_mut(ring, 1)?.copy_from_slice(&image);
+        let desc = self.desc_mut(ring.slot);
+        desc.addr = SlotDesc::pack_addr(vol, lba);
+        desc.seq = seq;
+        desc.crc32c = crc;
+        desc.kind = SlotKind::Hole.as_u32();
+        self.write_word(ring.slot, SlotState::Filled, ring.lap);
+        Ok(())
+    }
+
+    /// The hole record a `Filled` or `Placed` hole slot carries.
+    pub fn hole_record(&self, ring: RingRef) -> Result<HoleRecordBlock, ArenaError> {
+        self.check_data(ring, 1)?;
+        let desc = *self.desc(ring.slot);
+        if !desc.is_hole() {
+            return Err(ArenaError::BadTransition {
+                slot: ring.slot,
+                state: desc.state(),
+            });
+        }
+        HoleRecordBlock::decode(self.data_of(ring.slot), desc.vol(), desc.lba())
+            .ok_or(ArenaError::DataCrc { slot: ring.slot })
     }
 
     /// Marks a `Filled` run `Placed`: it is in the dirty index and may be
@@ -1141,6 +1336,11 @@ const _: () = {
     assert!(align_of::<SlotDesc>() == 8);
     assert!(offset_of!(SlotDesc, seq) == 8);
     assert!(offset_of!(SlotDesc, crc32c) == 16);
+    assert!(offset_of!(SlotDesc, kind) == 20);
+    assert!(size_of::<HoleRecordBlock>() == HOLE_RECORD_SIZE);
+    assert!(align_of::<HoleRecordBlock>() == 8);
+    assert!(SlotKind::Data.as_u32() == 0 && SlotKind::Hole.as_u32() == 1);
+    assert!(SlotKind::from_u32(2).is_none());
     assert!(offset_of!(SlotDesc, word) == SLOT_WORD_OFFSET);
     assert!(SlotState::Free.as_u8() == 0 && SlotState::Committed.as_u8() == 3);
     assert!(matches!(SlotState::from_bits(2), SlotState::Placed));

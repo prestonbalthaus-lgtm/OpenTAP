@@ -8,26 +8,32 @@ use std::sync::Arc;
 use otap_arena::{Arena, ArenaError, PlacedSlot, RingRef};
 use otap_format::checksum::crc32c;
 use otap_format::{
-    boot_write_active, FormatError, IntentSlot, MapEntry, NvCause, RootRef, RunState, SbLocation,
-    SbSlot, SegKind, StripeDescriptor, StripeHdr, StripeKind, Superblock, SuperblockSlot, Uuid,
-    VolBitSet, VolState, BLOCK_SIZE, CP_LOG_RECS_PER_PAGE, MAX_CP_SEQ, MAX_LBA, MAX_VOLS,
-    SECTORS_PER_BLOCK, SEG_ENTRY_SIZE, VOL_PRESENT,
+    boot_write_active, map_roots_image, snap_table_image, FormatError, IntentSlot, IntoBytes,
+    MapEntry, NvCause, RootRef, RunState, SbLocation, SbSlot, SegKind, SegState, SnapKind,
+    SnapOrigin, SnapRecord, SnapRootPage, StripeDescriptor, StripeHdr, StripeKind, Superblock,
+    SuperblockSlot, Uuid, VolBitSet, VolState, BLOCK_SIZE, MAX_CP_SEQ, MAX_LBA, MAX_VOLS,
+    SECTORS_PER_BLOCK, VOL_PRESENT,
 };
 use otap_index::{DirtyExtent, GenId, Generation, Index, IndexError};
+use otap_map::{CpInput, MapError, MapSet, MapUpdate, PageReader, PinnedRoot, Replaced};
 use otap_sys::HugeArena;
 
-use crate::blockmap::BlockMap;
-use crate::boot::{self, BootError};
+use crate::boot::{self, BootError, BootSnapshot};
 use crate::layout::{DiskLayout, LayoutError};
+use crate::meta::{MetaError, MetaStream};
 use crate::segments::{OpenSegment, SegmentError, SegmentTable};
 use crate::traits::{
-    Backstore, Busy, Clock, DevClass, Done, FrontDoor, IoError, NvfailIntent, Request, RequestKind,
-    Status, Tag,
+    Backstore, Busy, Clock, DevClass, DiscardPolicy, Done, FlushPolicy, FrontDoor, IoError,
+    NvfailIntent, Request, RequestKind, Status, Tag,
 };
 
-/// The longest request the engine serves, in blocks (8 MiB): bounds the
-/// read buffer and the arena run one request can take.
+/// The longest read or write the engine serves, in blocks (8 MiB): bounds
+/// the read buffer and the arena run one request can take.
 pub const MAX_REQUEST_BLOCKS: u32 = 2048;
+
+/// The longest discard or write of zeros the engine serves, in blocks
+/// (1 GiB): one hole record in the arena, one CP log record per block.
+pub const MAX_PUNCH_BLOCKS: u32 = 1 << 18;
 
 /// Segments data allocations leave free so a boot or a shutdown commit
 /// always finds room for its metadata.
@@ -40,6 +46,38 @@ pub struct VolumeSpec {
     pub vol: u32,
     /// The size in 4 KiB blocks, `1..=MAX_LBA + 1`.
     pub size_blocks: u64,
+}
+
+/// When the map folds its overlay into the pages (E22). A fold happens at
+/// the first CP after any bound is reached, at a snapshot, at a clean
+/// shutdown, and on request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldPolicy {
+    /// Bytes of CP log since the last fold.
+    pub log_bytes: u64,
+    /// Time since the last fold, when anything is in the overlay.
+    pub interval_ns: u64,
+    /// Consistency points with changes since the last fold.
+    pub max_cps: u64,
+    /// Map pages the committed overlay touches (the CP after the one that
+    /// crosses the bound folds).
+    pub max_dirty_pages: usize,
+    /// Entries in the committed overlay (likewise).
+    pub max_overlay_entries: usize,
+}
+
+impl Default for FoldPolicy {
+    /// 1 GiB of log or ten minutes (section 1.3), 1,024 CPs, 65,536 dirty
+    /// pages (1 GiB of map pages), 8 million overlay entries.
+    fn default() -> Self {
+        Self {
+            log_bytes: 1 << 30,
+            interval_ns: 600_000_000_000,
+            max_cps: 1024,
+            max_dirty_pages: 65_536,
+            max_overlay_entries: 8 << 20,
+        }
+    }
 }
 
 /// What the engine is told at boot or format.
@@ -56,6 +94,10 @@ pub struct EngineConfig {
     /// The volumes and their sizes. A volume listed here and absent from the
     /// disk is created at boot (durable with the boot commit).
     pub volumes: Vec<VolumeSpec>,
+    /// When the map folds.
+    pub fold: FoldPolicy,
+    /// Map pages the engine caches.
+    pub cache_pages: usize,
 }
 
 impl EngineConfig {
@@ -68,6 +110,8 @@ impl EngineConfig {
             ring: otap_index::DEFAULT_RING,
             arena_half: 0.5,
             volumes,
+            fold: FoldPolicy::default(),
+            cache_pages: boot::CACHE_PAGES,
         }
     }
 
@@ -102,6 +146,20 @@ fn check_size(vol: u32, size_blocks: u64) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// The page index a volume needs must fit the pool's metadata budget: a
+/// quarter of the segments, so data keeps the rest.
+fn check_index_fits(layout: &DiskLayout, size_blocks: u64) -> Result<(), EngineError> {
+    let bytes = otap_format::MapRoot::index_pages_for(size_blocks)
+        .saturating_mul(otap_format::INDEX_PAGE_SIZE as u64);
+    // A quarter of the pool, and never more than the largest region a boot
+    // reads (4 GiB; `boot::read_root`).
+    let limit = ((u64::from(layout.segments) * layout.segment_bytes) / 4).min(1 << 32);
+    if bytes > limit {
+        return Err(EngineError::MetadataTooLarge { bytes, limit });
+    }
+    Ok(())
+}
+
 /// What caused a consistency point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CpTrigger {
@@ -118,6 +176,64 @@ pub enum CpTrigger {
     Shutdown,
     /// The commit every boot writes before it serves.
     Boot,
+}
+
+/// A structured warning an operator must see in the pool status (E21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OperatorWarning {
+    /// The backstore is flush-opaque and the policy trusts the host-side
+    /// barrier: a power loss that also loses the controller's cache can
+    /// lose committed data, which nvfail then quarantines.
+    FlushOpaqueTrusted {
+        /// The policy in force.
+        policy: FlushPolicy,
+    },
+    /// A map page of `vol` does not verify: its entries read `Corrupt`,
+    /// and the map is not folded until the volume is repaired.
+    MapPageDamaged {
+        /// The volume.
+        vol: u32,
+        /// The map page (1,024 blocks each).
+        page_no: u64,
+    },
+    /// A snapshot's root page or pinned index did not verify at boot: it
+    /// is listed, cannot be read or diffed, and still pins its data.
+    SnapshotDamaged {
+        /// The snapshot.
+        snap_id: u64,
+        /// Its volume.
+        vol: u32,
+        /// What failed.
+        reason: String,
+    },
+}
+
+impl fmt::Display for OperatorWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FlushOpaqueTrusted { policy } => write!(
+                f,
+                "the backstore cannot prove its flushes; running under {policy:?}: a power loss \
+                 that loses the controller cache can lose committed consistency points, and \
+                 nvfail quarantines the volumes it finds dirty"
+            ),
+            Self::MapPageDamaged { vol, page_no } => write!(
+                f,
+                "map page {page_no} of volume {vol} does not verify: its blocks read as corrupt \
+                 and the map is not folded until the volume is repaired"
+            ),
+            Self::SnapshotDamaged {
+                snap_id,
+                vol,
+                reason,
+            } => write!(
+                f,
+                "snapshot {snap_id} of volume {vol} is damaged ({reason}): it cannot be read or \
+                 diffed"
+            ),
+        }
+    }
 }
 
 /// Something the engine did that an operator or a checker wants to know.
@@ -146,6 +262,8 @@ pub enum Event {
         orphaned_blocks: u64,
         /// Volumes held by nvfail after this boot.
         nvfail: VolBitSet,
+        /// The candidates skipped as torn, newest first: `(cp_seq, why)`.
+        torn: Vec<(u64, String)>,
     },
     /// A consistency point is durable.
     CpCommitted {
@@ -167,6 +285,13 @@ pub enum Event {
         cp_seq: u64,
         /// Why.
         reason: String,
+    },
+    /// A consistency point folded the map: the pages hold everything.
+    Folded {
+        /// The CP.
+        cp_seq: u64,
+        /// Map pages rewritten.
+        pages: u64,
     },
     /// An intent slot is durable.
     IntentWritten {
@@ -190,6 +315,36 @@ pub enum Event {
         /// The CP that carried it.
         cp_seq: u64,
     },
+    /// A snapshot is durable.
+    SnapshotCreated {
+        /// Its id.
+        snap_id: u64,
+        /// The volume.
+        vol: u32,
+        /// The CP it pins.
+        cp_seq: u64,
+    },
+    /// A snapshot that was accepted could not be taken: the fold it needed
+    /// found no free segment, or a map page it had to rewrite is damaged.
+    /// The request is dropped; the control plane may ask again later.
+    SnapshotFailed {
+        /// The snapshot's identity.
+        uuid: Uuid,
+        /// The volume.
+        vol: u32,
+        /// Why.
+        reason: String,
+    },
+    /// A metadata segment no reachable CP names was freed (and discarded
+    /// when the policy says so).
+    SegmentFreed {
+        /// The segment.
+        pseg: u64,
+        /// A discard was issued.
+        discarded: bool,
+    },
+    /// A warning the pool status carries.
+    OperatorWarning(OperatorWarning),
     /// A block in the arena failed the CRC recorded when it was written: the
     /// block goes to disk under the recorded CRC and reads as `Corrupt`.
     ArenaDamage {
@@ -228,6 +383,10 @@ pub enum EngineError {
     Arena(ArenaError),
     /// The index refused.
     Index(IndexError),
+    /// The map refused.
+    Map(MapError),
+    /// The metadata stream refused.
+    Meta(MetaError),
     /// The geometry cannot be laid out.
     Layout(LayoutError),
     /// The segment table refused.
@@ -255,13 +414,13 @@ pub enum EngineError {
         /// The size offered.
         size_blocks: u64,
     },
-    /// The CP metadata (the whole map image plus the segment table, E14)
-    /// could outgrow one segment with these volumes on this geometry.
+    /// A volume whose page index would take more than the pool's metadata
+    /// budget (a quarter of the segments): legal in size, impossible here.
     MetadataTooLarge {
-        /// Stripes the metadata could need.
-        stripes: u64,
-        /// Stripes in a segment.
-        stripes_per_segment: u32,
+        /// The index bytes the volume needs.
+        bytes: u64,
+        /// The budget.
+        limit: u64,
     },
     /// The volume is held by nvfail.
     NvFailed {
@@ -275,6 +434,44 @@ pub enum EngineError {
         /// The LBA.
         lba: u64,
     },
+    /// No snapshot with this id.
+    NoSuchSnapshot {
+        /// The id.
+        snap_id: u64,
+    },
+    /// A snapshot with this uuid exists or is pending.
+    SnapshotExists {
+        /// The uuid.
+        uuid: Uuid,
+    },
+    /// The snapshot's root page or pinned index did not verify at boot: it
+    /// is listed, and reads and diffs of it are refused.
+    SnapshotDamaged {
+        /// The id.
+        snap_id: u64,
+    },
+    /// A diff's base is not older than the snapshot it is taken against.
+    SnapshotOrder {
+        /// The snapshot.
+        snap_id: u64,
+        /// The base offered.
+        base: u64,
+    },
+    /// The configuration gives a volume a size other than its on-disk root:
+    /// a resize goes through a consistency point, not a boot.
+    VolumeSizeMismatch {
+        /// The volume.
+        vol: u32,
+        /// The root's size in blocks.
+        on_disk: u64,
+        /// The configuration's size in blocks.
+        configured: u64,
+    },
+    /// A map page is damaged and the map cannot be folded until the volume
+    /// is repaired; a snapshot or a requested fold is refused.
+    MapDamaged,
+    /// The geometry is flush-opaque and the policy is strict (E19 / E21).
+    FlushOpaqueRefused,
     /// The engine is not serving (booting or stopped).
     NotServing,
     /// Something this step does not support.
@@ -289,6 +486,8 @@ impl fmt::Display for EngineError {
             Self::Format(e) => write!(f, "format: {e}"),
             Self::Arena(e) => write!(f, "arena: {e}"),
             Self::Index(e) => write!(f, "index: {e}"),
+            Self::Map(e) => write!(f, "map: {e}"),
+            Self::Meta(e) => write!(f, "metadata: {e}"),
             Self::Layout(e) => write!(f, "layout: {e}"),
             Self::Segment(e) => write!(f, "segments: {e}"),
             Self::Boot(e) => write!(f, "boot: {e}"),
@@ -302,15 +501,35 @@ impl fmt::Display for EngineError {
                     "volume {vol}: a size of {size_blocks} blocks is out of bounds"
                 )
             }
-            Self::MetadataTooLarge {
-                stripes,
-                stripes_per_segment,
-            } => write!(
+            Self::MetadataTooLarge { bytes, limit } => write!(
                 f,
-                "the CP metadata could take {stripes} stripes; a segment has {stripes_per_segment}"
+                "a page index of {bytes} bytes exceeds the pool's metadata budget of {limit}"
             ),
             Self::NvFailed { vol } => write!(f, "volume {vol} is held by nvfail"),
             Self::Corrupt { vol, lba } => write!(f, "volume {vol} LBA {lba} failed its CRC"),
+            Self::NoSuchSnapshot { snap_id } => write!(f, "no snapshot {snap_id}"),
+            Self::SnapshotExists { uuid } => write!(f, "snapshot {uuid} exists"),
+            Self::SnapshotDamaged { snap_id } => {
+                write!(f, "snapshot {snap_id} is damaged and cannot be read")
+            }
+            Self::SnapshotOrder { snap_id, base } => write!(
+                f,
+                "snapshot {base} is not older than snapshot {snap_id}, so it cannot be its base"
+            ),
+            Self::VolumeSizeMismatch {
+                vol,
+                on_disk,
+                configured,
+            } => write!(
+                f,
+                "volume {vol} is {on_disk} blocks on disk and {configured} in the configuration"
+            ),
+            Self::MapDamaged => {
+                f.write_str("a map page is damaged; the map cannot be folded or snapshotted")
+            }
+            Self::FlushOpaqueRefused => f.write_str(
+                "the backstore is flush-opaque and the policy is RequireFuaOrFlush (E19)",
+            ),
             Self::NotServing => f.write_str("the engine is not serving"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Internal(s) => write!(f, "internal: {s}"),
@@ -332,6 +551,8 @@ macro_rules! from_error {
 from_error!(Format, FormatError);
 from_error!(Arena, ArenaError);
 from_error!(Index, IndexError);
+from_error!(Map, MapError);
+from_error!(Meta, MetaError);
 from_error!(Layout, LayoutError);
 from_error!(Segment, SegmentError);
 from_error!(Boot, BootError);
@@ -390,6 +611,8 @@ pub enum PeekSource {
     Disk,
     /// Never written: zeros.
     Unmapped,
+    /// A punched hole: zeros.
+    Hole,
 }
 
 /// A volume as the engine sees it.
@@ -412,6 +635,64 @@ pub struct VolumeStatus {
     pub active_windows: u8,
 }
 
+/// A snapshot as the engine lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SnapshotInfo {
+    /// The id: monotonic per aggregate between rewinds (a boot that rewinds
+    /// below the CP that took a snapshot loses it, and the id is reused).
+    pub snap_id: u64,
+    /// The identity.
+    pub uuid: Uuid,
+    /// The volume.
+    pub vol: u32,
+    /// The CP it pins.
+    pub cp_seq: u64,
+    /// How it was taken.
+    pub kind: SnapKind,
+    /// Why it exists.
+    pub origin: SnapOrigin,
+    /// When it was taken.
+    pub created_wall_ns: u64,
+    /// The boot could not read its root page or pinned index: reads and
+    /// diffs of it are refused ([`OperatorWarning::SnapshotDamaged`]).
+    pub damaged: bool,
+}
+
+/// The pool as an operator sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolStatus {
+    /// The committed CP.
+    pub cp_seq: u64,
+    /// The CP of the last fold.
+    pub fold_cp: u64,
+    /// Consistency points with changes since the fold.
+    pub cps_since_fold: u64,
+    /// Bytes of CP log since the fold.
+    pub log_bytes_since_fold: u64,
+    /// Map pages a fold would rewrite now.
+    pub dirty_pages: usize,
+    /// Overlay entries.
+    pub overlay_entries: usize,
+    /// Free segments.
+    pub free_segments: u32,
+    /// Segments in the pool.
+    pub segments: u32,
+    /// The flush policy in force.
+    pub flush_policy: FlushPolicy,
+    /// The geometry is flush-opaque.
+    pub flush_opaque: bool,
+    /// The discard policy in force.
+    pub discard: DiscardPolicy,
+    /// The warnings in force.
+    pub warnings: Vec<OperatorWarning>,
+    /// Snapshots on disk.
+    pub snapshots: usize,
+    /// A CP failed for want of a segment and none was requested since.
+    pub pool_full: bool,
+    /// The engine serves requests.
+    pub serving: bool,
+}
+
 /// Which phase the CP state machine is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Phase {
@@ -419,7 +700,7 @@ pub enum Phase {
     Idle,
     /// Writing data stripes.
     Staging,
-    /// Writing the map image and the segment table.
+    /// Writing the map regions and the tables.
     Metadata,
     /// Waiting for the pool flush.
     Flushing,
@@ -444,11 +725,32 @@ struct CpJob {
     trigger: CpTrigger,
     gen: Option<Arc<Generation>>,
     blocks: Vec<StagedBlock>,
+    /// Holes the generation holds: `(vol, lba, blocks)`.
+    holes: Vec<(u32, u64, u32)>,
     max_seq: u64,
     run_state: RunState,
+    /// The snapshot requests this CP took when it decided to fold: they
+    /// are the CP's until it commits or fails (a request arriving while
+    /// the CP is in flight stays with the engine for the next fold).
+    snaps: Vec<SnapRequest>,
+    /// The CP took the explicit fold request.
+    fold_requested: bool,
+    /// The CP folds because the policy's bounds were reached (and for no
+    /// other reason): a fold that does not fit is then simply dropped.
+    policy_fold: bool,
+}
+
+impl CpJob {
+    /// `true` when the CP was prepared as a fold.
+    fn folds(&self) -> bool {
+        self.fold_requested || !self.snaps.is_empty() || self.policy_fold
+    }
 }
 
 type Delta = (u32, u64, MapEntry);
+
+/// The stripe images a CP's metadata phase still has to write.
+type MetaStripeQueue = VecDeque<(u64, Vec<u8>)>;
 
 #[derive(Debug)]
 struct Staging {
@@ -460,14 +762,95 @@ struct Staging {
     failed: Option<String>,
 }
 
+/// A snapshot the engine holds: the record and the pinned root, or the
+/// damage the boot found instead of the root.
+#[derive(Debug, Clone)]
+struct SnapState {
+    record: SnapRecord,
+    pinned: Option<PinnedRoot>,
+    damage: Option<String>,
+}
+
+/// A snapshot asked for and not yet taken.
+#[derive(Debug, Clone, Copy)]
+struct SnapRequest {
+    vol: u32,
+    uuid: Uuid,
+    kind: SnapKind,
+    origin: SnapOrigin,
+    /// The active generation when the request was made, when it held
+    /// writes: the snapshot must see them, so the CP that carries that
+    /// generation (or a later one) takes the request, never a CP whose
+    /// generation was cut before.
+    after_gen: Option<GenId>,
+}
+
+/// Everything a CP's metadata phase laid out, before the job joins it.
+#[derive(Debug)]
+struct PreparedParts {
+    map_update: MapUpdate,
+    segments: SegmentTable,
+    open_meta: Option<OpenSegment>,
+    meta_live: HashMap<u64, u64>,
+    data_live: HashMap<u64, u64>,
+    freed: Vec<RootRef>,
+    table_regions: Vec<RootRef>,
+    map_roots: RootRef,
+    seg_table: RootRef,
+    cp_log_head: RootRef,
+    snap_table: RootRef,
+    new_snapshots: Vec<SnapState>,
+    carried: Vec<u32>,
+    fold: bool,
+    fold_pages: u64,
+}
+
+impl PreparedParts {
+    fn into_prepared(self, job: CpJob) -> Prepared {
+        Prepared {
+            job,
+            map_update: self.map_update,
+            segments: self.segments,
+            open_meta: self.open_meta,
+            meta_live: self.meta_live,
+            data_live: self.data_live,
+            freed: self.freed,
+            table_regions: self.table_regions,
+            map_roots: self.map_roots,
+            seg_table: self.seg_table,
+            cp_log_head: self.cp_log_head,
+            snap_table: self.snap_table,
+            new_snapshots: self.new_snapshots,
+            carried: self.carried,
+            fold: self.fold,
+            fold_pages: self.fold_pages,
+            slot: None,
+        }
+    }
+}
+
+/// Everything a CP's metadata phase laid out; applied at commit.
 #[derive(Debug)]
 struct Prepared {
     job: CpJob,
-    next_map: BlockMap,
+    map_update: MapUpdate,
+    segments: SegmentTable,
+    open_meta: Option<OpenSegment>,
+    meta_live: HashMap<u64, u64>,
+    data_live: HashMap<u64, u64>,
+    /// Regions this CP stops referencing, freed after the deferral.
+    freed: Vec<RootRef>,
+    /// The roots, directory and snapshot table regions of this CP.
+    table_regions: Vec<RootRef>,
+    map_roots: RootRef,
     seg_table: RootRef,
     cp_log_head: RootRef,
-    /// The metadata segment this CP's regions live in.
-    meta_pseg: u64,
+    snap_table: RootRef,
+    new_snapshots: Vec<SnapState>,
+    /// Volumes whose root is in this CP's table: the rows of its slot.
+    carried: Vec<u32>,
+    fold: bool,
+    fold_pages: u64,
     /// The slot as written to `A`; `B` is the same content at the other
     /// location, so the two copies of one commit never differ.
     slot: Option<SuperblockSlot>,
@@ -514,7 +897,8 @@ struct VolRt {
     present: bool,
     /// Present, but no CP has carried the creation yet: not serving.
     creating: bool,
-    /// The CP whose slot first carried the creation, once one was built.
+    /// The CP whose metadata first carried the creation, once one was
+    /// prepared.
     created_in: Option<u64>,
     size_blocks: u64,
     rollback_gen: u32,
@@ -538,6 +922,8 @@ pub struct Stats {
     pub stripes: u64,
     /// Writes acknowledged.
     pub writes: u64,
+    /// Discards and writes of zeros acknowledged.
+    pub punches: u64,
     /// Reads completed.
     pub reads: u64,
     /// Writes deferred because the arena was full.
@@ -546,6 +932,25 @@ pub struct Stats {
     pub intents: u64,
     /// Metadata segments recycled.
     pub recycled: u64,
+    /// Segment discards issued.
+    pub discards: u64,
+    /// Folds committed.
+    pub folds: u64,
+    /// Snapshots created.
+    pub snapshots: u64,
+}
+
+/// Reads map pages through a backstore.
+struct BackstoreReader<'a, B: Backstore>(&'a mut B);
+
+impl<B: Backstore> PageReader for BackstoreReader<'_, B> {
+    fn read_blocks(&mut self, pba: u64, dst: &mut [u8]) -> Result<(), MapError> {
+        self.0.read(pba, dst).map_err(|e| MapError::Io {
+            pba,
+            bytes: dst.len(),
+            reason: e.to_string(),
+        })
+    }
 }
 
 /// The engine.
@@ -557,13 +962,52 @@ pub struct Engine<B: Backstore, F: FrontDoor, C: Clock> {
     clock: C,
     arena: Arena,
     index: Index,
-    map: BlockMap,
+    map: MapSet,
     segments: SegmentTable,
     open_data: Option<OpenSegment>,
     open_meta: Option<OpenSegment>,
-    /// Metadata segments the last two committed CPs (and, at boot, every
-    /// verified slot on the ring) name: never recycled.
-    meta_protect: VecDeque<(u64, Vec<u64>)>,
+    /// Bytes of metadata the committed CP (and the regions not yet freed)
+    /// reference, per metadata segment.
+    meta_live: HashMap<u64, u64>,
+    /// Live data blocks per data segment.
+    data_live: HashMap<u64, u64>,
+    /// Regions a committed CP stopped referencing, keyed by that CP; freed
+    /// once a rewind can no longer reach the CP that referenced them.
+    freed_pending: VecDeque<(u64, Vec<RootRef>)>,
+    /// Metadata segments the other verified slot of the ring referenced at
+    /// boot, with the CP they were recorded at: kept for two commits.
+    boot_protect: VecDeque<(u64, Vec<u64>)>,
+    /// The committed CP's roots, directory and snapshot table regions.
+    table_regions: Vec<RootRef>,
+    snapshots: Vec<SnapState>,
+    snap_requests: Vec<SnapRequest>,
+    next_snap_id: u64,
+    fold_requested: bool,
+    last_fold_ns: u64,
+    /// A fold the policy asked for failed for want of a segment with this
+    /// many free: the policy stays quiet until more are free.
+    fold_blocked_at: Option<u32>,
+    /// A fold failed because a map page it had to rewrite does not verify:
+    /// no fold is attempted until the volume is repaired (a reboot clears
+    /// the flag; the page is reported in the warnings).
+    fold_damaged: bool,
+    /// Data segments whose live count reached zero at a CP, with that CP:
+    /// freed once a rewind can no longer reach a CP that named their
+    /// blocks (the same deferral as a freed metadata region).
+    dead_data_pending: VecDeque<(u64, Vec<u64>)>,
+    /// Segments freed while a CP was in flight (a discard completing): the
+    /// CP's copy of the table does not have the free, so it is applied
+    /// again when the copy becomes the table.
+    freed_during_cp: Vec<u64>,
+    /// Hole record slots per generation, released when its CP commits.
+    gen_holes: HashMap<GenId, Vec<RingRef>>,
+    warnings: Vec<OperatorWarning>,
+    /// Segments whose discard is in flight, by tag: they stay allocated
+    /// in the table until the discard completes, so nothing is written
+    /// where a late discard could still land.
+    discarding: HashMap<Tag, u64>,
+    /// Segments whose discard the backstore refused with `Busy`.
+    pending_discards: Vec<u64>,
     vols: Vec<VolRt>,
     cp_seq: u64,
     cp_nonce: u64,
@@ -593,6 +1037,9 @@ pub struct Engine<B: Backstore, F: FrontDoor, C: Clock> {
     /// is attempted until one is requested.
     pool_full: bool,
     pool_retry: bool,
+    /// The boot commit failed and is issued again on the next tick (unless
+    /// the pool is full, where a request is needed first).
+    boot_retry: bool,
     pending_triggers: Vec<(GenId, CpTrigger)>,
     last_cut_ns: u64,
     last_commit_ns: u64,
@@ -610,29 +1057,6 @@ impl<B: Backstore, F: FrontDoor, C: Clock> fmt::Debug for Engine<B, F, C> {
             .field("stopped", &self.stopped)
             .finish_non_exhaustive()
     }
-}
-
-/// Stripes the CP metadata takes at most with `total_blocks` mapped (the
-/// whole map image plus the segment table, packed into whole stripes).
-#[must_use]
-pub fn metadata_stripes(layout: &DiskLayout, total_blocks: u64) -> u64 {
-    let map_pages = total_blocks.div_ceil(CP_LOG_RECS_PER_PAGE as u64);
-    let table_pages =
-        ((u64::from(layout.segments) + 1) * SEG_ENTRY_SIZE as u64).div_ceil(BLOCK_SIZE as u64);
-    (map_pages + table_pages)
-        .saturating_mul(BLOCK_SIZE as u64)
-        .div_ceil(u64::from(layout.stripe_bytes))
-}
-
-fn check_metadata_fits(layout: &DiskLayout, total_blocks: u64) -> Result<(), EngineError> {
-    let stripes = metadata_stripes(layout, total_blocks);
-    if stripes > u64::from(layout.stripes_per_segment) {
-        return Err(EngineError::MetadataTooLarge {
-            stripes,
-            stripes_per_segment: layout.stripes_per_segment,
-        });
-    }
-    Ok(())
 }
 
 /// Drives one backstore synchronously (format only): submits, retrying on
@@ -691,6 +1115,14 @@ impl SyncDriver {
     }
 }
 
+/// Checks the E19 policy against the geometry.
+fn check_flush_policy(profile: &crate::traits::MediaProfile) -> Result<(), EngineError> {
+    if profile.geom.flush_opaque && profile.flush_policy == FlushPolicy::RequireFuaOrFlush {
+        return Err(EngineError::FlushOpaqueRefused);
+    }
+    Ok(())
+}
+
 impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     /// Formats the device for `cfg`: wipes the superblock ring and the intent
     /// slots, then writes consistency point 0, clean, with the configured
@@ -698,12 +1130,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     /// slots of the ring are durable.
     pub fn format(backstore: &mut B, clock: &C, cfg: &EngineConfig) -> Result<(), EngineError> {
         let profile = *backstore.profile();
-        if profile.geom.flush_opaque {
-            return Err(EngineError::Unsupported("flush-opaque backstores (E19)"));
-        }
+        check_flush_policy(&profile)?;
         cfg.validate()?;
         let layout = DiskLayout::new(&profile.geom)?;
-        check_metadata_fits(&layout, cfg.total_blocks())?;
+        for spec in &cfg.volumes {
+            check_index_fits(&layout, spec.size_blocks)?;
+        }
         let mut rows = [VolState::ABSENT; MAX_VOLS];
         let mut vol_count = 0u32;
         for spec in &cfg.volumes {
@@ -737,6 +1169,8 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         let tag = driver.tag();
         driver.submit(backstore, tag, |b| b.flush(DevClass::Pool, tag))?;
         driver.drain(backstore, true)?;
+        // CP 0 lists the volumes as present but maps nothing: their roots
+        // are written by the first boot's commit, which creates them.
         let nonce = nonce_for(cfg.agg_id, 0, clock.wall_ns(), clock.mono_ns(), 0);
         for location in [SbLocation::A, SbLocation::B] {
             let mut slot = SuperblockSlot::new(cfg.agg_id, 0, location);
@@ -746,6 +1180,11 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             slot.sb.vol_count = vol_count;
             slot.sb.set_run_state(RunState::CleanShutdown);
             slot.vols.vols = rows;
+            slot.sb.set_geometry(
+                layout.stripe_bytes,
+                layout.segment_bytes as u32,
+                layout.capacity_bytes,
+            );
             slot.seal()?;
             let pba = layout.sb_pba(slot.sb.sb_slot().expect("slot_for gave a slot"));
             let tag = driver.tag();
@@ -778,11 +1217,8 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 })
             };
         }
-        if backstore.profile().geom.flush_opaque {
-            fail!(
-                EngineError::Unsupported("flush-opaque backstores (E19)"),
-                memory
-            );
+        if let Err(e) = check_flush_policy(backstore.profile()) {
+            fail!(e, memory);
         }
         if let Err(e) = cfg.validate() {
             fail!(e, memory);
@@ -795,6 +1231,23 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             Ok(state) => state,
             Err(e) => fail!(e.into(), memory),
         };
+        // The configuration is the control plane's view of the volumes; a
+        // size other than the root's is a mismatch, not a resize (a resize
+        // goes through a CP that rewrites the root).
+        for spec in &cfg.volumes {
+            if let Some(v) = state.map.volume(spec.vol) {
+                if v.lba_count() != spec.size_blocks {
+                    fail!(
+                        EngineError::VolumeSizeMismatch {
+                            vol: spec.vol,
+                            on_disk: v.lba_count(),
+                            configured: spec.size_blocks,
+                        },
+                        memory
+                    );
+                }
+            }
+        }
         let wall = clock.wall_ns();
         let (arena, reattach, arena_lost) = match Arena::can_attach(&memory, &cfg.agg_id) {
             Ok(()) => match Arena::attach(memory, &cfg.agg_id) {
@@ -859,9 +1312,17 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             segments,
             open_data,
             open_meta,
-            ring_roots,
+            meta_live,
+            protected,
+            snapshots,
+            table_regions,
+            torn,
             ..
         } = state;
+        let torn: Vec<(u64, String)> = torn
+            .into_iter()
+            .map(|(cp, reason)| (cp, format!("{reason:?}")))
+            .collect();
         let sb = slot.sb;
         // A rewind proves the engine ran past the selected CP, whatever that
         // CP's run state says.
@@ -874,21 +1335,45 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 vols[i].present = true;
                 vols[i].rollback_gen = row.rollback_gen;
                 vols[i].nvfail = row.nvfail_cause().filter(|c| *c != NvCause::None);
+                // A present volume's size is its root's; one without a map
+                // root (CP 0 of a format, or a pool whose creation CP is the
+                // next one) is created with the boot commit.
+                match map.volume(i as u32) {
+                    Some(v) => vols[i].size_blocks = v.lba_count(),
+                    None => vols[i].creating = true,
+                }
             }
         }
         for spec in &cfg.volumes {
             if let Some(v) = vols.get_mut(spec.vol as usize) {
-                v.size_blocks = spec.size_blocks;
+                if !v.present || v.creating {
+                    v.size_blocks = spec.size_blocks;
+                }
                 if !v.present {
                     // The control plane knows a volume the disk does not:
-                    // it is created with the boot commit.
+                    // it is created with the boot commit. After a rewind
+                    // the volume may have existed in the torn CP, with
+                    // writes the client was told were done: it is created
+                    // held, like the volumes whose writes the rewind lost,
+                    // until the operator clears it.
                     v.present = true;
                     v.creating = true;
+                    if rewound {
+                        v.nvfail = Some(NvCause::TornCp);
+                    }
+                }
+            }
+        }
+        for (vol, m) in map.volumes() {
+            if let Some(v) = vols.get_mut(vol as usize) {
+                if v.size_blocks == 0 {
+                    v.size_blocks = m.lba_count();
                 }
             }
         }
 
         let index = Index::new(cfg.ring, now);
+        let mut gen_holes: HashMap<GenId, Vec<RingRef>> = HashMap::new();
         let mut events = Vec::new();
         let mut replayed_blocks = 0u64;
         let mut orphaned_blocks = 0u64;
@@ -897,9 +1382,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             damaged_slots = report.damaged.len() as u32;
             for (vol, lba, extent) in runs_of(&report.placed) {
                 let known = vols.get(vol as usize).is_some_and(|v| v.present);
+                let slots = if extent.hole { 1 } else { extent.blocks };
                 if !known {
                     orphaned_blocks += u64::from(extent.blocks);
-                    if let Err(e) = arena.commit(extent.ring, extent.blocks) {
+                    if let Err(e) = arena.commit(extent.ring, slots) {
                         events.push(Event::Internal {
                             what: format!("releasing an orphaned run: {e}"),
                         });
@@ -907,7 +1393,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                     continue;
                 }
                 match index.insert(vol, lba, extent) {
-                    Ok((_, superseded)) => {
+                    Ok((gen, superseded)) => {
                         if let Some(v) = vols.get_mut(vol as usize) {
                             v.windows = 2;
                         }
@@ -918,6 +1404,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                                 });
                             }
                         }
+                        if extent.hole {
+                            gen_holes.entry(gen).or_default().push(extent.ring);
+                        }
                         replayed_blocks += u64::from(extent.blocks);
                     }
                     Err(e) => {
@@ -925,7 +1414,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                         events.push(Event::Internal {
                             what: format!("replaying volume {vol} LBA {lba}: {e}"),
                         });
-                        if let Err(e) = arena.commit(extent.ring, extent.blocks) {
+                        if let Err(e) = arena.commit(extent.ring, slots) {
                             events.push(Event::Internal {
                                 what: format!("releasing an unreplayable run: {e}"),
                             });
@@ -967,19 +1456,55 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 intent_seq = intent_seq.max(intent.intent_seq);
             }
         }
-        // Metadata segments any verified superblock on the ring names stay
-        // until two more CPs have committed.
-        let mut protected: Vec<u64> = ring_roots
-            .iter()
-            .filter_map(|r| layout.pseg_of_pba(r.pba))
-            .collect();
-        if let Some(open) = open_meta {
-            protected.push(open.pseg);
+        let mut boot_protect = VecDeque::new();
+        boot_protect.push_back((sb.cp_seq, protected));
+
+        // Data liveness as the table recorded it.
+        let mut data_live = HashMap::new();
+        for (pseg, entry) in segments.iter() {
+            if !entry.is_free() && entry.seg_kind() == Some(SegKind::Data) {
+                data_live.insert(pseg, u64::from(entry.live_bytes) / BLOCK_SIZE as u64);
+            }
         }
-        protected.sort_unstable();
-        protected.dedup();
-        let mut meta_protect = VecDeque::new();
-        meta_protect.push_back((sb.cp_seq, protected));
+        let next_snap_id = snapshots
+            .iter()
+            .map(|s| s.record.snap_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut warnings = Vec::new();
+        if backstore.profile().trusts_opaque_barrier() {
+            let warning = OperatorWarning::FlushOpaqueTrusted {
+                policy: backstore.profile().flush_policy,
+            };
+            events.push(Event::OperatorWarning(warning.clone()));
+            warnings.push(warning);
+        }
+        let snapshots: Vec<SnapState> = snapshots
+            .into_iter()
+            .map(
+                |BootSnapshot {
+                     record,
+                     pinned,
+                     damage,
+                 }| {
+                    if let Some(reason) = &damage {
+                        let warning = OperatorWarning::SnapshotDamaged {
+                            snap_id: record.snap_id,
+                            vol: record.vol,
+                            reason: reason.clone(),
+                        };
+                        events.push(Event::OperatorWarning(warning.clone()));
+                        warnings.push(warning);
+                    }
+                    SnapState {
+                        record,
+                        pinned,
+                        damage,
+                    }
+                },
+            )
+            .collect();
 
         events.insert(
             0,
@@ -993,6 +1518,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 damaged_slots,
                 orphaned_blocks,
                 nvfail: nvfail_now,
+                torn,
             },
         );
         Self {
@@ -1006,7 +1532,24 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             segments,
             open_data,
             open_meta,
-            meta_protect,
+            meta_live,
+            data_live,
+            freed_pending: VecDeque::new(),
+            boot_protect,
+            table_regions,
+            snapshots,
+            snap_requests: Vec::new(),
+            next_snap_id,
+            fold_requested: false,
+            last_fold_ns: now,
+            fold_blocked_at: None,
+            fold_damaged: false,
+            dead_data_pending: VecDeque::new(),
+            freed_during_cp: Vec::new(),
+            gen_holes,
+            warnings,
+            discarding: HashMap::new(),
+            pending_discards: Vec::new(),
             vols,
             cp_seq: sb.cp_seq,
             cp_nonce: sb.cp_nonce,
@@ -1029,6 +1572,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             cp_requested: false,
             pool_full: false,
             pool_retry: false,
+            boot_retry: false,
             pending_triggers: Vec::new(),
             last_cut_ns: now,
             last_commit_ns: now,
@@ -1046,12 +1590,33 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         self.backstore.poll(&mut dones);
         let mut cp_dones = Vec::new();
         for done in dones {
+            if let Some(pseg) = self.discarding.remove(&done.tag) {
+                // Discarded or not, nothing live is there: the segment is
+                // free now that no discard can land on it late.
+                if let Err(e) = done.result {
+                    self.events.push(Event::Internal {
+                        what: format!("the discard of segment {pseg} failed: {e}"),
+                    });
+                }
+                self.free_segment(pseg, done.result.is_ok());
+                continue;
+            }
             if !self.handle_intent_done(done) {
                 cp_dones.push(done);
             }
         }
         self.advance_cp(cp_dones)?;
         self.retry_intent()?;
+        self.retry_discards();
+        if self.boot_retry
+            && matches!(self.state, State::Idle)
+            && (!self.pool_full || self.pool_retry)
+        {
+            self.boot_retry = false;
+            self.pool_retry = false;
+            let job = self.new_job(CpTrigger::Boot, None, RunState::Running);
+            self.start_job(job)?;
+        }
         if self.serving && !self.stopped {
             self.serve_front_door()?;
         } else if self.stopped {
@@ -1067,6 +1632,19 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     pub fn request_cp(&mut self) {
         self.cp_requested = true;
         self.pool_retry = true;
+    }
+
+    /// Asks the next consistency point to fold the map. Refused with an
+    /// internal event while a map page is damaged (the warnings say which).
+    pub fn request_fold(&mut self) {
+        if self.fold_damaged {
+            self.events.push(Event::Internal {
+                what: "a fold was requested while a map page is damaged; refused".into(),
+            });
+            return;
+        }
+        self.fold_requested = true;
+        self.request_cp();
     }
 
     /// Begins a clean shutdown: no new requests are fetched, every frozen
@@ -1104,13 +1682,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     }
 
     /// Creates a volume: present at once, serving once the CP that carries
-    /// its table row commits ([`Event::VolumeCreated`]); requests to it
-    /// answer `NoSuchVolume` until then, so no acknowledged write can
+    /// its root and table row commits ([`Event::VolumeCreated`]); requests
+    /// to it answer `NoSuchVolume` until then, so no acknowledged write can
     /// outlive a volume that was never durable.
     pub fn create_volume(&mut self, vol: u32, size_blocks: u64) -> Result<(), EngineError> {
         check_size(vol, size_blocks)?;
-        let total = self.total_blocks().saturating_add(size_blocks);
-        check_metadata_fits(&self.layout, total)?;
+        check_index_fits(&self.layout, size_blocks)?;
         let v = self
             .vols
             .get_mut(vol as usize)
@@ -1128,6 +1705,217 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         v.windows = 0;
         self.request_cp();
         Ok(())
+    }
+
+    /// Asks for a snapshot of `vol`: taken at the next consistency point,
+    /// which folds the map so the root is complete, and durable when that
+    /// CP commits ([`Event::SnapshotCreated`]). Returns nothing until then;
+    /// [`snapshots`](Self::snapshots) lists it afterwards.
+    pub fn create_snapshot(
+        &mut self,
+        vol: u32,
+        uuid: Uuid,
+        kind: SnapKind,
+        origin: SnapOrigin,
+    ) -> Result<(), EngineError> {
+        let v = self
+            .vols
+            .get(vol as usize)
+            .filter(|v| v.present && !v.creating)
+            .ok_or(EngineError::NoSuchVolume { vol })?;
+        if v.nvfail.is_some() {
+            return Err(EngineError::NvFailed { vol });
+        }
+        if uuid.is_nil() {
+            return Err(EngineError::Format(FormatError::BadField {
+                field: "snap_uuid",
+                value: 0,
+            }));
+        }
+        if self.snapshots.iter().any(|s| s.record.snap_uuid == uuid)
+            || self.snap_requests.iter().any(|r| r.uuid == uuid)
+            || self.in_flight_snapshot(uuid)
+        {
+            return Err(EngineError::SnapshotExists { uuid });
+        }
+        if self.fold_damaged {
+            return Err(EngineError::MapDamaged);
+        }
+        self.snap_requests.push(SnapRequest {
+            vol,
+            uuid,
+            kind,
+            origin,
+            after_gen: (self.index.active_blocks() > 0).then(|| self.index.active_id()),
+        });
+        self.request_fold();
+        Ok(())
+    }
+
+    /// `true` while a CP in flight holds a request for `uuid`.
+    fn in_flight_snapshot(&self, uuid: Uuid) -> bool {
+        let job = match &self.state {
+            State::Staging(st) => Some(&st.job),
+            State::Meta(mw) => Some(&mw.prep.job),
+            State::Flush { prep, .. }
+            | State::CommitA { prep, .. }
+            | State::CommitB { prep, .. } => Some(&prep.job),
+            State::Idle => None,
+        };
+        job.is_some_and(|j| j.snaps.iter().any(|r| r.uuid == uuid))
+    }
+
+    /// The snapshots on disk, in id order.
+    #[must_use]
+    pub fn snapshots(&self) -> Vec<SnapshotInfo> {
+        self.snapshots
+            .iter()
+            .map(|s| SnapshotInfo {
+                snap_id: s.record.snap_id,
+                uuid: s.record.snap_uuid,
+                vol: s.record.vol,
+                cp_seq: u64::from(s.record.birth_cp),
+                kind: s.record.snap_kind().unwrap_or(SnapKind::Crash),
+                origin: s.record.snap_origin().unwrap_or(SnapOrigin::User),
+                created_wall_ns: s.record.created_wall_ns,
+                damaged: s.damage.is_some(),
+            })
+            .collect()
+    }
+
+    /// Reads `dst.len() / 4096` blocks at `lba` of snapshot `snap_id`: the
+    /// volume as it was at the snapshot's CP, whatever happened since.
+    pub fn snapshot_read(
+        &mut self,
+        snap_id: u64,
+        lba: u64,
+        dst: &mut [u8],
+    ) -> Result<Vec<PeekSource>, EngineError> {
+        if !dst.len().is_multiple_of(BLOCK_SIZE) {
+            return Err(EngineError::Io(IoError::BadLength { bytes: dst.len() }));
+        }
+        let snap = self
+            .snapshots
+            .iter()
+            .position(|s| s.record.snap_id == snap_id)
+            .ok_or(EngineError::NoSuchSnapshot { snap_id })?;
+        let blocks = (dst.len() / BLOCK_SIZE) as u64;
+        let pinned = self.snapshots[snap]
+            .pinned
+            .clone()
+            .ok_or(EngineError::SnapshotDamaged { snap_id })?;
+        if lba
+            .checked_add(blocks)
+            .is_none_or(|end| end > pinned.root.lba_count)
+        {
+            return Err(EngineError::Io(IoError::OutOfRange {
+                pba: lba,
+                bytes: dst.len(),
+            }));
+        }
+        let mut sources = Vec::with_capacity(blocks as usize);
+        for k in 0..blocks {
+            let out = &mut dst[(k as usize) * BLOCK_SIZE..(k as usize + 1) * BLOCK_SIZE];
+            let entry = {
+                let Engine { map, backstore, .. } = self;
+                map.pinned_get(&mut BackstoreReader(backstore), &pinned, lba + k)?
+            };
+            sources.push(self.read_entry(pinned.vol, lba + k, entry, out)?);
+        }
+        Ok(sources)
+    }
+
+    /// Every block of snapshot `snap_id` born after `base` (another
+    /// snapshot of the same volume, older, or none): what a delta ships.
+    pub fn snapshot_diff(
+        &mut self,
+        snap_id: u64,
+        base: Option<u64>,
+    ) -> Result<Vec<(u64, MapEntry)>, EngineError> {
+        let snap = self
+            .snapshots
+            .iter()
+            .find(|s| s.record.snap_id == snap_id)
+            .ok_or(EngineError::NoSuchSnapshot { snap_id })?;
+        let birth = u64::from(snap.record.birth_cp);
+        let pinned = snap
+            .pinned
+            .clone()
+            .ok_or(EngineError::SnapshotDamaged { snap_id })?;
+        let base_cp = self.base_cp(pinned.vol, base)?;
+        if let Some(base_id) = base {
+            if base_cp >= birth {
+                return Err(EngineError::SnapshotOrder {
+                    snap_id,
+                    base: base_id,
+                });
+            }
+        }
+        let mut out = Vec::new();
+        let Engine { map, backstore, .. } = self;
+        map.pinned_diff(
+            &mut BackstoreReader(backstore),
+            &pinned,
+            base_cp,
+            |lba, e| out.push((lba, e)),
+        )?;
+        Ok(out)
+    }
+
+    /// Every committed block of `vol` born after `base` (a snapshot of the
+    /// volume, or none).
+    pub fn live_diff(
+        &mut self,
+        vol: u32,
+        base: Option<u64>,
+    ) -> Result<Vec<(u64, MapEntry)>, EngineError> {
+        let base_cp = self.base_cp(vol, base)?;
+        let mut out = Vec::new();
+        let Engine { map, backstore, .. } = self;
+        map.diff(&mut BackstoreReader(backstore), vol, base_cp, |lba, e| {
+            out.push((lba, e))
+        })?;
+        Ok(out)
+    }
+
+    fn base_cp(&self, vol: u32, base: Option<u64>) -> Result<u64, EngineError> {
+        match base {
+            None => Ok(0),
+            Some(id) => {
+                let s = self
+                    .snapshots
+                    .iter()
+                    .find(|s| s.record.snap_id == id)
+                    .ok_or(EngineError::NoSuchSnapshot { snap_id: id })?;
+                if s.record.vol != vol {
+                    return Err(EngineError::NoSuchSnapshot { snap_id: id });
+                }
+                Ok(u64::from(s.record.birth_cp))
+            }
+        }
+    }
+
+    /// The pool as an operator sees it.
+    #[must_use]
+    pub fn pool_status(&self) -> PoolStatus {
+        let profile = self.backstore.profile();
+        PoolStatus {
+            cp_seq: self.cp_seq,
+            fold_cp: self.map.fold_cp(),
+            cps_since_fold: self.map.cps_since_fold(),
+            log_bytes_since_fold: self.map.log_bytes_since_fold(),
+            dirty_pages: self.map.dirty_pages(),
+            overlay_entries: self.map.overlay_entries(),
+            free_segments: self.segments.free_count(),
+            segments: self.segments.segments(),
+            flush_policy: profile.flush_policy,
+            flush_opaque: profile.geom.flush_opaque,
+            discard: profile.discard,
+            warnings: self.warnings.clone(),
+            snapshots: self.snapshots.len(),
+            pool_full: self.pool_full,
+            serving: self.serving,
+        }
     }
 
     /// Reads `dst.len() / 4096` blocks at `lba` of `vol` regardless of
@@ -1187,11 +1975,15 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         Ok(blocks)
     }
 
-    /// The committed map entry of a block, if any (for checkers and the
-    /// support bundle).
-    #[must_use]
-    pub fn map_entry(&self, vol: u32, lba: u64) -> Option<MapEntry> {
-        self.map.get(vol, lba)
+    /// The committed map entry of a block, if mapped (for checkers and the
+    /// support bundle): `None` for an unmapped block, a volume without a
+    /// root yet, or a page that could not be read.
+    pub fn map_entry(&mut self, vol: u32, lba: u64) -> Option<MapEntry> {
+        let Engine { map, backstore, .. } = self;
+        match map.get(&mut BackstoreReader(backstore), vol, lba) {
+            Ok(e) if !e.is_unmapped() => Some(e),
+            _ => None,
+        }
     }
 
     /// Events since the last call.
@@ -1293,6 +2085,18 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         self.segments.free_count()
     }
 
+    /// Live data blocks the engine counts in segment `pseg`.
+    #[must_use]
+    pub fn live_blocks(&self, pseg: u64) -> u64 {
+        self.data_live.get(&pseg).copied().unwrap_or(0)
+    }
+
+    /// Bytes of metadata the committed CP references in segment `pseg`.
+    #[must_use]
+    pub fn meta_live_bytes(&self, pseg: u64) -> u64 {
+        self.meta_live.get(&pseg).copied().unwrap_or(0)
+    }
+
     /// Counters.
     #[must_use]
     pub const fn stats(&self) -> Stats {
@@ -1309,6 +2113,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     #[must_use]
     pub const fn config(&self) -> &EngineConfig {
         &self.cfg
+    }
+
+    /// The map (for checkers).
+    #[must_use]
+    pub const fn map(&self) -> &MapSet {
+        &self.map
     }
 
     /// The front door, for a harness that owns it.
@@ -1340,21 +2150,14 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         )
     }
 
-    fn total_blocks(&self) -> u64 {
-        self.vols
-            .iter()
-            .filter(|v| v.present)
-            .fold(0u64, |sum, v| sum.saturating_add(v.size_blocks))
-    }
-
     // ----------------------------------------------------------------------
     // The front door
     // ----------------------------------------------------------------------
 
     /// Serves requests: deferred writes first, in order, then new ones.
-    /// Writes stay first-in first-out among themselves (a write behind a
-    /// deferred one waits); reads and flushes never wait for the arena, so
-    /// a stalled device cannot starve cache hits.
+    /// Writes and punches stay first-in first-out among themselves (one
+    /// behind a deferred one waits); reads and flushes never wait for the
+    /// arena, so a stalled device cannot starve cache hits.
     fn serve_front_door(&mut self) -> Result<(), EngineError> {
         while let Some(req) = self.deferred.pop_front() {
             if let Some(back) = self.serve(req)? {
@@ -1366,8 +2169,8 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             let Some(req) = self.front.fetch() else {
                 break;
             };
-            let is_write = matches!(req.kind, RequestKind::Write { .. });
-            if is_write && !self.deferred.is_empty() {
+            let takes_arena = matches!(req.kind, RequestKind::Write { .. }) || req.is_punch();
+            if takes_arena && !self.deferred.is_empty() {
                 self.deferred.push_back(req);
                 self.stats.deferred += 1;
                 continue;
@@ -1435,6 +2238,22 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 }
                 self.serve_write(req, vol, lba, blocks)
             }
+            RequestKind::Discard { lba, blocks, .. }
+            | RequestKind::WriteZeroes { lba, blocks, .. } => {
+                if !in_range(lba, blocks) {
+                    self.front.complete(req, Status::OutOfRange, 0);
+                    return Ok(None);
+                }
+                if blocks > MAX_PUNCH_BLOCKS {
+                    self.front.complete(req, Status::TooLarge, 0);
+                    return Ok(None);
+                }
+                if self.pool_full {
+                    self.front.complete(req, Status::NoSpace, 0);
+                    return Ok(None);
+                }
+                self.serve_punch(req, vol, lba, blocks)
+            }
             RequestKind::Read { lba, blocks, .. } => {
                 if !in_range(lba, blocks) {
                     self.front.complete(req, Status::OutOfRange, 0);
@@ -1495,7 +2314,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         self.arena.fill(ring, vol, lba, seq, &crcs)?;
         let superseded = match self
             .index
-            .insert(vol, lba, DirtyExtent { ring, blocks, seq })
+            .insert(vol, lba, DirtyExtent::data(ring, blocks, seq))
         {
             Ok((_, superseded)) => superseded,
             Err(e) => {
@@ -1516,6 +2335,63 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             self.arena.commit(old, old_blocks)?;
         }
         self.stats.writes += 1;
+        self.acknowledge(req, vol, seq);
+        Ok(None)
+    }
+
+    /// A discard or a write of zeros: one hole record in the arena, a hole
+    /// extent in the index, acknowledged like a write.
+    fn serve_punch(
+        &mut self,
+        req: Request,
+        vol: u32,
+        lba: u64,
+        blocks: u32,
+    ) -> Result<Option<Request>, EngineError> {
+        let ring = match self.arena.reserve(1) {
+            Ok(ring) => ring,
+            Err(ArenaError::Full { .. }) => return Ok(Some(req)),
+            Err(ArenaError::LapExhausted) => {
+                self.events.push(Event::Internal {
+                    what: "the arena's lap counter is exhausted".into(),
+                });
+                self.front.complete(req, Status::Failed, 0);
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let seq = self.arena.next_seq();
+        self.arena.fill_hole(ring, vol, lba, blocks, seq)?;
+        let (gen, superseded) =
+            match self
+                .index
+                .insert(vol, lba, DirtyExtent::hole(ring, blocks, seq))
+            {
+                Ok(x) => x,
+                Err(e) => {
+                    self.arena.discard(ring, 1)?;
+                    match e {
+                        IndexError::BadExtent { .. } | IndexError::BadVol { .. } => {
+                            self.front.complete(req, Status::OutOfRange, 0);
+                            return Ok(None);
+                        }
+                        other => return Err(other.into()),
+                    }
+                }
+            };
+        self.arena.place(ring, 1)?;
+        for (old, old_blocks) in superseded {
+            self.arena.commit(old, old_blocks)?;
+        }
+        self.gen_holes.entry(gen).or_default().push(ring);
+        self.stats.punches += 1;
+        self.acknowledge(req, vol, seq);
+        Ok(None)
+    }
+
+    /// Acknowledges a placed write or punch, after an intent when precise
+    /// mode needs one.
+    fn acknowledge(&mut self, req: Request, vol: u32, seq: u64) {
         if let Some(v) = self.vols.get_mut(vol as usize) {
             v.windows = 2;
         }
@@ -1524,10 +2400,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         {
             self.intent_wanted = true;
             self.pending_acks.push((req, seq));
-            return Ok(None);
+            return;
         }
         self.front.complete(req, Status::Ok, seq);
-        Ok(None)
     }
 
     fn serve_read(
@@ -1542,8 +2417,15 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             let out = &mut buf[(k as usize) * BLOCK_SIZE..(k as usize + 1) * BLOCK_SIZE];
             match self.read_block(vol, lba + u64::from(k), out) {
                 Ok(_) => {}
-                Err(EngineError::Corrupt { .. }) => {
+                // A block, or the map page that names it, that does not
+                // verify: this request's answer, not the engine's failure.
+                Err(EngineError::Corrupt { .. }) | Err(EngineError::Map(MapError::Format(_))) => {
                     self.front.complete(req, Status::Corrupt, 0);
+                    return Ok(());
+                }
+                // The device refused a read: likewise.
+                Err(EngineError::Io(_)) | Err(EngineError::Map(MapError::Io { .. })) => {
+                    self.front.complete(req, Status::Failed, 0);
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -1558,7 +2440,8 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     }
 
     /// One block: the arena first (newest generation wins, checked against
-    /// the CRC recorded when it was written), then the map.
+    /// the CRC recorded when it was written; a hole reads as zeros), then
+    /// the map.
     fn read_block(
         &mut self,
         vol: u32,
@@ -1566,6 +2449,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         out: &mut [u8],
     ) -> Result<PeekSource, EngineError> {
         if let Some(hit) = self.index.lookup(vol, lba) {
+            if hit.hole {
+                out.fill(0);
+                return Ok(PeekSource::Hole);
+            }
             match self.arena.check_data(hit.ring, 1) {
                 Ok(()) => {}
                 Err(ArenaError::DataCrc { .. }) => return Err(EngineError::Corrupt { vol, lba }),
@@ -1585,24 +2472,44 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         lba: u64,
         out: &mut [u8],
     ) -> Result<PeekSource, EngineError> {
-        match self.map.get(vol, lba) {
-            Some(entry) if entry.is_data() => {
-                let pba = self
-                    .layout
-                    .block_pba(entry.lseg(), entry.off())
-                    .ok_or_else(|| {
-                        EngineError::Internal(format!("map entry of {vol}/{lba} is off the device"))
-                    })?;
-                self.backstore.read(pba, out)?;
-                if crc32c(out) != entry.crc32c {
-                    return Err(EngineError::Corrupt { vol, lba });
-                }
-                Ok(PeekSource::Disk)
+        let entry = {
+            let Engine { map, backstore, .. } = self;
+            match map.get(&mut BackstoreReader(backstore), vol, lba) {
+                Ok(e) => e,
+                // A volume without a root yet maps nothing.
+                Err(MapError::NoSuchVolume { .. }) => MapEntry::UNMAPPED,
+                Err(e) => return Err(e.into()),
             }
-            _ => {
-                out.fill(0);
-                Ok(PeekSource::Unmapped)
+        };
+        self.read_entry(vol, lba, entry, out)
+    }
+
+    /// Reads what a map entry names.
+    fn read_entry(
+        &mut self,
+        vol: u32,
+        lba: u64,
+        entry: MapEntry,
+        out: &mut [u8],
+    ) -> Result<PeekSource, EngineError> {
+        if entry.is_data() {
+            let pba = self
+                .layout
+                .block_pba(entry.lseg(), entry.off())
+                .ok_or_else(|| {
+                    EngineError::Internal(format!("map entry of {vol}/{lba} is off the device"))
+                })?;
+            self.backstore.read(pba, out)?;
+            if crc32c(out) != entry.crc32c {
+                return Err(EngineError::Corrupt { vol, lba });
             }
+            Ok(PeekSource::Disk)
+        } else if entry.is_hole() {
+            out.fill(0);
+            Ok(PeekSource::Hole)
+        } else {
+            out.fill(0);
+            Ok(PeekSource::Unmapped)
         }
     }
 
@@ -1678,6 +2585,61 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             self.intent_wanted = false;
         }
         Ok(())
+    }
+
+    /// Issues the segment discards a `Busy` backstore refused earlier.
+    fn retry_discards(&mut self) {
+        let pending = std::mem::take(&mut self.pending_discards);
+        for pseg in pending {
+            self.discard(pseg);
+        }
+    }
+
+    /// Issues a whole-segment discard, or queues it when the backstore is
+    /// busy. The segment stays allocated until the discard completes.
+    fn discard(&mut self, pseg: u64) {
+        let Some(pba) = self.layout.segment_first_pba(pseg) else {
+            self.free_segment(pseg, false);
+            return;
+        };
+        let tag = self.tag();
+        match self
+            .backstore
+            .discard_segment(pba, self.layout.segment_bytes, tag)
+        {
+            Ok(()) => {
+                self.discarding.insert(tag, pseg);
+                self.stats.discards += 1;
+            }
+            Err(Busy) => self.pending_discards.push(pseg),
+        }
+    }
+
+    /// Returns a dead metadata segment to the pool.
+    fn free_segment(&mut self, pseg: u64, discarded: bool) {
+        match self.segments.free(pseg) {
+            Ok(()) => {
+                self.meta_live.remove(&pseg);
+                self.data_live.remove(&pseg);
+                self.stats.recycled += 1;
+                self.events.push(Event::SegmentFreed { pseg, discarded });
+                // A CP past its metadata preparation works on a copy of the
+                // table taken before this free: the free is applied again
+                // when the copy lands. (A CP still staging copies the table
+                // later and sees the free itself.)
+                if !matches!(self.state, State::Idle | State::Staging(_)) {
+                    self.freed_during_cp.push(pseg);
+                }
+            }
+            Err(e) => self.events.push(Event::Internal {
+                what: format!("recycling segment {pseg}: {e}"),
+            }),
+        }
+    }
+
+    /// `true` while a discard of `pseg` is in flight or waiting.
+    fn discard_pending(&self, pseg: u64) -> bool {
+        self.discarding.values().any(|p| *p == pseg) || self.pending_discards.contains(&pseg)
     }
 
     // ----------------------------------------------------------------------
@@ -1785,11 +2747,16 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         let cp_seq = self.cp_seq + 1;
         let nonce = self.new_nonce(cp_seq);
         let mut blocks = Vec::new();
+        let mut holes = Vec::new();
         let mut max_seq = 0u64;
         if let Some(gen) = &gen {
             gen.for_each_dirty_volume(|vol, dirty| {
                 for (lba, ext) in dirty.iter() {
                     max_seq = max_seq.max(ext.seq);
+                    if ext.hole {
+                        holes.push((vol, lba, ext.blocks));
+                        continue;
+                    }
                     for k in 0..ext.blocks {
                         blocks.push(StagedBlock {
                             vol,
@@ -1802,11 +2769,15 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             });
         }
         CpJob {
+            snaps: Vec::new(),
+            fold_requested: false,
+            policy_fold: false,
             cp_seq,
             nonce,
             trigger,
             gen,
             blocks,
+            holes,
             max_seq,
             run_state,
         }
@@ -1844,16 +2815,58 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     /// Gives a CP attempt up. With `no_space` the pool is full: writes are
     /// refused until a CP is requested, and a shutdown that cannot write
     /// what it has to stops without the clean marker.
+    /// Refuses the fold requests a failed CP took: the snapshot requests
+    /// are answered with [`Event::SnapshotFailed`], the explicit fold
+    /// request with an internal event, and none is retried.
+    fn fail_fold_requests(&mut self, job: &mut CpJob, reason: &str) {
+        for req in job.snaps.drain(..) {
+            self.events.push(Event::SnapshotFailed {
+                uuid: req.uuid,
+                vol: req.vol,
+                reason: reason.to_string(),
+            });
+        }
+        if std::mem::take(&mut job.fold_requested) {
+            self.events.push(Event::Internal {
+                what: format!("the requested fold was refused: {reason}"),
+            });
+        }
+        job.policy_fold = false;
+    }
+    /// Answers every snapshot request still waiting with
+    /// [`Event::SnapshotFailed`]: the engine is stopping and will not take
+    /// them.
+    fn fail_pending_snapshots(&mut self, reason: &str) {
+        for req in std::mem::take(&mut self.snap_requests) {
+            self.events.push(Event::SnapshotFailed {
+                uuid: req.uuid,
+                vol: req.vol,
+                reason: reason.to_string(),
+            });
+        }
+    }
+
     fn fail_cp(&mut self, job: &CpJob, reason: String, no_space: bool) -> State {
         self.events.push(Event::CpFailed {
             cp_seq: job.cp_seq,
             reason,
         });
+        // The requests the CP still holds go back for the next attempt.
+        self.snap_requests.splice(0..0, job.snaps.iter().copied());
+        self.fold_requested |= job.fold_requested;
+        // Frees that landed meanwhile stand: the committed table has them.
+        self.freed_during_cp.clear();
+        if job.trigger == CpTrigger::Boot && !self.boot_done() {
+            // The boot commit is what makes the engine serve: a failed
+            // attempt is issued again (after a request, on a full pool).
+            self.boot_retry = true;
+        }
         if no_space {
             self.pool_full = true;
             if self.shutdown_requested {
                 self.stopped = true;
                 self.serving = false;
+                self.fail_pending_snapshots("the engine stopped");
                 self.events.push(Event::Stopped {
                     cp_seq: self.cp_seq,
                     clean: false,
@@ -1918,13 +2931,42 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             let st = *st;
             return match self.prepare_meta(st.job, st.deltas) {
                 Ok(mw) => self.step_meta(Box::new(mw), Vec::new()),
-                Err((EngineError::NoSpace, job)) => {
-                    Ok(self.fail_cp(&job, "no free segment".into(), true))
+                Err(failed) => {
+                    let (error, mut job) = *failed;
+                    match error {
+                        // Out of space anywhere in the CP's metadata, whoever
+                        // placed the region, is a full pool: writes are
+                        // refused, reads go on, and the next request tries
+                        // again. A fold that did not fit is dropped (the
+                        // policy stays quiet, and requests wait, until
+                        // segments are freed) so the plain CP that follows
+                        // can commit; a shutdown's fold is retried at once as
+                        // a plain CP, so the clean marker still lands.
+                        EngineError::NoSpace
+                        | EngineError::Map(MapError::NoSpace)
+                        | EngineError::Meta(MetaError::NoSpace) => {
+                            let shutdown_fold =
+                                job.folds() && job.run_state == RunState::CleanShutdown;
+                            if job.folds() {
+                                self.fold_blocked_at = Some(self.free_segments());
+                            }
+                            Ok(self.fail_cp(&job, "no free segment".into(), !shutdown_fold))
+                        }
+                        // A fold had to rewrite a map page that does not
+                        // verify: folds stop until the volume is repaired;
+                        // plain CPs go on (their records log the new entries,
+                        // the old ones unknown).
+                        EngineError::Map(MapError::Format(e)) if job.folds() => {
+                            self.fold_damaged = true;
+                            self.fail_fold_requests(
+                                &mut job,
+                                &format!("a map page does not verify: {e}"),
+                            );
+                            Ok(self.fail_cp(&job, format!("fold: map page: {e}"), false))
+                        }
+                        other => Err(other),
+                    }
                 }
-                Err((EngineError::MetadataTooLarge { .. }, job)) => {
-                    Ok(self.fail_cp(&job, "metadata outgrew a segment".into(), false))
-                }
-                Err((e, _)) => Err(e),
             };
         }
         Ok(State::Staging(st))
@@ -2013,125 +3055,317 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         Ok(open)
     }
 
+    /// Whether this CP folds the map (E22): on request, for a snapshot, at
+    /// `true` when CP `job` may take snapshot request `req`: the request
+    /// was made before the job's generation was cut (or after everything
+    /// written so far was committed), so the snapshot sees every write
+    /// acknowledged before the request.
+    fn snap_eligible(&self, req: &SnapRequest, job: &CpJob) -> bool {
+        match (req.after_gen, &job.gen) {
+            (None, _) => true,
+            (Some(rg), Some(g)) => rg <= g.id(),
+            (Some(rg), None) => rg < self.index.active_id(),
+        }
+    }
+
+    /// a clean shutdown, or when the fold policy's bounds are reached.
+    fn should_fold(&self, job: &CpJob, pending_deltas: usize) -> bool {
+        // A damaged map page cannot be rewritten from what it holds: no
+        // fold at all until the volume is repaired (requests are refused
+        // where they are made).
+        if self.fold_damaged {
+            return false;
+        }
+        // Nothing folds while a fold would not fit: requests wait, and the
+        // policy stays quiet, until segments are freed (or a reboot).
+        if self
+            .fold_blocked_at
+            .is_some_and(|at| self.free_segments() <= at)
+        {
+            return false;
+        }
+        if self.fold_requested
+            || self
+                .snap_requests
+                .iter()
+                .any(|r| self.snap_eligible(r, job))
+        {
+            return true;
+        }
+        if job.run_state == RunState::CleanShutdown
+            && (self.map.overlay_entries() > 0 || pending_deltas > 0)
+        {
+            return true;
+        }
+        let policy = self.cfg.fold;
+        let pending_bytes = (pending_deltas as u64).saturating_mul(32);
+        let dirty = self.map.overlay_entries() > 0 || pending_deltas > 0;
+        dirty
+            && (self
+                .map
+                .log_bytes_since_fold()
+                .saturating_add(pending_bytes)
+                >= policy.log_bytes
+                || self.map.cps_since_fold() + 1 >= policy.max_cps
+                || self.map.dirty_pages() >= policy.max_dirty_pages
+                || self.map.overlay_entries() >= policy.max_overlay_entries
+                || self.clock.mono_ns().saturating_sub(self.last_fold_ns) >= policy.interval_ns)
+    }
+
     /// Lays out the CP's metadata; gives the job back on failure so the
     /// attempt can be recorded.
     fn prepare_meta(
         &mut self,
-        job: CpJob,
+        mut job: CpJob,
         deltas: Vec<Delta>,
-    ) -> Result<MetaWrite, (EngineError, CpJob)> {
-        match self.prepare_meta_inner(&job, deltas) {
-            Ok((next_map, seg_table, cp_log_head, meta_pseg, stripes)) => Ok(MetaWrite {
-                prep: Prepared {
-                    job,
-                    next_map,
-                    seg_table,
-                    cp_log_head,
-                    meta_pseg,
-                    slot: None,
-                },
+    ) -> Result<MetaWrite, Box<(EngineError, CpJob)>> {
+        let pending = deltas.len()
+            + job
+                .holes
+                .iter()
+                .map(|(_, _, blocks)| *blocks as usize)
+                .sum::<usize>();
+        let fold = self.should_fold(&job, pending);
+        if fold {
+            // The requests this CP answers are its own from here on.
+            let (mine, later): (Vec<SnapRequest>, Vec<SnapRequest>) =
+                std::mem::take(&mut self.snap_requests)
+                    .into_iter()
+                    .partition(|r| self.snap_eligible(r, &job));
+            job.snaps = mine;
+            self.snap_requests = later;
+            job.fold_requested = std::mem::take(&mut self.fold_requested);
+            job.policy_fold = !job.fold_requested
+                && job.snaps.is_empty()
+                && job.run_state != RunState::CleanShutdown;
+        }
+        match self.prepare_meta_inner(&job, deltas, fold) {
+            Ok((parts, stripes)) => Ok(MetaWrite {
+                prep: parts.into_prepared(job),
                 stripes,
                 inflight: HashSet::new(),
                 failed: None,
             }),
-            Err(e) => Err((e, job)),
+            Err(e) => Err(Box::new((e, job))),
         }
     }
 
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_lines)]
     fn prepare_meta_inner(
         &mut self,
         job: &CpJob,
-        deltas: Vec<Delta>,
-    ) -> Result<(BlockMap, RootRef, RootRef, u64, VecDeque<(u64, Vec<u8>)>), EngineError> {
-        let mut next_map = self.map.clone();
-        for (vol, lba, entry) in deltas {
-            next_map.set(vol, lba, entry);
-        }
-        for pseg in self.segments.used_segments() {
-            if self.segments.entry(pseg)?.seg_kind() == Some(SegKind::Data) {
-                let live = next_map.live_blocks(pseg) * BLOCK_SIZE as u64;
-                self.segments
-                    .set_live_bytes(pseg, u32::try_from(live).unwrap_or(u32::MAX))?;
+        mut deltas: Vec<Delta>,
+        fold: bool,
+    ) -> Result<(PreparedParts, MetaStripeQueue), EngineError> {
+        let cp32 = job.cp_seq as u32;
+        // The holes the generation holds become hole entries.
+        for (vol, lba, blocks) in &job.holes {
+            for k in 0..*blocks {
+                deltas.push((*vol, lba + u64::from(k), MapEntry::hole(cp32)?));
             }
         }
-        let dump = next_map.dump(self.cfg.agg_id, job.cp_seq, job.nonce)?;
-        let dump_pages = (dump.len() / BLOCK_SIZE) as u32;
-        let table_pages = (self.segments.image().len() / BLOCK_SIZE) as u32;
-        // Both regions are packed page after page into whole stripes.
-        let needed = self.layout.stripes_for_pages(dump_pages + table_pages);
-        if needed > self.layout.stripes_per_segment {
-            return Err(EngineError::MetadataTooLarge {
-                stripes: u64::from(needed),
-                stripes_per_segment: self.layout.stripes_per_segment,
-            });
+        // Volumes without a root yet get one with this CP (a failed attempt
+        // left `created_in` set but the map untouched, so the map is the
+        // test).
+        let new_volumes: Vec<(u32, u64)> = self
+            .vols
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| v.present && v.creating && self.map.volume(*i as u32).is_none())
+            .map(|(i, v)| (i as u32, v.size_blocks))
+            .collect();
+        let input = CpInput {
+            cp_seq: job.cp_seq,
+            cp_nonce: job.nonce,
+            deltas,
+            fold,
+            new_volumes: new_volumes.clone(),
+            max_region_pages: self.layout.blocks_per_segment(),
+        };
+        // Only the boot and shutdown commits may take the reserve: a fold or
+        // a snapshot that would breach it fails for space instead, so the
+        // pool can always boot and stop cleanly.
+        let reserve = match job.trigger {
+            CpTrigger::Boot => 0,
+            CpTrigger::Shutdown => 1,
+            _ => META_RESERVE_SEGMENTS,
+        };
+        let mut stream =
+            MetaStream::new(&self.layout, &self.segments, self.open_meta, cp32, reserve);
+        let prepared = {
+            let Engine { map, backstore, .. } = self;
+            map.prepare_cp(&mut BackstoreReader(backstore), &input, &mut stream)?
+        };
+        // A page that did not verify when the CP looked up what it
+        // replaces: reported once; its entries read `Corrupt` and no fold
+        // can rewrite it until the volume is repaired.
+        for (vol, page_no) in &prepared.damaged_pages {
+            let warning = OperatorWarning::MapPageDamaged {
+                vol: *vol,
+                page_no: *page_no,
+            };
+            if !self.warnings.contains(&warning) {
+                self.events.push(Event::OperatorWarning(warning.clone()));
+                self.warnings.push(warning);
+            }
         }
-        let open = self.open_meta_segment(job.cp_seq as u32, needed)?;
-        let pseg = open.pseg;
-        let first_idx = open.next_idx;
-        let end_idx = first_idx + needed;
-        let written = u64::from(end_idx) * u64::from(self.layout.stripe_bytes);
-        self.segments
-            .set_live_bytes(pseg, u32::try_from(written).unwrap_or(u32::MAX))?;
-        self.open_meta = Some(OpenSegment {
-            pseg,
-            next_idx: end_idx,
-        });
-        let table = self.segments.image();
-        let first_pba = self
-            .layout
-            .stripe_pba(pseg, first_idx)
-            .ok_or_else(|| EngineError::Internal("metadata region is off the device".into()))?;
-        let cp_log_head = if dump.is_empty() {
+        // Snapshots asked for: pinned at this fold.
+        let mut new_snapshots = Vec::new();
+        let mut records: Vec<SnapRecord> = self.snapshots.iter().map(|s| s.record).collect();
+        if fold {
+            let wall = self.clock.wall_ns();
+            for (i, req) in job.snaps.iter().enumerate() {
+                let Some((_, root, index)) =
+                    prepared.fold_roots.iter().find(|(v, _, _)| *v == req.vol)
+                else {
+                    continue;
+                };
+                let snap_id = self.next_snap_id + i as u64;
+                let page =
+                    SnapRootPage::new(self.cfg.agg_id, snap_id, job.cp_seq, *root, RootRef::NONE)?;
+                let page_ref = stream.place_region(page.as_bytes())?;
+                let mut record = SnapRecord {
+                    snap_id,
+                    snap_uuid: req.uuid,
+                    map_root_pba: page_ref.pba,
+                    deadlist_pba: 0,
+                    created_wall_ns: wall,
+                    birth_cp: cp32,
+                    vol: req.vol,
+                    kind: req.kind.as_u8(),
+                    origin: req.origin.as_u8(),
+                    flags: 0,
+                    rsvd: 0,
+                    crc32c: 0,
+                };
+                record.seal();
+                records.push(record);
+                new_snapshots.push(SnapState {
+                    record,
+                    pinned: Some(PinnedRoot::from_parts(req.vol, *root, index.clone())),
+                    damage: None,
+                });
+            }
+        }
+        let snap_table = if records.is_empty() {
             RootRef::NONE
         } else {
-            RootRef::for_region(first_pba, &dump)?
+            stream.place_region(&snap_table_image(&records)?)?
         };
-        let seg_table = RootRef::for_region(first_pba + u64::from(dump_pages), &table)?;
-        let mut region = dump;
-        region.extend_from_slice(&table);
-        let mut stripes = VecDeque::new();
-        self.push_region_stripes(&mut stripes, pseg, first_idx, &region);
-        Ok((next_map, seg_table, cp_log_head, pseg, stripes))
-    }
-
-    fn push_region_stripes(
-        &self,
-        out: &mut VecDeque<(u64, Vec<u8>)>,
-        pseg: u64,
-        first_idx: u32,
-        region: &[u8],
-    ) {
-        let stripe_bytes = self.layout.stripe_bytes as usize;
-        for (k, chunk) in region.chunks(stripe_bytes).enumerate() {
-            let mut image = vec![0u8; stripe_bytes];
-            image[..chunk.len()].copy_from_slice(chunk);
-            if let Some(pba) = self.layout.stripe_pba(pseg, first_idx + k as u32) {
-                out.push_back((pba, image));
+        // The roots table and the directory, then the segment table, whose
+        // live bytes include its own region.
+        let map_roots = stream.place_region(&map_roots_image(&prepared.roots_table)?)?;
+        let cp_log_head = stream.place_region(&prepared.dir.encode(self.cfg.agg_id)?)?;
+        let table_pages = (stream.segments().image().len() / BLOCK_SIZE) as u32;
+        let table_pba = stream.reserve(table_pages)?;
+        // Data liveness after this CP: every replaced entry, the old block
+        // staying live when a snapshot pins it (its birth at or before the
+        // snapshot's CP).
+        let mut data_live = self.data_live.clone();
+        for Replaced { vol, old, new, .. } in &prepared.replaced {
+            if new.is_data() {
+                *data_live.entry(new.lseg()).or_insert(0) += 1;
+            }
+            if old.is_data() && !self.pinned_by_snapshot(*vol, old.birth_cp) {
+                if let Some(n) = data_live.get_mut(&old.lseg()) {
+                    *n = n.saturating_sub(1);
+                }
             }
         }
+        // Metadata liveness after this CP: what was live plus every region
+        // placed (frees are deferred).
+        let mut meta_live = self.meta_live.clone();
+        for (pseg, bytes) in stream.bytes_per_segment() {
+            *meta_live.entry(pseg).or_insert(0) += bytes;
+        }
+        for (pseg, bytes) in self.layout.segments_of_region(table_pba, table_pages) {
+            *meta_live.entry(pseg).or_insert(0) += bytes;
+        }
+        {
+            let table = stream.segments_mut();
+            for pseg in table.used_segments() {
+                let kind = table.entry(pseg)?.seg_kind();
+                let bytes = match kind {
+                    Some(SegKind::Data) => {
+                        data_live.get(&pseg).copied().unwrap_or(0) * BLOCK_SIZE as u64
+                    }
+                    Some(SegKind::Metadata) => meta_live.get(&pseg).copied().unwrap_or(0),
+                    None => 0,
+                };
+                table.set_live_bytes(pseg, u32::try_from(bytes).unwrap_or(u32::MAX))?;
+            }
+        }
+        let seg_table = stream.place_at(table_pba, &stream.segments().image())?;
+        // What this CP stops referencing: the previous tables, the deltas a
+        // fold drops, and the pages and indexes a fold replaced unless a
+        // snapshot still pins them.
+        let mut freed = self.table_regions.clone();
+        freed.extend_from_slice(&prepared.freed_deltas);
+        for fp in &prepared.freed_pages {
+            let pinned = self.snapshots.iter().any(|s| {
+                s.pinned
+                    .as_ref()
+                    .is_some_and(|p| p.vol == fp.vol && p.references_page(fp.page_no, fp.root.pba))
+            });
+            if !pinned {
+                freed.push(fp.root);
+            }
+        }
+        for fi in &prepared.freed_indexes {
+            let pinned = self.snapshots.iter().any(|s| {
+                s.pinned
+                    .as_ref()
+                    .is_some_and(|p| p.references_index(fi.root.pba))
+            });
+            if !pinned {
+                freed.push(fi.root);
+            }
+        }
+        let table_regions = vec![map_roots, cp_log_head, snap_table, seg_table]
+            .into_iter()
+            .filter(|r| !r.is_none())
+            .collect();
+        let (stripes, segments, open_meta) = stream.finish();
+        // The volumes this CP's tables carry: those with a root.
+        let carried: Vec<u32> = prepared
+            .roots_table
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.is_absent())
+            .map(|(i, _)| i as u32)
+            .collect();
+        for (vol, _) in &new_volumes {
+            if let Some(v) = self.vols.get_mut(*vol as usize) {
+                v.created_in = Some(job.cp_seq);
+            }
+        }
+        let fold_pages = prepared.dir.pages.len() as u64;
+        let prep = PreparedParts {
+            map_update: prepared.update,
+            segments,
+            open_meta,
+            meta_live,
+            data_live,
+            freed,
+            table_regions,
+            map_roots,
+            seg_table,
+            cp_log_head,
+            snap_table,
+            new_snapshots,
+            carried,
+            fold,
+            fold_pages,
+        };
+        Ok((prep, stripes.into_iter().collect()))
     }
 
-    fn open_meta_segment(&mut self, cp_seq: u32, needed: u32) -> Result<OpenSegment, EngineError> {
-        if let Some(open) = self.open_meta {
-            if open.next_idx + needed <= self.layout.stripes_per_segment {
-                return Ok(open);
-            }
-            self.segments.seal(open.pseg)?;
-            self.open_meta = None;
-        }
-        let pseg =
-            match self
-                .segments
-                .allocate(SegKind::Metadata, cp_seq.max(1), self.layout.stripe_bytes)
-            {
-                Ok(pseg) => pseg,
-                Err(SegmentError::NoSpace) => return Err(EngineError::NoSpace),
-                Err(e) => return Err(e.into()),
-            };
-        let open = OpenSegment { pseg, next_idx: 0 };
-        self.open_meta = Some(open);
-        Ok(open)
+    /// `true` when a snapshot of `vol` was taken at or after the CP that
+    /// wrote an entry: the snapshot's root still names that entry.
+    fn pinned_by_snapshot(&self, vol: u32, birth_cp: u32) -> bool {
+        self.snapshots
+            .iter()
+            .any(|s| s.record.vol == vol && s.record.birth_cp >= birth_cp)
     }
 
     fn step_meta(
@@ -2276,6 +3510,11 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         let job = &prep.job;
         let mut slot = SuperblockSlot::new(self.cfg.agg_id, job.cp_seq, SbLocation::A);
         let sb = &mut slot.sb;
+        sb.set_geometry(
+            self.layout.stripe_bytes,
+            self.layout.segment_bytes as u32,
+            self.layout.capacity_bytes,
+        );
         sb.owner_epoch = self.cfg.owner_epoch;
         sb.cut_seq = job.gen.as_ref().map_or(self.cut_seq, |g| g.id());
         sb.cp_nonce = job.nonce;
@@ -2288,11 +3527,14 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         sb.set_run_state(job.run_state);
         sb.seg_table = prep.seg_table;
         sb.cp_log_head = prep.cp_log_head;
-        let vol_count = self
-            .vols
-            .iter()
-            .rposition(|v| v.present)
-            .map_or(0, |i| i as u32 + 1);
+        sb.map_roots = prep.map_roots;
+        sb.snap_table = prep.snap_table;
+        if let Some(open) = self.open_data {
+            sb.open_data_pseg = open.pseg;
+            sb.open_data_idx = open.next_idx;
+        }
+        // The rows: the volumes whose root this CP's tables carry.
+        let vol_count = prep.carried.iter().max().map_or(0, |v| v + 1);
         sb.vol_count = vol_count;
         let precise = self.backstore.profile().nvfail_intent == NvfailIntent::Precise;
         let committed_gen = job.gen.as_ref().map(|g| g.id());
@@ -2305,7 +3547,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         for vol in 0..vol_count {
             let v = self.vols[vol as usize];
             let row = &mut slot.vols.vols[vol as usize];
-            if !v.present {
+            if !v.present || !prep.carried.contains(&vol) {
                 *row = VolState::ABSENT;
                 continue;
             }
@@ -2340,11 +3582,8 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         slot.sb.write_active = write_active;
         slot.sb.nvfail = nvfail;
         slot.seal()?;
-        // Volumes and clears this slot carries become durable with it.
+        // Clears this slot carries become durable with it.
         for v in &mut self.vols {
-            if v.creating && v.created_in.is_none() {
-                v.created_in = Some(job.cp_seq);
-            }
             if let Some(c) = &mut v.clearing {
                 if c.in_cp.is_none() {
                     c.in_cp = Some(job.cp_seq);
@@ -2374,19 +3613,46 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         blocks * BLOCK_SIZE as u64
     }
 
-    /// The CP is durable: the map, the arena, the index, the volumes and
-    /// the acknowledgements catch up. Nothing here can refuse; an
-    /// inconsistency is recorded as [`Event::Internal`].
+    /// The CP is durable: the map, the arena, the index, the volumes, the
+    /// snapshots, the segment bookkeeping and the acknowledgements catch
+    /// up. Nothing here can refuse; an inconsistency is recorded as
+    /// [`Event::Internal`].
     fn finalize(&mut self, prep: Prepared) {
         let Prepared {
             job,
-            next_map,
-            meta_pseg,
+            map_update,
+            segments,
+            open_meta,
+            mut meta_live,
+            mut data_live,
+            freed,
+            table_regions,
+            new_snapshots,
+            fold,
+            fold_pages,
             ..
         } = prep;
-        self.map = next_map;
+        let gen = job.gen.clone();
+        self.map.apply(map_update);
+        self.segments = segments;
+        for pseg in std::mem::take(&mut self.freed_during_cp) {
+            // Freed while this CP was in flight, on the table it copied.
+            if let Err(e) = self.segments.free(pseg) {
+                self.events.push(Event::Internal {
+                    what: format!("re-applying the free of segment {pseg}: {e}"),
+                });
+            }
+            meta_live.remove(&pseg);
+            data_live.remove(&pseg);
+        }
+        self.open_meta = open_meta;
+        self.meta_live = meta_live;
+        self.data_live = data_live;
+        self.table_regions = table_regions;
         self.cp_seq = job.cp_seq;
         self.cp_nonce = job.nonce;
+        self.note_dead_data(job.cp_seq);
+        // The arena slots the generation held: data runs and hole records.
         for blk in &job.blocks {
             if let Err(e) = self.arena.commit(blk.ring, 1) {
                 self.events.push(Event::Internal {
@@ -2397,7 +3663,17 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 });
             }
         }
-        if let Some(gen) = &job.gen {
+        if let Some(gen) = &gen {
+            for ring in self.gen_holes.remove(&gen.id()).unwrap_or_default() {
+                if let Err(e) = self.arena.commit(ring, 1) {
+                    self.events.push(Event::Internal {
+                        what: format!(
+                            "releasing hole record {} after CP {}: {e}",
+                            ring.slot, job.cp_seq
+                        ),
+                    });
+                }
+            }
             if let Err(e) = self.index.retire(gen.id()) {
                 self.events.push(Event::Internal {
                     what: format!("retiring generation {}: {e}", gen.id()),
@@ -2447,14 +3723,37 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 }
             }
         }
+        for snap in new_snapshots {
+            self.events.push(Event::SnapshotCreated {
+                snap_id: snap.record.snap_id,
+                vol: snap.record.vol,
+                cp_seq: job.cp_seq,
+            });
+            self.next_snap_id = self.next_snap_id.max(snap.record.snap_id + 1);
+            self.snapshots.push(snap);
+            self.stats.snapshots += 1;
+        }
+        if fold {
+            // The requests this CP took went with it (`job.snaps`,
+            // `job.fold_requested`); ones that arrived meanwhile stay for
+            // the next fold.
+            self.fold_blocked_at = None;
+            self.last_fold_ns = self.clock.mono_ns();
+            self.stats.folds += 1;
+            self.events.push(Event::Folded {
+                cp_seq: job.cp_seq,
+                pages: fold_pages,
+            });
+        }
         self.pool_full = false;
-        self.recycle_metadata(job.cp_seq, meta_pseg);
+        self.freed_pending.push_back((job.cp_seq, freed));
+        self.release_freed(job.cp_seq);
         self.stats.cps += 1;
         self.last_commit_ns = self.clock.mono_ns();
         self.events.push(Event::CpCommitted {
             cp_seq: job.cp_seq,
             trigger: job.trigger,
-            gen: job.gen.as_ref().map(|g| g.id()),
+            gen: gen.as_ref().map(|g| g.id()),
             blocks: job.blocks.len() as u64,
             max_seq: job.max_seq,
         });
@@ -2467,6 +3766,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             CpTrigger::Shutdown => {
                 self.stopped = true;
                 self.serving = false;
+                self.fail_pending_snapshots("the engine stopped");
                 self.events.push(Event::Stopped {
                     cp_seq: job.cp_seq,
                     clean: true,
@@ -2476,37 +3776,113 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         }
     }
 
-    /// Frees the metadata segments no reachable consistency point names: a
-    /// CP's metadata is needed only to boot that CP, and a boot reaches the
-    /// newest committed CP or the one before it, so once CP `N` committed
-    /// the metadata of every CP before `N - 1` is dead. The segment a
-    /// freed CP shared with a live one stays, and so does the open one.
-    fn recycle_metadata(&mut self, cp_seq: u64, meta_pseg: u64) {
-        self.meta_protect.push_back((cp_seq, vec![meta_pseg]));
-        while self.meta_protect.len() > 2 {
-            self.meta_protect.pop_front();
+    /// Frees the regions a committed CP stopped referencing once no reachable
+    /// consistency point can name them: a boot reaches the newest committed
+    /// CP or the one before it, so a region CP `N` stopped referencing is
+    /// dead once `N + 1` committed (one CP later still on a flush-opaque
+    /// backstore, C07). A metadata segment with nothing live left, not open
+    /// and not protected since the boot, is freed and, when the policy says
+    /// so, discarded (D9).
+    fn release_freed(&mut self, cp_seq: u64) {
+        let keep = if self.backstore.profile().trusts_opaque_barrier() {
+            2
+        } else {
+            1
+        };
+        self.boot_protect.retain(|(cp, _)| cp + keep + 1 > cp_seq);
+        // Data segments dead long enough that no rewind reaches a CP that
+        // named their blocks.
+        let mut dead_now = Vec::new();
+        while let Some((cp, _)) = self.dead_data_pending.front() {
+            if cp + keep > cp_seq {
+                break;
+            }
+            let (_, segs) = self.dead_data_pending.pop_front().expect("front exists");
+            dead_now.extend(segs);
         }
-        let mut protected: Vec<u64> = self
-            .meta_protect
+        while let Some((cp, _)) = self.freed_pending.front() {
+            if cp + keep > cp_seq {
+                break;
+            }
+            let (_, regions) = self.freed_pending.pop_front().expect("front exists");
+            for region in regions {
+                for (pseg, bytes) in self.layout.segments_of_region(region.pba, region.pages) {
+                    match self.meta_live.get_mut(&pseg) {
+                        Some(live) if *live >= bytes => *live -= bytes,
+                        _ => self.events.push(Event::Internal {
+                            what: format!("metadata liveness of segment {pseg} went negative"),
+                        }),
+                    }
+                }
+            }
+        }
+        let protected: HashSet<u64> = self
+            .boot_protect
             .iter()
             .flat_map(|(_, segs)| segs.iter().copied())
             .collect();
-        if let Some(open) = self.open_meta {
-            protected.push(open.pseg);
-        }
+        let open_meta = self.open_meta.map(|o| o.pseg);
+        let open_data = self.open_data.map(|o| o.pseg);
+        let discard = self.backstore.profile().discard == DiscardPolicy::WholeSegment;
+        let mut to_free = Vec::new();
         for pseg in self.segments.used_segments() {
-            let is_meta = self
-                .segments
-                .entry(pseg)
-                .is_ok_and(|e| e.seg_kind() == Some(SegKind::Metadata));
-            if is_meta && !protected.contains(&pseg) {
-                match self.segments.free(pseg) {
-                    Ok(()) => self.stats.recycled += 1,
-                    Err(e) => self.events.push(Event::Internal {
-                        what: format!("recycling metadata segment {pseg}: {e}"),
-                    }),
-                }
+            let kind = self.segments.entry(pseg).ok().and_then(|e| e.seg_kind());
+            if Some(pseg) == open_meta
+                || Some(pseg) == open_data
+                || protected.contains(&pseg)
+                || self.discard_pending(pseg)
+            {
+                continue;
             }
+            let dead = match kind {
+                Some(SegKind::Metadata) => self.meta_live.get(&pseg).copied().unwrap_or(0) == 0,
+                // A data segment is freed only after its deferral.
+                Some(SegKind::Data) => {
+                    dead_now.contains(&pseg) && self.data_live.get(&pseg).copied().unwrap_or(0) == 0
+                }
+                _ => false,
+            };
+            if dead {
+                to_free.push(pseg);
+            }
+        }
+        for pseg in to_free {
+            if discard {
+                // Freed once the discard completes: a discard still in
+                // flight must never race a write into a reused segment.
+                self.discard(pseg);
+            } else {
+                self.free_segment(pseg, false);
+            }
+        }
+    }
+
+    /// Queues the data segments that CP `cp_seq` left without a live block
+    /// for freeing after the deferral.
+    fn note_dead_data(&mut self, cp_seq: u64) {
+        let open_data = self.open_data.map(|o| o.pseg);
+        let queued: HashSet<u64> = self
+            .dead_data_pending
+            .iter()
+            .flat_map(|(_, segs)| segs.iter().copied())
+            .collect();
+        let dead: Vec<u64> = self
+            .segments
+            .used_segments()
+            .into_iter()
+            .filter(|pseg| {
+                Some(*pseg) != open_data
+                    && !queued.contains(pseg)
+                    && !self.discard_pending(*pseg)
+                    && self.segments.entry(*pseg).is_ok_and(|e| {
+                        e.seg_kind() == Some(SegKind::Data)
+                            && e.seg_state() == Some(SegState::Sealed)
+                    })
+                    && self.data_live.get(pseg).copied().unwrap_or(0) == 0
+            })
+            .collect();
+        if !dead.is_empty() {
+            self.dead_data_pending.push_back((cp_seq, dead));
         }
     }
 
@@ -2544,12 +3920,22 @@ fn nonce_for(agg_id: Uuid, cp_seq: u64, wall_ns: u64, mono_ns: u64, counter: u64
 }
 
 /// Groups placed slots (sorted by `(seq, position)`) into extents: same
-/// write, same volume, consecutive LBAs, consecutive slots on one lap.
+/// write, same volume, consecutive LBAs, consecutive slots on one lap; a
+/// hole record is an extent of its own.
 fn runs_of(placed: &[PlacedSlot]) -> Vec<(u32, u64, DirtyExtent)> {
     let mut out: Vec<(u32, u64, DirtyExtent)> = Vec::new();
     for p in placed {
+        if p.is_hole() {
+            out.push((
+                p.vol,
+                p.lba,
+                DirtyExtent::hole(p.ring, p.hole_blocks, p.seq),
+            ));
+            continue;
+        }
         if let Some((vol, lba, ext)) = out.last_mut() {
-            let continues = *vol == p.vol
+            let continues = !ext.hole
+                && *vol == p.vol
                 && ext.seq == p.seq
                 && *lba + u64::from(ext.blocks) == p.lba
                 && ext.ring.lap == p.ring.lap
@@ -2559,15 +3945,7 @@ fn runs_of(placed: &[PlacedSlot]) -> Vec<(u32, u64, DirtyExtent)> {
                 continue;
             }
         }
-        out.push((
-            p.vol,
-            p.lba,
-            DirtyExtent {
-                ring: p.ring,
-                blocks: 1,
-                seq: p.seq,
-            },
-        ));
+        out.push((p.vol, p.lba, DirtyExtent::data(p.ring, 1, p.seq)));
     }
     out
 }

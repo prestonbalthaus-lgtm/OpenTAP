@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bd6126758dc65bc387421c7fed62a6ea03ed23d673ab526c2553c65b902b7a61 # shrinks to depth = 7, high = 5, ops = [Submit { tag: 234, kind: 0, lba: 0, blocks: 1 }, Submit { tag: 5254, kind: 0, lba: 0, blocks: 1 }, Submit { tag: 26381, kind: 0, lba: 0, blocks: 1 }, Pump, Fetch, Fetch, Submit { tag: 9911, kind: 0, lba: 0, blocks: 1 }, Fetch, Submit { tag: 27148, kind: 0, lba: 0, blocks: 1 }, Submit { tag: 0, kind: 0, lba: 0, blocks: 1 }, Fetch, Submit { tag: 0, kind: 0, lba: 0, blocks: 1 }, Fetch, Abort { tag: 14842 }, Complete { n: 24, status: 0 }]
+cc 25bfa9b0abbfee7cccb9f4eea3a27184e0095538e14d76b27d76191436d4db8d # shrinks to depth = 10, high = 1, ops = [SubmitBad { tag: 4283, unsupported: false }, Submit { tag: 10683, kind: 0, lba: 0, blocks: 1 }, Submit { tag: 4352, kind: 1, lba: 0, blocks: 1 }, Pump, Abort { tag: 45112 }, Fetch, Submit { tag: 0, kind: 0, lba: 0, blocks: 1 }, Submit { tag: 0, kind: 0, lba: 0, blocks: 1 }]
+cc 97d0d640d2813c59659c085bc4888e88f2a00bb5460c1a80e69324aa8d74bb80 # shrinks to depth = 2, high = 1, ops = [Submit { tag: 18282, kind: 0, lba: 0, blocks: 1 }, Submit { tag: 23459, kind: 1, lba: 0, blocks: 1 }, Pump, Abort { tag: 31207 }, Submit { tag: 34453, kind: 0, lba: 0, blocks: 1 }, Fetch, Complete { n: 0, status: 0 }, Fetch]

@@ -2,7 +2,7 @@
 
 use otap_arena::{slots_for_len, Arena, ArenaError, RingRef, SlotDesc, SlotState, SLOT_BYTES};
 use otap_format::checksum::crc32c;
-use otap_format::{Uuid, MAX_LBA, MAX_VOL};
+use otap_format::{FromBytes, IntoBytes, Uuid, MAX_LBA, MAX_VOL};
 use otap_sys::{HugeArena, HugePageSize};
 use proptest::prelude::*;
 
@@ -393,5 +393,106 @@ proptest! {
                 prop_assert_eq!(a.occupied(), 0, "nothing live, nothing occupied");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hole record slots (Step 4, layout 1.2, E23)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_hole_record_fills_one_slot_and_survives_a_reattach() {
+    let mut a = arena();
+    assert_eq!(a.header().ver, otap_arena::ARENA_VERSION);
+    let data = a.reserve(2).unwrap();
+    let crcs = paint(&mut a, data, 2, 0x11);
+    a.fill(data, 3, 100, 1, &crcs).unwrap();
+    a.place(data, 2).unwrap();
+    let hole = a.reserve(1).unwrap();
+    a.fill_hole(hole, 3, 1000, 4096, 2).unwrap();
+    let desc = a.descriptor(hole.slot).unwrap();
+    assert!(desc.is_hole());
+    assert_eq!(desc.slot_kind(), Some(otap_arena::SlotKind::Hole));
+    assert_eq!((desc.vol(), desc.lba(), desc.seq), (3, 1000, 2));
+    assert!(!a.descriptor(data.slot).unwrap().is_hole());
+    let rec = a.hole_record(hole).unwrap();
+    assert_eq!((rec.vol, rec.lba, rec.blocks), (3, 1000, 4096));
+    assert!(a.hole_record(data).is_err(), "a data slot is not a record");
+    assert!(
+        a.check_data(hole, 1).is_ok(),
+        "the record is under the slot CRC"
+    );
+    a.place(hole, 1).unwrap();
+
+    // Bounds: no zero-length hole, no run past the LBA space, one slot only.
+    let spare = a.reserve(1).unwrap();
+    assert!(a.fill_hole(spare, 3, 1000, 0, 3).is_err());
+    assert!(a.fill_hole(spare, 3, MAX_LBA, 2, 3).is_err());
+    assert!(a.fill_hole(spare, MAX_VOL + 1, 0, 1, 3).is_err());
+    a.discard(spare, 1).unwrap();
+
+    // A re-attach lists the hole as a placed slot with its block count,
+    // in sequence order after the data.
+    let mem = a.into_memory();
+    let (a, report) = Arena::attach(mem, &agg()).unwrap();
+    assert!(!report.is_damaged());
+    assert_eq!(report.placed.len(), 3);
+    assert!(!report.placed[0].is_hole() && !report.placed[1].is_hole());
+    let h = report.placed[2];
+    assert!(h.is_hole());
+    assert_eq!((h.vol, h.lba, h.seq, h.hole_blocks), (3, 1000, 2, 4096));
+    assert_eq!(h.ring, hole);
+    assert_eq!(a.hole_record(hole).unwrap().blocks, 4096);
+    assert_eq!(a.peek_seq(), 3);
+}
+
+#[test]
+fn a_damaged_hole_record_or_an_unknown_kind_is_reported_not_trusted() {
+    // A hole record whose block was changed: the CRC catches it as data
+    // damage; one whose descriptor kind is undefined is kind damage; and a
+    // record whose block decodes to another address than its descriptor is
+    // kind damage even though the CRC matches.
+    for case in 0..3 {
+        let mut a = arena();
+        let hole = a.reserve(1).unwrap();
+        a.fill_hole(hole, 1, 50, 8, 1).unwrap();
+        a.place(hole, 1).unwrap();
+        let desc_off =
+            a.header().desc_off as usize + hole.slot as usize * otap_arena::SLOT_DESC_SIZE;
+        let data_off = a.header().data_off as usize + hole.slot as usize * SLOT_BYTES;
+        let mut mem = a.into_memory();
+        match case {
+            0 => mem.as_mut_slice()[data_off + 16] ^= 1,
+            1 => {
+                // kind = 7, resealed so the descriptor itself verifies.
+                let bytes =
+                    &mut mem.as_mut_slice()[desc_off..desc_off + otap_arena::SLOT_DESC_SIZE];
+                let mut desc = SlotDesc::read_from_bytes(bytes).unwrap();
+                desc.kind = 7;
+                desc.word = desc.word_for(desc.state(), desc.lap());
+                bytes.copy_from_slice(desc.as_bytes());
+            }
+            _ => {
+                // The block says LBA 51 and its CRC is recomputed to match.
+                let block = &mut mem.as_mut_slice()[data_off..data_off + SLOT_BYTES];
+                block[8..16].copy_from_slice(&51u64.to_le_bytes());
+                let crc = crc32c(block);
+                let bytes =
+                    &mut mem.as_mut_slice()[desc_off..desc_off + otap_arena::SLOT_DESC_SIZE];
+                let mut desc = SlotDesc::read_from_bytes(bytes).unwrap();
+                desc.crc32c = crc;
+                desc.word = desc.word_for(desc.state(), desc.lap());
+                bytes.copy_from_slice(desc.as_bytes());
+            }
+        }
+        let (_, report) = Arena::attach(mem, &agg()).unwrap();
+        assert!(report.placed.is_empty(), "case {case}");
+        assert_eq!(report.damaged.len(), 1, "case {case}");
+        let expected = if case == 0 {
+            otap_arena::Damage::Data
+        } else {
+            otap_arena::Damage::Kind
+        };
+        assert_eq!(report.damaged[0].damage, expected, "case {case}");
     }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "otap-map"
+description = "OpenTAP's persistent block map: the per-volume two-level radix map of otap-format (page index and 16 KiB map pages) with a copy-on-write fold, the consistency-point log as its journal (delta regions listed by a directory), the overlay that answers lookups since the last fold, pinned snapshot roots and the birth walk behind diff and live accounting. No I/O of its own: pages come through a reader and regions go out through a writer, so the engine and the simulator drive it. No unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+otap-format = { path = "../otap-format" }
+
+[dev-dependencies]
+proptest.workspace = true

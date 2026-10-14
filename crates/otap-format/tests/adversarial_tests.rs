@@ -202,6 +202,26 @@ fn record_verdict(
     }
     None
 }
+/// Format 2.1: an open data segment of 0 names none, so its index is 0.
+fn open_data_ok(p: &[u8]) -> bool {
+    !(le_u64(p, 1696) == 0 && le_u32(p, 1704) != 0)
+}
+
+/// Format 2.2 (F15): a recorded geometry (any of the three fields nonzero on
+/// a minor of 2 or more) is a whole stripe of at most 8 MiB, a segment of
+/// whole stripes and a capacity of at least a segment.
+fn geometry_ok(p: &[u8]) -> bool {
+    let (stripe, segment, capacity) = (le_u32(p, 1712), le_u32(p, 1716), le_u64(p, 1720));
+    if p[4] < 2 || (stripe == 0 && segment == 0 && capacity == 0) {
+        return true;
+    }
+    stripe != 0
+        && stripe % 4096 == 0
+        && stripe <= 8 * 1024 * 1024
+        && segment != 0
+        && segment % stripe == 0
+        && capacity >= u64::from(segment)
+}
 
 /// The superblock page rules behind its CRC: run state, slot index, the CP
 /// bound, slot parity (F7), `vol_count`, the bitsets below it, and the
@@ -219,6 +239,8 @@ fn page_rules_ok(p: &[u8]) -> bool {
         && below(SB_WRITE_ACTIVE_AT)
         && below(SB_NVFAIL_AT)
         && (log[0] == 1 || log.iter().all(|&b| b == 0))
+        && open_data_ok(p)
+        && geometry_ok(p)
 }
 
 /// The volume-table rules of a slot (F1): defined causes, absent rows at and

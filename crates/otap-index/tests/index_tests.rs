@@ -14,6 +14,7 @@ fn ext(slot: u32, blocks: u32, seq: u64) -> DirtyExtent {
         ring: RingRef { slot, lap: 0 },
         blocks,
         seq,
+        hole: false,
     }
 }
 
@@ -198,6 +199,7 @@ fn concurrent_inserts_are_never_lost_across_cuts() {
                             },
                             blocks: blocks as u32,
                             seq: u64::from(i) + 1,
+                            hole: false,
                         },
                     )
                     .unwrap();
@@ -284,6 +286,176 @@ proptest! {
             prop_assert!(a_lba + u64::from(a_blocks) <= b_lba, "extents overlap");
             let mergeable = a_lba + u64::from(a_blocks) == b_lba && a_slot + a_blocks == b_slot;
             prop_assert!(!mergeable, "adjacent extents with a continuous run were not merged");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// holes (Step 4, E23): discards as extents without data
+// ---------------------------------------------------------------------------
+
+fn hole(record: u32, blocks: u32, seq: u64) -> DirtyExtent {
+    DirtyExtent::hole(
+        RingRef {
+            slot: record,
+            lap: 0,
+        },
+        blocks,
+        seq,
+    )
+}
+
+#[test]
+fn holes_split_merge_and_supersede_like_data_but_release_nothing() {
+    let mut v = VolumeDirty::new();
+    assert_eq!(superseded_blocks(&v.insert(0, ext(0, 8, 1))), 0);
+    // A hole over the middle supersedes four data blocks and splits the run.
+    let freed = v.insert(2, hole(100, 4, 2));
+    assert_eq!(superseded_blocks(&freed), 4);
+    assert_eq!(freed, vec![(RingRef { slot: 2, lap: 0 }, 4)]);
+    assert_eq!(
+        extents(&v),
+        vec![(0, 0, 2, 1), (2, 100, 4, 2), (6, 6, 2, 1)]
+    );
+    assert_eq!(v.blocks(), 8);
+    assert_eq!(v.data_blocks(), 4);
+    let (k, e) = v.find(4).unwrap();
+    assert_eq!((k, e.hole, e.blocks), (2, true, 4));
+    assert_eq!(
+        v.lookup(5),
+        Some((RingRef { slot: 100, lap: 0 }, 2)),
+        "a hole answers with its record slot, never offset"
+    );
+    // A write into the hole splits it; the pieces keep the record slot and
+    // nothing is released for the hole blocks it covered.
+    let freed = v.insert(3, ext(50, 2, 3));
+    assert!(freed.is_empty(), "a superseded hole releases no slot");
+    assert_eq!(
+        extents(&v),
+        vec![
+            (0, 0, 2, 1),
+            (2, 100, 1, 2),
+            (3, 50, 2, 3),
+            (5, 100, 1, 2),
+            (6, 6, 2, 1)
+        ]
+    );
+    // Overwriting the write with another hole of the same record merges the
+    // three hole pieces back into one.
+    let freed = v.insert(3, hole(100, 2, 4));
+    assert_eq!(superseded_blocks(&freed), 2);
+    assert_eq!(
+        extents(&v),
+        vec![(0, 0, 2, 1), (2, 100, 4, 4), (6, 6, 2, 1)]
+    );
+    // Holes of different records stay apart; a hole never merges with data.
+    let mut v = VolumeDirty::new();
+    v.insert(0, hole(1, 2, 1));
+    v.insert(2, hole(2, 2, 2));
+    v.insert(4, ext(4, 2, 3));
+    assert_eq!(v.extents(), 3);
+    well_formed_holes(&v);
+}
+
+fn well_formed_holes(v: &VolumeDirty) {
+    let mut end = 0u64;
+    for (lba, e) in v.iter() {
+        assert!(lba >= end, "extents overlap");
+        end = lba + u64::from(e.blocks);
+        if e.hole {
+            for k in 0..e.blocks {
+                assert_eq!(v.lookup(lba + u64::from(k)), Some((e.ring, e.seq)));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_index_reports_holes_in_hits_and_counts_them_as_dirty() {
+    let index = Index::new(4, 0);
+    index.insert(0, 10, ext(0, 4, 1)).unwrap();
+    let (_, freed) = index.insert(0, 12, hole(9, 8, 2)).unwrap();
+    assert_eq!(superseded_blocks(&freed), 2);
+    let hit = index.lookup(0, 15).unwrap();
+    assert!(hit.hole);
+    assert_eq!(hit.ring, RingRef { slot: 9, lap: 0 });
+    assert_eq!(hit.seq, 2);
+    let data = index.lookup(0, 11).unwrap();
+    assert!(!data.hole);
+    assert_eq!(data.ring, RingRef { slot: 1, lap: 0 });
+    assert_eq!(index.active_blocks(), 10, "holes count as dirty blocks");
+    assert!(index.lookup(0, 20).is_none());
+    // A hole is frozen with its generation and found through the frozen
+    // queue like any extent.
+    let gen = index.cut(1).unwrap();
+    assert!(index
+        .lookup(0, 15)
+        .is_some_and(|h| h.hole && h.gen == gen.id()));
+    let mut holes = 0;
+    gen.for_each_dirty_volume(|_, d| {
+        holes += d.iter().filter(|(_, e)| e.hole).count();
+    });
+    assert_eq!(holes, 1);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// Random data writes and discards against a per-block model: the
+    /// newest insert wins every block, holes answer with their record slot,
+    /// superseded runs are exactly the data blocks replaced.
+    #[test]
+    fn holes_and_data_agree_with_a_block_model(
+        ops in prop::collection::vec((0u64..32, 1u32..=6, any::<bool>()), 1..60)
+    ) {
+        let mut v = VolumeDirty::new();
+        let mut model: Vec<Option<(u64, bool, u32)>> = vec![None; 40];
+        let mut next_slot = 0u32;
+        for (seq0, (lba, blocks, is_hole)) in ops.into_iter().enumerate() {
+            let seq = seq0 as u64 + 1;
+            let ext = if is_hole {
+                let r = next_slot;
+                next_slot += 1;
+                hole(r, blocks, seq)
+            } else {
+                let r = next_slot;
+                next_slot += blocks;
+                ext(r, blocks, seq)
+            };
+            let freed = v.insert(lba, ext);
+            let mut expected_freed = 0u64;
+            for k in 0..blocks {
+                let at = (lba + u64::from(k)) as usize;
+                if let Some((_, false, _)) = model[at] {
+                    expected_freed += 1;
+                }
+                model[at] = Some((seq, is_hole, ext.ring.slot + if is_hole { 0 } else { k }));
+            }
+            prop_assert_eq!(superseded_blocks(&freed), expected_freed);
+            for (at, m) in model.iter().enumerate() {
+                let got = v.lookup(at as u64);
+                match m {
+                    None => prop_assert!(got.is_none(), "LBA {} should be clean", at),
+                    Some((s, h, slot)) => {
+                        let (ring, seq) = got.expect("dirty block found");
+                        // A merged data run carries the newest sequence of its
+                        // parts (E20); a hole is never merged with another op here.
+                        if *h {
+                            prop_assert_eq!(seq, *s);
+                        } else {
+                            prop_assert!(seq >= *s, "a run never loses sequence");
+                        }
+                        prop_assert_eq!(ring.slot, *slot);
+                        let (_, e) = v.find(at as u64).unwrap();
+                        prop_assert_eq!(e.hole, *h);
+                    }
+                }
+            }
+            prop_assert_eq!(v.blocks(), model.iter().filter(|m| m.is_some()).count() as u64);
+            prop_assert_eq!(v.data_blocks(), model.iter().filter(|m| matches!(m, Some((_, false, _)))).count() as u64);
         }
     }
 }

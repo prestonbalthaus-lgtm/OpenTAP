@@ -74,6 +74,26 @@ impl SimFrontDoor {
         id
     }
 
+    /// Queues a discard.
+    pub fn submit_discard(&mut self, vol: u32, lba: u64, blocks: u32) -> ReqId {
+        let id = self.id();
+        self.queue.push_back(Request {
+            id,
+            kind: RequestKind::Discard { vol, lba, blocks },
+        });
+        id
+    }
+
+    /// Queues a write of zeros.
+    pub fn submit_write_zeroes(&mut self, vol: u32, lba: u64, blocks: u32) -> ReqId {
+        let id = self.id();
+        self.queue.push_back(Request {
+            id,
+            kind: RequestKind::WriteZeroes { vol, lba, blocks },
+        });
+        id
+    }
+
     /// Completions since the last call.
     pub fn take_completions(&mut self) -> Vec<Completion> {
         std::mem::take(&mut self.completions)
