@@ -436,7 +436,7 @@ review.
 
 The owner approved putting the tree under version control. The lead
 installed the GitHub CLI 2.102.0 (zip release, SHA-256 verified against the
-published checksums, in `C:\Users\jimmy\tools\gh`), the owner logged in as
+published checksums, in `%USERPROFILE%\tools\gh`), the owner logged in as
 `prestonbalthaus-lgtm`, and the lead initialised the repository at
 `E:\Coding\OpenTAP`, committed the tree as it stood after the Step 3 review
 (`aee54fc`, 93 files, "Phase C Steps 1 to 3"), created the private
@@ -653,6 +653,38 @@ rerun. `PROPTEST_CASES=10000 cargo test --workspace`: all 458 tests and 2
 doctests passed, 1 ignored, in 116 min 6 s on this host
 (`step4_sim_tests` 52 min, `map_tests` 19 min, `adversarial_sim_tests`
 17 min, `sim_tests` 14 min; every other suite under six minutes).
+
+## 2026-10-14: the public face of the repository
+
+The owner asked for the repository to carry everything that exists and for
+a short README about the goal of the project, ahead of making the
+repository public. Everything in the working tree was already committed;
+what was missing lived in session scratch directories. Changes, all of
+them documentation:
+
+- `README.md` is now the public face: what OpenTAP is for, the goal in six
+  points, how the engine works in one paragraph, an honest status (the
+  engine has run only on the simulator and over a plain file), the
+  repository map, the two build commands and the licensing position. The
+  build, test and layout guide it replaced moved to `BUILDING.md` with its
+  title, its introduction and its source-control section reworded and its
+  gate line naming the 10,000-case run; `06`, `07` and `09` point there.
+- `docs/reviews/` archives the worker reports behind the Step 1, 2 and 4
+  reviews (the format audit and the two format QA passes, the `otap-sys`
+  hand-back, the two stream QA passes, the Step 4 adversarial QA report),
+  verbatim apart from the hand-back wrapper and the path encoding, with an
+  index. The Step 3 review's report was never saved as a file; the Step 3
+  entry above remains its record.
+- The mentions of the development PC's user directory in `06`, `08` and
+  `09` were removed or replaced with `%USERPROFILE%`; nothing else in the
+  tree names a local account. The design records (`01`, `03`, `05`) are
+  session transcripts and were left as they are.
+- GitHub: ten topics added (rust, storage, san, nas, iscsi, ublk, io-uring,
+  homelab, block-storage, log-structured). The repository stays private
+  until the owner chooses a license and flips it; the README says that no
+  license has been chosen yet.
+
+No code changed, so the gates of the Step 4 commit stand.
 
 ## Lessons, running list
 

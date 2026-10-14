@@ -1,6 +1,6 @@
 # OpenTAP implementation status and handoff
 
-Living document. Last updated 2026-10-13, after Phase C Step 4. Update it at
+Living document. Last updated 2026-10-14, after Phase C Step 4 and the public README. Update it at
 the end of every step and whenever section 7 ("Next") changes. Section 1 is
 what a new session reads first; the rest is the detail behind it.
 
@@ -34,10 +34,9 @@ what a new session reads first; the rest is the detail behind it.
   reproducible defects, five of them in the boot (the Step 4 entry of
   `08-engineering-log.md`, decisions E29 to E33); the lead's own suites had
   found five before it. All are fixed and pinned.
-- The tree is under version control: branch `main` of the private
+- The tree is under version control: branch `main` of the GitHub
   repository `github.com/prestonbalthaus-lgtm/OpenTAP`, one commit per
-  reviewed change with the gates green, pushed through the GitHub CLI in
-  `C:\Users\jimmy\tools\gh`.
+  reviewed change with the gates green, pushed through the GitHub CLI.
 - Owner decisions D3 to D7 and D11 to D15 have no recorded answers; the
   code depends on them only through the reservations listed in section 6.
 - The development PC runs Windows. The first run on a Debian 13 host will
@@ -58,7 +57,9 @@ what a new session reads first; the rest is the detail behind it.
 | `08-engineering-log.md` | dated record of what happened: steps, reviews, defects, gate results, lessons | living, append only |
 | `09-working-agreements.md` | how the work is done: roles, definition of done, code and test rules, build etiquette, documentation rules | living |
 | `10-phase-c-step-briefs.md` | the owner's step briefs, verbatim, each with a note on how it was read | append per step |
-| `../README.md` | build, test and layout guide, including the Windows host notes | kept current with the tree |
+| `../README.md` | the public face of the repository: the goal, how the system works, status, where to start | kept current |
+| `../BUILDING.md` | build, test and layout guide, including the Windows host notes | kept current with the tree |
+| `reviews/` | the worker reports behind the Step 1, 2 and 4 reviews, verbatim, with an index | archive |
 | `../crates/otap-format/src/lib.rs` | the layout specification and format rulings F1 to F15; the code is the authority | format 2.2, stream header 1.0 |
 
 ## 3. The workspace as built
@@ -112,7 +113,7 @@ page, `OTCD` CP log directory page, `OTSR` snapshot root page.
 Golden vectors: `crates/otap-format/tests/vectors/v2.0/` (twelve images),
 `v2.1/` and `v2.2/` (fourteen each) hold byte-exact images with BLAKE3 manifests whose hashes
 are pinned in `format_tests.rs`; every set is decoded on every run. Any
-layout change is a minor bump plus a new vector directory (README, "Golden
+layout change is a minor bump plus a new vector directory (`BUILDING.md`, "Golden
 vectors").
 
 ### 3.2 otap-stream: what is on the wire
@@ -280,7 +281,7 @@ met under the simulator; the physical re-attach test is a Linux item.
 
 On the development PC every cargo command is prefixed with
 `export PATH="$HOME/.cargo/bin:$HOME/.cargo/mingw-tools/bin:$PATH"` (see the
-README's Windows notes) and runs with `-j 3`; tests use `--test-threads=6`.
+the Windows notes in `BUILDING.md`) and runs with `-j 3`; tests use `--test-threads=6`.
 
 | Gate | Result |
 |---|---|
@@ -369,7 +370,7 @@ socket is designed, and to D5, D6 and D14 before the nvfail policy code.
   `dump --since` are doc 05 week 11 items.
 - **The golden-vector sets were regenerated once (2.0) and bumped once
   (2.1).** Allowed only before a release; the procedure for any later
-  change is in the README.
+  change is in `BUILDING.md`.
 - **The engine is one thread.** The reactor partitioning of the arena is a
   `dbladed` item (E16); the ublk front door serves one queue.
 - **Nothing frees a data segment with a live block.** Metadata segments

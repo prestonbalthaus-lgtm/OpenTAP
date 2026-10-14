@@ -118,7 +118,7 @@ parallel builds. Rules:
 - Every cargo command is prefixed with
   `export PATH="$HOME/.cargo/bin:$HOME/.cargo/mingw-tools/bin:$PATH"` in
   Git Bash (rustup was installed with `--no-modify-path`; `dlltool.exe` and
-  `as.exe` from winlibs live in `mingw-tools`). The README's Windows section
+  `as.exe` from winlibs live in `mingw-tools`). The Windows section of `BUILDING.md`
   has the detail.
 - One cargo process at a time on the machine. The lead builds with `-j 3`;
   a worker with `-j 2`; tests run with `--test-threads=6`. Never two heavy
@@ -146,7 +146,7 @@ parallel builds. Rules:
 | The code departs from the design or a brief | `07-engineering-decisions.md` (E-entry, F-ruling or S-rule) |
 | Anything happens worth remembering: a review, a defect, a gate run, a lesson | `08-engineering-log.md` (dated, append only) |
 | A rule in this file changes | this file, with the reason in the log |
-| A build or layout fact changes | `README.md` and the crate root docs |
+| A build or layout fact changes | `BUILDING.md` and the crate root docs |
 
 The code is the authority for what it enforces; these documents are the
 authority for why, and for what is not yet code.
@@ -165,5 +165,5 @@ GitHub repository `prestonbalthaus-lgtm/OpenTAP`, branch `main`. Rules:
   private, unless the owner says otherwise.
 - `target/`, the fuzz build output and corpora are ignored; `Cargo.lock`
   files are committed; the golden vectors are binary (`.gitattributes`).
-- The GitHub CLI lives in `C:\Users\jimmy\tools\gh\bin` (on the user PATH)
+- The GitHub CLI lives in `%USERPROFILE%\tools\gh\bin` (on the user PATH)
   and holds the owner's token; `gh auth status` shows the login.

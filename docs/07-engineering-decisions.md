@@ -101,7 +101,7 @@ enforced.
   regenerated once, on 2026-10-13, when the Step-2 records were added, which
   is allowed only before a release has written the format.
 - **Enforced by** `format_tests.rs` (the vectors lane and the pinned hash),
-  `.gitattributes` (`*.bin binary`), README "Golden vectors".
+  `.gitattributes` (`*.bin binary`), `BUILDING.md` "Golden vectors".
 
 ## E06. Stream rules S1 to S10
 
@@ -227,7 +227,7 @@ the §7.3 sketch of doc 05. Every one is pinned by `stream_tests.rs` or
 2026-10-13. Accepted. The PC has 6 cores and 12 threads and has frozen under
 parallel agent builds before. One cargo process at a time; `-j 3` for the
 lead, `-j 2` for a worker; `--test-threads=6`; no two heavy jobs at once.
-Details and the PATH prefix are in `09-working-agreements.md` and the README.
+Details and the PATH prefix are in `09-working-agreements.md` and `BUILDING.md`.
 
 ## E11. How a departure from the design is recorded
 
