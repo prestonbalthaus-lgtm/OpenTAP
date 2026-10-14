@@ -116,3 +116,13 @@ notes for a windows-gnu toolchain:
 
 Keep heavy work polite on the shared desktop: `cargo build -j 3`, tests with
 `--test-threads=6`.
+
+## Source control
+
+The tree is a git repository (since 2026-10-13) whose `origin` is the private
+GitHub repository `prestonbalthaus-lgtm/OpenTAP`, branch `main`. The rules
+(one commit per reviewed change with the gates green, the commit identity,
+what is ignored) are in `docs/09-working-agreements.md`, section 8. The
+GitHub CLI used for pushes and repository work is installed in
+`%USERPROFILE%\tools\gh\bin` (on the user `PATH`); `gh auth status` shows the
+login. `docs/06-implementation-status.md` is where a new session starts.

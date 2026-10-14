@@ -37,7 +37,12 @@ what a new session reads first; the rest is the detail behind it.
   history. One commit per reviewed change with the gates green, pushed
   through the GitHub CLI installed in `C:\Users\jimmy\tools\gh`.
 - Owner decisions D1 to D15 have no recorded answers. The code depends on them
-  only through the reservations listed in section 6.
+  only through the reservations listed in section 6. Decision E19
+  (flush-opaque backstores) is the one implementation decision waiting on
+  the owner.
+- The Step 3 report was given to the owner on the evening of 2026-10-13;
+  nothing is in progress. A new session starts at section 7 with the Step 4
+  brief, once the owner sends it.
 - The development PC runs Windows. Everything Linux-specific is type-checked
   against `x86_64-unknown-linux-gnu` and has never executed. The first run on
   a Debian 13 host will find things; budget for it.

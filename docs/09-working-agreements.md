@@ -125,6 +125,16 @@ parallel builds. Rules:
   owns; it never runs a workspace-wide gate while the lead may be building.
 - Temporary files, extracted sources and toolchains go to the session
   scratchpad, never into the tree.
+- The 10,000-case gate (`PROPTEST_CASES=10000 cargo test --workspace`)
+  takes about 41 minutes and runs in the background with its output
+  captured to a file; nothing else uses cargo meanwhile. The two simulator
+  random walks (`sim_tests` and `adversarial_sim_tests`) are single
+  property tests, so more test threads do not shorten them; after one
+  build they can be run as two separate test processes at once to halve
+  the wall time. Their seeds differ per run, so the gate is repeated over
+  time rather than treated as final once.
+- The owner prefers the work done well over done fast: case counts are
+  never trimmed and the review is never skipped to save time.
 
 ## 7. Documentation rules
 
