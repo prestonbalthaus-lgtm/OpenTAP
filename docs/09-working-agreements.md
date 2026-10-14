@@ -176,6 +176,5 @@ GitHub repository `prestonbalthaus-lgtm/OpenTAP`, branch `main`. Rules:
   declared licence of every package in both lockfiles, read from the
   registry sources) is repeated on every dependency bump and its result
   noted in the log.
-- The full records of the three design rounds are the owner's to keep out
-  of the public repository (decided 2026-10-14); the log records what is
-  still open about that.
+- The full records of the three design rounds stay in the repository: the
+  owner decided on 2026-10-14 that they may be public.

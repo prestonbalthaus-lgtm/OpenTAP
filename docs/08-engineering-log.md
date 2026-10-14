@@ -726,6 +726,10 @@ rewritten and force-pushed, or the repository deleted and recreated, before
 it is made public. The lead prepared the steps but did not run them; that
 is the owner's call, recorded here as open.
 
+Closed the same day: the owner decided that the records may stay in the
+repository, which has been public since 2026-10-14. The copy made in the
+private folder was removed.
+
 ## Lessons, running list
 
 - `prop_assert!(cond)` without a message fails to compile when `cond`

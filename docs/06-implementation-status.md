@@ -35,8 +35,10 @@ what a new session reads first; the rest is the detail behind it.
   `08-engineering-log.md`, decisions E29 to E33); the lead's own suites had
   found five before it. All are fixed and pinned.
 - The tree is under version control: branch `main` of the GitHub
-  repository `github.com/prestonbalthaus-lgtm/OpenTAP`, one commit per
-  reviewed change with the gates green, pushed through the GitHub CLI.
+  repository `github.com/prestonbalthaus-lgtm/OpenTAP`, public since
+  2026-10-14 with the design records in it by the owner's decision; one
+  commit per reviewed change with the gates green, pushed through the
+  GitHub CLI.
 - Licensed under Apache-2.0 since 2026-10-14 (`LICENSE`; every manifest
   carries the field). Every package in both lockfiles declares a
   permissive license (MIT, Apache-2.0, BSD, Zlib, CC0, Unicode, NCSA);
