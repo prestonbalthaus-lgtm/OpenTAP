@@ -686,6 +686,46 @@ them documentation:
 
 No code changed, so the gates of the Step 4 commit stand.
 
+## 2026-10-14: the license
+
+The owner chose the Apache License 2.0 and asked whether running on Debian
+forces the GPL. It does not: the Linux kernel's licence covers the kernel
+and its modules, and its own COPYING file states that user programs using
+the kernel through normal system calls are not derivative works. OpenTAP
+is a user-space program that drives the kernel through public interfaces
+(ublk, io_uring, configfs for LIO) and has no kernel module, so the choice
+of licence is free. What would bind it is linking a GPL library, which the
+dependency graph does not do: a scan of every package in both lockfiles
+against the registry sources found only permissive licences (MIT,
+Apache-2.0, BSD-2-Clause, Zlib, CC0-1.0, MIT-0, Unicode-3.0, NCSA for
+`libfuzzer-sys`); 76 packages in the workspace lock, 28 in the fuzz lock.
+Two platform-only packages are absent from the local registry because they
+are never built here: `r-efi` (UEFI targets; MIT OR Apache-2.0 OR
+LGPL-2.1-or-later on crates.io, so Apache applies) and `redox_syscall`
+(Redox; MIT). Components OpenTAP will drive as separate processes later
+(the kernel, `mdadm`, Samba, `versitygw`) keep their own licences; a
+shipped installation image would have to honour each, which is a packaging
+duty, not a constraint on this code.
+
+Done: `LICENSE` is the verbatim Apache-2.0 text from apache.org (SHA-256
+`cfc7749b…523d30`, 11,358 bytes); `[workspace.package]` carries `license`
+and `repository`, every crate manifest inherits both, and the fuzz manifest
+declares them itself; the README's licence section names the licence,
+the copyright line ("the OpenTAP authors") and the trademark notice;
+`09-working-agreements.md` section 8 records the rules (contributions
+under the same licence, no copyleft in the linked graph, the licence check
+on every dependency bump). The gates after the manifest change: clippy on
+the host, the fuzz type-check and fmt, all clean. No code changed.
+
+Still the owner's: the full records of the three design rounds (`01`,
+`03`, `05` `-record.md`, 1.9 MB of session transcripts) are to stay out of
+the public repository. They were copied to `E:\Coding\OpenTAP-private\records`
+on 2026-10-14. Taking them out of the public repository means more than
+deleting them, because they are in the first commit: the history has to be
+rewritten and force-pushed, or the repository deleted and recreated, before
+it is made public. The lead prepared the steps but did not run them; that
+is the owner's call, recorded here as open.
+
 ## Lessons, running list
 
 - `prop_assert!(cond)` without a message fails to compile when `cond`

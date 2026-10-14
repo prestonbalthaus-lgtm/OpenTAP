@@ -31,6 +31,8 @@ edition = "2021"
 # these pins. The tree is built and tested with stable 1.99.
 rust-version = "1.89"
 publish = false
+license = "Apache-2.0"
+repository = "https://github.com/prestonbalthaus-lgtm/OpenTAP"
 
 [workspace.dependencies]
 # On-disk and on-wire views (round-3 ruling R25, Part 7 conventions).

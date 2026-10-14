@@ -37,6 +37,10 @@ what a new session reads first; the rest is the detail behind it.
 - The tree is under version control: branch `main` of the GitHub
   repository `github.com/prestonbalthaus-lgtm/OpenTAP`, one commit per
   reviewed change with the gates green, pushed through the GitHub CLI.
+- Licensed under Apache-2.0 since 2026-10-14 (`LICENSE`; every manifest
+  carries the field). Every package in both lockfiles declares a
+  permissive license (MIT, Apache-2.0, BSD, Zlib, CC0, Unicode, NCSA);
+  nothing copyleft is linked.
 - Owner decisions D3 to D7 and D11 to D15 have no recorded answers; the
   code depends on them only through the reservations listed in section 6.
 - The development PC runs Windows. The first run on a Debian 13 host will

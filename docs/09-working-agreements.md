@@ -153,7 +153,7 @@ authority for why, and for what is not yet code.
 
 ## 8. Source control
 
-Since 2026-10-13 the tree is a git repository with `origin` at the private
+Since 2026-10-13 the tree is a git repository with `origin` at the
 GitHub repository `prestonbalthaus-lgtm/OpenTAP`, branch `main`. Rules:
 
 - One commit per reviewed change with the gates green; the message says
@@ -161,9 +161,21 @@ GitHub repository `prestonbalthaus-lgtm/OpenTAP`, branch `main`. Rules:
   that wrote it.
 - Commits are authored by the owner's GitHub identity (the no-reply
   address, so pushes are never rejected for exposing an email).
-- Nothing is pushed anywhere but `origin`, and the repository stays
-  private, unless the owner says otherwise.
+- Nothing is pushed anywhere but `origin`; the repository's visibility is
+  the owner's call.
 - `target/`, the fuzz build output and corpora are ignored; `Cargo.lock`
   files are committed; the golden vectors are binary (`.gitattributes`).
 - The GitHub CLI lives in `%USERPROFILE%\tools\gh\bin` (on the user PATH)
   and holds the owner's token; `gh auth status` shows the login.
+- The tree is licensed under the Apache License 2.0 (`LICENSE`); every
+  manifest carries the field, and contributions are accepted under the
+  same licence.
+- A dependency must carry a permissive licence. Nothing under the GPL,
+  LGPL or AGPL enters the linked graph; a crate that offers a copyleft
+  licence only as one choice among permissive ones is fine. The check (the
+  declared licence of every package in both lockfiles, read from the
+  registry sources) is repeated on every dependency bump and its result
+  noted in the log.
+- The full records of the three design rounds are the owner's to keep out
+  of the public repository (decided 2026-10-14); the log records what is
+  still open about that.

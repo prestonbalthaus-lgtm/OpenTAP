@@ -96,8 +96,11 @@ Windows host notes.
 
 ## License
 
-No license has been chosen yet. Until one is added, the code is copyright
-its authors, all rights reserved.
+Copyright 2026 the OpenTAP authors. Licensed under the Apache License,
+Version 2.0; see `LICENSE`. Contributions are accepted under the same
+terms. OpenTAP runs on Linux and drives the kernel through its public
+interfaces (ublk, io_uring, configfs); it links no GPL code, and every
+crate it depends on is permissively licensed.
 
 OpenTAP is an independent project with no affiliation to NetApp. ONTAP is a
 trademark of NetApp, Inc.
