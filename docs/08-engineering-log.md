@@ -1029,3 +1029,38 @@ device, the hugetlbfs arena, the io_uring backstore and the fuzz targets.
   accepted on its reading and "fixed" before anyone measured it; the gate's
   own timings, in the Step 4 log all along, disproved it. The lapse was the
   lead's acceptance without a test, not the reviewer's reading.
+
+## 2026-10-14: Step 6 begun and paused
+
+The Step 6 brief arrived in the evening, cut off in the middle of the
+transport scope (at "Dual Transport Backends: 1"); what arrived is saved
+verbatim in `10`. The lead copied the saved Linux 6.12 sources out of the
+Step 2 session's scratchpad, read the ublk driver's recovery paths, wrote
+its preliminary positions for each scope, and launched twelve read-only
+readers to map the subsystems Step 6 touches. Ten maps came back. Three
+readers stopped on a usage limit of the model running them before they
+wrote anything, and a fourth wrote its map but not its summary. The owner
+then stopped for the night and asked for the work to be saved.
+
+What was saved: the maps, the readers' summaries, the positions and a
+handoff in `step6/`; the kernel sources (GPL-2.0, so kept out of the
+tree), the workflow script with every reader's assignment, the raw results
+and a one-cargo-at-a-time wrapper in `E:\Coding\OpenTAP-local\`. No source
+file changed, so no gate was run.
+
+Two findings in the maps reach beyond Step 6. Both are readers' claims,
+not yet checked. The snapshot table is rewritten in every CP that has a
+snapshot, changed or not, so `06` section 8 and E39 understate the cost.
+The boot's metadata liveness counts a region shared by the live tree and
+a snapshot once per tree, so such a metadata segment cannot be freed until
+the next boot: the Step 4 review's hazard 12, never closed and never
+recorded as a limit. The full list is in `step6/README.md`, section 2.
+
+Lessons:
+
+- A reader whose deliverable is a file keeps its work when it is cut off:
+  the fourth reader's map survived its failure for that reason. Every
+  worker writes its file first and hands back only a summary.
+- Twelve agents launched at once can exhaust a usage limit together. A
+  large fan-out is better staged, so a limit stops it between agents
+  rather than in the middle of all of them.

@@ -574,3 +574,60 @@ The message pasted the following:
   10,000-case run in the background with its timing recorded; the Linux
   halves are type-checked for `x86_64-unknown-linux-gnu` and have not
   executed.
+
+## Step 6 brief (received 2026-10-14)
+
+The owner pasted the brief into the session; the paste ended mid-sentence
+in the "Dual Transport Backends" list of the third worker (at "1"), so
+everything after that point (the rest of the transport scope, the fourth
+worker, and any later sections) did not reach the lead. The text below is
+what arrived, verbatim; the note at the end of this entry says how the
+missing part was read.
+
+> # OpenTAP Step 6 Implementation Brief: `USER_RECOVERY` Re-Attach, Incremental Catalogue & Snapshot Tables, Pool Attestation, and Replication Transport (Windows Host Execution)
+>
+> **Role Definition:**
+> You are Fable 5.1, Lead Systems Architect and Engineering Director for **OpenTAP**. Step 5 (`5114866`) is committed on `main` with 541 passing unit tests and a 179-minute, 10,000-case property-test gate. You are now directing **Step 6**.
+>
+> **Execution Environment Directive (Windows Today, WSL 2.0 Tomorrow):**
+> The project owner is running this session on the **Windows host** today and will install **WSL 2.0** tomorrow for live Linux kernel execution. Therefore:
+> 1. **Build and verify 100% of the Step 6 code on Windows today** using `PortableFileBackstore`, the mock `ublk` transport, the `otap-sim` deterministic harness, and cross-platform loopback TCP sockets, while keeping all Linux-specific syscalls (`io_uring`, `/dev/ublk-control`, `hugetlbfs`) cleanly gated and type-checked under `--target x86_64-unknown-linux-gnu`.
+> 2. **Prepare WSL 2.0 tooling (`scripts/wsl2-prep.sh` and updated `scripts/linux-smoke.sh`)** so tomorrow's Linux test run handles WSL 2 nuances cleanly (specifically probing for `io_uring`, `hugetlbfs`, and `/dev/ublk-control`, running available Linux kernel suites immediately, and providing a reproducible script to compile a Linux 6.12 WSL 2 kernel with `CONFIG_BLK_DEV_UBLK=y` if the stock Microsoft WSL2 kernel lacks `ublk_drv`).
+>
+> ---
+>
+> ## 1. Step 6 Objectives & Task Delegation
+>
+> Direct four specialized Opus 5.5 worker agents to deliver the complete Step 6 feature set:
+>
+> ### 1. Opus-Ublk-Recovery (`UBLK_F_USER_RECOVERY` Re-Attach & Stale Device Reaper)
+> * Extend `otap-sys::ublk`, `otap-ublk`, and `dbladed`:
+>   * Implement the full `UBLK_F_USER_RECOVERY` lifecycle (`UBLK_CMD_START_USER_RECOVERY` and `UBLK_CMD_END_USER_RECOVERY` in `otap-sys`, state machine in `otap-ublk`).
+>   * Coordinate daemon restart (`kill -9` recovery) with `otap-arena` re-attachment: when `dbladed` restarts over an existing persistent arena and surviving `ublk` device, recover placed arena runs, reconcile in-flight `ublk` I/O tags without duplicating or dropping acknowledged writes, and resume serving within the 2-second recovery budget.
+>   * Implement the **Stale Device Reaper**: detect and clean up orphaned/wedged `ublk` device instances left behind by dead daemons or removed volumes, plus explicit `otapctl device list` and `otapctl device reap` commands.
+>   * Test the entire crash, `USER_RECOVERY` re-attach, and reaper state machine deterministically on Windows via the mock transport in `otap-ublk` and `otap-sim`.
+>
+> ### 2. Opus-Storage-Catalogue (Incremental Catalogue/Snapshot Tables & Pool Attestation)
+> * **Incremental Catalogue & Snapshot Persistence:**
+>   * Replace full-table rewrites with incremental catalogue and snapshot table updates across Consistency Points (logging incremental `SnapRecord` / volume catalogue deltas in `CpLogPage` or CoW catalogue pages and folding them periodically), ensuring O(1) CP metadata overhead even with hundreds of volumes and snapshots.
+>   * Maintain backward/forward format clarity and update golden vectors if required by pre-release format rules.
+> * **End-to-End Pool Attestation (`otapctl pool verify` / `attest`):**
+>   * Build a comprehensive verification and attestation pass in `otap-cp` (exposed via `dbladed` and `otapctl pool verify`) that audits:
+>     1. Superblock ring (`A0/A1/B0/B1`) CRC and epoch/sequence monotonicity.
+>     2. Every active volume's two-level radix map (`MapPage` CRCs, bounds, and LBA continuity) and pinned `SnapRecord` roots.
+>     3. Every live segment's on-disk stripe summary headers and block payload CRCs against the radix map's expected `(lseg, off, birth_cp)`.
+>     4. Exact reconciliation between recomputed live block references and `SegEntry::live_bytes` / deferred-free accounting, returning a structured attestation report without panicking on corrupted sectors.
+>
+> ### 3. Opus-Fabrics-Transport (Async Replication Transport & SnapMirror Engine)
+> * Wire `otap-stream` (frames, `Cursor`, `ResumeBitmap`, credit `flow`) into `otap-cp` and `dbladed`:
+>   * **Sender & Receiver Pipeline:** Implement the asynchronous replication sender (pinning a `ReplicationBase` snapshot, walking `otap-map` for extents and holes with `birth_cp > base_cp`, packaging `DeltaBegin` $\rightarrow$ `Chunk`/`Holes`/`VolEvent` $\rightarrow$ `DeltaEnd`, and advancing the base snapshot only upon `Committed`) and receiver (staging incoming chunks, enforcing credit windows, maintaining the 4 KiB `CursorPage` / `ResumeBitmap` across disconnects, committing the received delta as an atomic CP on the target pool, and replying `Landed` $\rightarrow$ `Committed`).
+>   * **Dual Transport Backends:**
+>     1
+
+(The paste ends here.)
+
+### Status (2026-10-14)
+
+Step 6 was paused before the design, at the owner's request; its state and
+the remaining work are in `step6/README.md`. The note on how the brief was
+read follows when the step ends.

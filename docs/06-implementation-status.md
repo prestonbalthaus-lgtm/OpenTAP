@@ -1,11 +1,17 @@
 # OpenTAP implementation status and handoff
 
-Living document. Last updated 2026-10-14, after Phase C Step 5. Update it at
+Living document. Last updated 2026-10-14, after Phase C Step 5, with Step 6
+begun and paused the same evening. Update it at
 the end of every step and whenever section 7 ("Next") changes. Section 1 is
 what a new session reads first; the rest is the detail behind it.
 
 ## 1. Where we are, in one screen
 
+- **Step 6 is in progress and paused** (2026-10-14, evening). The brief
+  is in `10` (it arrived cut off in the transport scope); ten maps of the
+  code, their summaries and the lead's preliminary positions are in
+  `step6/`. Nothing is decided or built yet: the code is still Step 5's.
+  Start with `step6/README.md`.
 - The design is complete through round 3: `05-architecture-brainstorm-03.md`
   holds rulings R25 to R64, the trait contracts (Part 7), the Phase C plan
   (Part 8) and the fifteen owner decisions (Part 9).
@@ -86,6 +92,7 @@ what a new session reads first; the rest is the detail behind it.
 | `../README.md` | the public face of the repository: the goal, how the system works, status, where to start | kept current |
 | `../BUILDING.md` | build, test and layout guide, including the Windows host notes | kept current with the tree |
 | `reviews/` | the worker reports behind the Step 1, 2, 4 and 5 reviews, verbatim, with an index | archive |
+| `step6/` | Step 6 working notes: the handoff, the lead's preliminary positions, ten maps of the code with their summaries | in progress, paused 2026-10-14 |
 | `../crates/otap-format/src/lib.rs` | the layout specification and format rulings F1 to F18; the code is the authority | format 2.3, stream header 1.0 |
 | `../scripts/linux-smoke.sh` | the first-run smoke test for a Debian 13 host (the README has the steps) | written, not yet run |
 
@@ -425,6 +432,10 @@ one (the Rust floor, F1 to F15, the stream rules, E13 to E33) are in
 `07-engineering-decisions.md`; each is reversible at the cost stated there.
 
 ## 7. Next: Step 6
+
+Step 6 began on 2026-10-14 and was paused before the design; its state
+and the order of the remaining work are in `step6/README.md`. The list
+below is still the plan.
 
 What doc 05 schedules next, in the order its dependencies allow:
 
