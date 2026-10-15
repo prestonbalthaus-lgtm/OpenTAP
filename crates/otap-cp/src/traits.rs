@@ -373,6 +373,65 @@ pub enum Status {
     /// [`MAX_PUNCH_BLOCKS`](crate::engine::MAX_PUNCH_BLOCKS) for a discard),
     /// or longer than the arena.
     TooLarge,
+    /// The volume is offline (Step 5, F18): taken down by the operator,
+    /// it answers nothing until it is brought online.
+    Offline,
+}
+
+impl<B: Backstore + ?Sized> Backstore for Box<B> {
+    fn profile(&self) -> &MediaProfile {
+        (**self).profile()
+    }
+
+    fn write_stripe(&mut self, pba: u64, image: &[u8], tag: Tag) -> Result<(), Busy> {
+        (**self).write_stripe(pba, image, tag)
+    }
+
+    fn write_meta(&mut self, pba: u64, image: &[u8], tag: Tag) -> Result<(), Busy> {
+        (**self).write_meta(pba, image, tag)
+    }
+
+    fn flush(&mut self, class: DevClass, tag: Tag) -> Result<(), Busy> {
+        (**self).flush(class, tag)
+    }
+
+    fn commit(&mut self, pba: u64, slot: &SuperblockSlot, tag: Tag) -> Result<(), Busy> {
+        (**self).commit(pba, slot, tag)
+    }
+
+    fn write_intent(&mut self, pba: u64, slot: &IntentSlot, tag: Tag) -> Result<(), Busy> {
+        (**self).write_intent(pba, slot, tag)
+    }
+
+    fn read(&mut self, pba: u64, dst: &mut [u8]) -> Result<(), IoError> {
+        (**self).read(pba, dst)
+    }
+
+    fn discard_segment(&mut self, pba: u64, bytes: u64, tag: Tag) -> Result<(), Busy> {
+        (**self).discard_segment(pba, bytes, tag)
+    }
+
+    fn poll(&mut self, out: &mut Vec<Done>) -> usize {
+        (**self).poll(out)
+    }
+}
+
+impl<F: FrontDoor + ?Sized> FrontDoor for Box<F> {
+    fn fetch(&mut self) -> Option<Request> {
+        (**self).fetch()
+    }
+
+    fn copy_in(&mut self, req: &Request, dst: &mut [u8]) -> Result<(), IoError> {
+        (**self).copy_in(req, dst)
+    }
+
+    fn copy_out(&mut self, req: &Request, src: &[u8]) -> Result<(), IoError> {
+        (**self).copy_out(req, src)
+    }
+
+    fn complete(&mut self, req: Request, status: Status, seq: u64) {
+        (**self).complete(req, status, seq)
+    }
 }
 
 /// The client side: ublk in production, a request script in the simulator.

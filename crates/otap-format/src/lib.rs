@@ -62,6 +62,8 @@
 //! | [`CpLogPage`] (`CpLogPageHdr` + 126 records) | 4096 | 4096 | header + records | [`records`] |
 //! | [`CpLogDirPage`] (`CpLogDirHdr` + 252 root references; 2.1) | 4096 | 4096 | header | [`records`] |
 //! | [`SnapRootPage`] (2.1) | 4096 | 4096 | trailing | [`records`] |
+//! | [`CatalogRec`] (2.3) | 512 | 8 | trailing | [`catalog`] |
+//! | [`CpStripe`] (2.3) | 16 | 8 | in root region | [`records`] |
 //!
 //! # Format rulings (F1 to F15)
 //! These settle the points on which the Step-1 brief, the round-3 synthesis
@@ -137,8 +139,8 @@
 //!   what the map needs to resolve an address, and the Step-2 brief's
 //!   `lseg` is the index. [`SnapRecord`] is 64 bytes with the volume, the
 //!   pinned map root, the deadlist, kind, origin and pin bits; snapshot
-//!   names are control-plane metadata keyed by the uuid and are not on
-//!   disk. [`CpLogRec`] is 32 bytes and carries the packed map address
+//!   names were control-plane metadata keyed by the uuid until format 2.3
+//!   put them in the catalogue (F16). [`CpLogRec`] is 32 bytes and carries the packed map address
 //!   rather than a separate physical address and length, so replaying the
 //!   journal is a copy into the map page; records live in 4 KiB
 //!   [`CpLogPage`]s whose header names the aggregate, the CP, its nonce and
@@ -191,6 +193,40 @@
 //!   over the old layout. Pools written by 2.1 (no geometry recorded) are
 //!   refused like 2.0 pools; none was released.
 //!
+//! Format 2.3 (Step 5, 2026-10-14) adds three rulings for snapshot
+//! deletion, the cleaner and the daemon; the earlier vectors stay and are
+//! still decoded, and `tests/vectors/v2.3/` holds the 2.3 set. A pool
+//! written by 2.2 or earlier is refused by the Step 5 boot; none was
+//! released.
+//!
+//! - **F16. Names are on disk: the catalogue.** The superblock's `catalog`
+//!   root names a region of [`CatalogRec`]s ([`catalog_image`],
+//!   [`parse_catalog`]): one 512-byte record per named volume (keyed by
+//!   index) or snapshot (keyed by uuid), with a name of 1 to 255 bytes of
+//!   UTF-8 without control characters or `/`, unique among volumes and
+//!   among the snapshots of one volume, in a canonical order, each record
+//!   sealed by its own CRC and the region by the root. This amends F11:
+//!   a name travels with the object it names and survives any crash the
+//!   object survives. A commit that changed no name carries the previous
+//!   region forward unchanged.
+//! - **F17. Every commit lists the data stripes it wrote.** The
+//!   superblock's `cp_stripes` root names a region of [`CpStripe`]
+//!   entries ([`cp_stripes_image`], [`parse_cp_stripes`]): `(pseg, idx,
+//!   kind)` for every data stripe the CP wrote, ingest and relocation
+//!   alike, or none. A boot verifies every listed stripe by its summary
+//!   (CRC and identity, the CP's nonce included) before it trusts the
+//!   commit; it no longer derives the stripes from the births in the
+//!   CP's records and pages, which a relocation (old births in a new
+//!   stripe) would hide.
+//! - **F18. Offline volumes, and pages in any directory.** `VolState`
+//!   gains the flag [`VOL_OFFLINE`]: the volume is present and taken down
+//!   by the operator, which a rollback, a shrink or a deletion requires.
+//!   And the directory's `page_entries` (F12) may be non-zero in any CP,
+//!   not only the fold's: a CP that rewrites a snapshot's map pages to
+//!   relocate its blocks lists them there so the boot verifies them.
+//!   `SegState::Relocated` and `reloc_index` stay reserved: a drained
+//!   segment is freed, not relocated (E37).
+//!
 //! # Using the views
 //! ```
 //! use otap_format::{FromBytes, IntoBytes, SbLocation, SbSlot, SuperblockSlot, Uuid, VOL_PRESENT};
@@ -226,6 +262,7 @@
 #[cfg(target_endian = "big")]
 compile_error!("otap-format defines a little-endian format and supports little-endian hosts only");
 
+pub mod catalog;
 pub mod checksum;
 pub mod constants;
 pub mod map;
@@ -235,15 +272,17 @@ pub mod stripe;
 pub mod superblock;
 pub mod types;
 
+pub use catalog::{catalog_image, parse_catalog, validate_name, CatalogKind, CatalogRec};
 pub use constants::*;
 pub use map::{
     map_roots_image, parse_map_roots, MapEntry, MapPage, MapRoot, PageIndexEntry, PageIndexPage,
     MAP_LSEG_SHIFT, MAP_OFF_SHIFT,
 };
 pub use records::{
-    parse_snap_table, snap_table_image, CpLogDir, CpLogDirHdr, CpLogDirPage, CpLogPage,
-    CpLogPageHdr, CpLogRec, SegEntry, SegKind, SegState, SnapKind, SnapOrigin, SnapRecord,
-    SnapRootPage, PIN_CLONE, PIN_MASK, PIN_REPLICATION, PIN_SCHEDULE, PIN_USER,
+    cp_stripes_image, parse_cp_stripes, parse_snap_table, snap_table_image, CpLogDir, CpLogDirHdr,
+    CpLogDirPage, CpLogPage, CpLogPageHdr, CpLogRec, CpStripe, SegEntry, SegKind, SegState,
+    SnapKind, SnapOrigin, SnapRecord, SnapRootPage, PIN_CLONE, PIN_MASK, PIN_REPLICATION,
+    PIN_SCHEDULE, PIN_USER,
 };
 pub use stream::{Codec, FrameKind, HoleRecord, StreamHeader, FLAGS_CODEC_MASK};
 pub use stripe::{
@@ -254,7 +293,7 @@ pub use stripe::{
 pub use superblock::{
     boot_write_active, DurableLogHdr, InboundState, IntentSlot, NvCause, RunState, SbLocation,
     SbSlot, Superblock, SuperblockSlot, VolState, VolTable, DURABLE_LOG_LOCAL_NVME_RING,
-    DURABLE_LOG_NONE, INBOUND_VALID, VOL_PRESENT,
+    DURABLE_LOG_NONE, INBOUND_VALID, VOL_OFFLINE, VOL_PRESENT,
 };
 pub use types::{AggId, Block4K, FormatError, Page16K, RootRef, Uuid, VolBitSet};
 

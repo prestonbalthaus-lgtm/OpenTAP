@@ -161,6 +161,7 @@ impl Pool {
             fold,
             new_volumes: new,
             max_region_pages: self.region_pages,
+            ..CpInput::default()
         }
     }
 

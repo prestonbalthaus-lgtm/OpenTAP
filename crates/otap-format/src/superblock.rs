@@ -214,6 +214,11 @@ impl NvCause {
 
 /// `VolState::flags` bit: the volume index is allocated.
 pub const VOL_PRESENT: u8 = 1 << 0;
+/// `VolState::flags` bit (format 2.3, F18): the volume is offline, taken
+/// down by the operator; the engine answers nothing on it until it is
+/// brought online, and a rollback, a shrink or a deletion is accepted only
+/// in this state.
+pub const VOL_OFFLINE: u8 = 1 << 1;
 
 /// Per-volume state recorded at commit time; one per volume index in the
 /// [`VolTable`].
@@ -250,6 +255,12 @@ impl VolState {
     #[must_use]
     pub const fn is_present(&self) -> bool {
         self.flags & VOL_PRESENT != 0
+    }
+
+    /// `true` when the volume is present and offline (format 2.3).
+    #[must_use]
+    pub const fn is_offline(&self) -> bool {
+        self.is_present() && self.flags & VOL_OFFLINE != 0
     }
 
     /// The decoded nvfail cause.
@@ -491,6 +502,13 @@ pub struct Superblock {
     /// Format 2.2: the device capacity the pool was laid out over, in
     /// bytes.
     pub geom_capacity_bytes: u64,
+    /// Format 2.3: the name catalogue region (F16), or none. Carried
+    /// forward unchanged by a commit that changed no name.
+    pub catalog: RootRef,
+    /// Format 2.3: the list of data stripes this commit wrote (F17), or
+    /// none when it wrote no data stripe. What the boot verifies by summary
+    /// before it trusts the commit.
+    pub cp_stripes: RootRef,
     /// Reserved, zero.
     pub reserved: [u8; SUPERBLOCK_RESERVED],
     /// CRC-32C over bytes `0..4092`.
@@ -1029,7 +1047,9 @@ const _: () = {
     assert!(offset_of!(Superblock, geom_stripe_bytes) == 1712);
     assert!(offset_of!(Superblock, geom_segment_bytes) == 1716);
     assert!(offset_of!(Superblock, geom_capacity_bytes) == 1720);
-    assert!(offset_of!(Superblock, reserved) == 1728);
+    assert!(offset_of!(Superblock, catalog) == 1728);
+    assert!(offset_of!(Superblock, cp_stripes) == 1744);
+    assert!(offset_of!(Superblock, reserved) == 1760);
     assert!(offset_of!(Superblock, crc32c) == SUPERBLOCK_CRC_OFFSET);
 
     assert!(size_of::<SuperblockSlot>() == SUPERBLOCK_SLOT_SIZE);

@@ -198,7 +198,7 @@ pub fn errno_for(status: Status, kind: &RequestKind) -> i32 {
             _ => 0,
         },
         Status::NvFailed | Status::Corrupt | Status::Failed => -EIO,
-        Status::NoSuchVolume | Status::Stopped => -ENODEV,
+        Status::NoSuchVolume | Status::Stopped | Status::Offline => -ENODEV,
         Status::NoSpace => -ENOSPC,
         Status::OutOfRange | Status::TooLarge => -EINVAL,
         _ => -EIO,

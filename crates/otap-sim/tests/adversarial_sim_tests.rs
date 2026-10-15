@@ -743,6 +743,11 @@ fn a_full_pool_refuses_writes_serves_reads_and_boots_after_a_daemon_crash() {
     cfg.segments = 6;
     cfg.stripes_per_segment = 2;
     cfg.volumes = vec![(0, 512)];
+    // The Step 4 regime this test pins: no reserve beyond the two segments of
+    // the boot and shutdown commits, and no cleaner (Step 5 adds both; the
+    // admission rule and the cleaner have their own tests).
+    cfg.reserve_segments = Some(0);
+    cfg.cleaner.background = false;
     let mut s = sim_with(cfg);
     s.boot().unwrap();
     let lba = fill_pool(&mut s);

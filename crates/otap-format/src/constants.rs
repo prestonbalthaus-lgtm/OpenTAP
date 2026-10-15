@@ -12,7 +12,7 @@ pub const FORMAT_MAJOR: u8 = 2;
 /// Minor version of the on-disk format. A later minor may only give meaning to
 /// bytes that this minor writes as zero; readers accept any minor of their own
 /// major.
-pub const FORMAT_MINOR: u8 = 2;
+pub const FORMAT_MINOR: u8 = 3;
 /// The `ver` field written into every on-disk structure: `major << 8 | minor`.
 pub const FORMAT_VERSION: u16 = ((FORMAT_MAJOR as u16) << 8) | FORMAT_MINOR as u16;
 
@@ -47,7 +47,7 @@ pub const SUPERBLOCK_SLOTS: usize = 4;
 pub const SUPERBLOCK_CRC_OFFSET: usize = SUPERBLOCK_SIZE - 4;
 /// Reserved bytes at the end of the superblock page, written as zero and
 /// covered by the CRC.
-pub const SUPERBLOCK_RESERVED: usize = 2364;
+pub const SUPERBLOCK_RESERVED: usize = 2332;
 
 /// Volumes per aggregate. A volume index is below this bound everywhere: in
 /// the bitsets, the volume table, descriptors and hole records (F8).
@@ -130,6 +130,15 @@ pub const NULL_PSEG: u64 = 0;
 pub const MAX_SEG_BYTES: u64 = (MAX_SEG_OFF as u64 + 1) * BLOCK_SIZE as u64;
 /// Size of one snapshot catalogue record.
 pub const SNAP_RECORD_SIZE: usize = 64;
+/// Size of one name catalogue record (format 2.3, F16).
+pub const CATALOG_RECORD_SIZE: usize = 512;
+/// The longest name a catalogue record holds, in bytes of UTF-8: the bound
+/// the stream's `VolEvent` already carries.
+pub const CATALOG_NAME_MAX: usize = 255;
+/// Reserved bytes at the end of a catalogue record.
+pub const CATALOG_RESERVED: usize = 221;
+/// Size of one entry of a consistency point's stripe list (format 2.3, F17).
+pub const CP_STRIPE_SIZE: usize = 16;
 /// Size of one CP log record.
 pub const CP_LOG_REC_SIZE: usize = 32;
 /// Size of the CP log page header.
@@ -208,7 +217,7 @@ pub const MAX_PLEN: u16 = (1 << PLEN_BITS) - 1;
 pub const NULL_LSEG: u64 = 0;
 
 const _: () = {
-    assert!(FORMAT_VERSION == 0x0202);
+    assert!(FORMAT_VERSION == 0x0203);
     assert!(STREAM_VERSION == 0x0100);
     assert!(VOL_BITSET_BYTES == 128);
     assert!(VOL_TABLE_SIZE == 16384);
@@ -228,4 +237,5 @@ const _: () = {
     assert!(CP_LOG_DIR_HDR_SIZE + CP_LOG_DIR_ENTRIES * ROOT_REF_SIZE == CP_LOG_DIR_PAGE_SIZE);
     assert!(SNAP_ROOT_RESERVED + 120 + 4 == SNAP_ROOT_PAGE_SIZE);
     assert!(MAX_SEG_BYTES == 256 * 1024 * 1024);
+    assert!(32 + CATALOG_NAME_MAX + CATALOG_RESERVED + 4 == CATALOG_RECORD_SIZE);
 };

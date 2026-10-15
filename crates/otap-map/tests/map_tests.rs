@@ -121,6 +121,7 @@ impl Pool {
             fold,
             new_volumes: new_vols.clone(),
             max_region_pages: 3,
+            ..CpInput::default()
         };
         let Pool { map, image, .. } = self;
         let mut reader = image.reader();
@@ -357,6 +358,7 @@ fn the_fold_frees_replaced_pages_indexes_and_deltas() {
         fold: true,
         new_volumes: vec![],
         max_region_pages: 64,
+        ..CpInput::default()
     };
     let prepared = map.prepare_cp(&mut reader, &input, image).unwrap();
     assert!(
@@ -388,6 +390,7 @@ fn the_fold_frees_replaced_pages_indexes_and_deltas() {
         fold: true,
         new_volumes: vec![],
         max_region_pages: 64,
+        ..CpInput::default()
     };
     let prepared = map.prepare_cp(&mut reader, &input, image).unwrap();
     assert_eq!(prepared.freed_pages.len(), 1);
@@ -540,6 +543,7 @@ fn prepare_refuses_what_the_format_refuses() {
             fold: false,
             new_volumes,
             max_region_pages: 4,
+            ..CpInput::default()
         };
     assert!(matches!(
         map.prepare_cp(

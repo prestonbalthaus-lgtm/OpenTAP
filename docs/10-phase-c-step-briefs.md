@@ -425,3 +425,152 @@ pasted the following:
   `UringBackstore`, `Sysfs`) are type-checked for
   `x86_64-unknown-linux-gnu` and have not executed, which the owner knows
   from Step 2 (no Linux host).
+
+---
+
+## Step 5 brief (received 2026-10-14)
+
+The message pasted the following:
+
+> # OpenTAP Step 5 Implementation Brief: Snapshot Deletion, Segment Cleaner (GC), `dbladed` Daemon, and `otapctl` CLI
+>
+> **Role Definition:**
+> You are Fable 5.1, Lead Systems Architect and Engineering Director for **OpenTAP**. Step 4 (`otap-map`, `otap-geom`, `otap-backstore`, `otap-ublk`) is committed on `main` (`f4dc64e`) with 458 passing unit tests and a 10,000-case property-test gate. You are now directing **Step 5**.
+>
+> ---
+>
+> ## 1. Executive Rulings on Open Decisions (D3, D5, D6, D14)
+>
+> Record these binding project-owner rulings in the decision log (`07`) and status document (`06`) before writing Step 5 code:
+>
+> 1. **D3 (Arena Sizing, Hugepage Fallback & CP Cadence):**
+>    * Production default remains an 8 GiB `hugetlbfs` arena (2 MiB pages), but `dbladed` MUST support configurable arena sizes down to 64 MiB and a `--heap-arena` flag (using aligned heap memory) so homelab operators and CI VMs can run without hugepage reservation.
+>    * Default CP timer is **5 seconds** (configurable 1–15s) or **50% active generation fullness**, with backpressure pacing at **80%** and hard stall at **95%** arena fullness.
+>    * Should `D3` in your internal ledger also track any remaining OS/fabric baseline item, lock Debian 13 (Trixie, kernel 6.12+) as the Linux target baseline and keep cross-platform Windows host testing mandatory.
+> 2. **D5 (Snapshot Deletion, Retention & Replication Pinning):**
+>    * Support up to 255 user snapshots per volume plus reserved slots for active replication baselines.
+>    * **Snapshot Deletion (`snap_delete`):** Deleting a snapshot unpins its `SnapRecord` in the next CP and accurately decrements `SegEntry::live_bytes` across unshared extents (comparing against adjacent older/newer snapshots or the active volume root) without corrupting shared Copy-on-Write pages.
+>    * **Replication Lock:** Snapshots flagged as an active replication baseline (`ReplicationBase`) MUST refuse user deletion with a clear error until explicitly unpinned or superseded by a newer `Committed` replication cursor.
+> 3. **D6 (Segment Cleaner / Garbage Collection & Reserve Slack):**
+>    * **Deadlock-Free Reserve:** Reserve a hard floor of free segments (`max(8, total_segments / 12)`) exclusively for cleaner compaction and metadata folds so a 100%-full user pool can still commit CPs to delete snapshots, punch holes (`Discard`), or compact fragmented segments.
+>    * **Cleaner Policy:** Background cleaning activates above **70% segment utilization** (or on explicit `otapctl pool scrub/clean`). Select candidate `Data` segments via cost-benefit scoring (lowest `live_bytes`, breaking ties by oldest `birth_cp`).
+>    * **Crash-Safe Relocation:** Relocate still-live blocks only if the volume/LBA currently maps to the exact physical `(lseg, off)` being cleaned (never overwriting newer random writes that landed since the segment was written), commit the remapped extents through the normal CP pipeline, and transition the drained segment to `Free` (issuing whole-segment discard on flash policies and direct overwrite on rotational policies).
+> 4. **D14 (`dbladed` Daemon Lifecycle, Control IPC & `otapctl`):**
+>    * Build `dbladed` and `otapctl` so the entire management lifecycle (`pool format`, `pool status`, `vol create/resize/delete/nvfail-clear`, `snap create/list/delete/rollback`, `cp trigger`, `gc run`) works end-to-end on both Linux (`UringBackstore` + `ublk`) and Windows/portable test harnesses (`PortableFileBackstore` + in-process/TCP control channel).
+>    * Persist human-readable volume and snapshot names in a CRC-protected catalogue volume/record so names survive reboots and crashes.
+>
+> *(Note: If your internal numbering in `05`/`06` assigns any adjacent scope to D3, D5, D6, or D14, map the corresponding ruling above and document the mapping cleanly in `07`.)*
+>
+> ---
+>
+> ## 2. Step 5 Objectives & Task Delegation
+>
+> Direct four specialized Opus 5.5 worker agents to deliver Step 5:
+>
+> ### 1. Opus-Storage-Lifecycle (Snapshot Deletion, Rollback & Segment Accounting)
+> * Extend `otap-map` and `otap-cp` with full **Snapshot Deletion** and **Volume Rollback**:
+>   * Accurately track extent sharing between the live volume tree and pinned snapshots so deleting a snapshot reclaims only extents that are neither referenced by an older snapshot nor still live in a newer snapshot/head.
+>   * Implement volume rollback to a pinned snapshot (`snap_rollback`), safely discarding newer unshared extents and updating `SegEntry::live_bytes`.
+>   * Enforce the `ReplicationBase` pin guard so active SnapMirror baselines cannot be accidentally deleted.
+>
+> ### 2. Opus-Storage-Cleaner (`otap-gc` or Cleaner Module in `otap-cp`)
+> * Implement the **Segment Cleaner (Garbage Collector)**:
+>   * Reserve the deadlock-free segment slack (`reserve_segments`) so `PoolFull` applies to front-door user writes before exhausting internal CP/cleaner segments.
+>   * Implement background and on-demand segment compaction: scan candidate segments with low `live_bytes`, verify live ownership via the stripe summary and current radix map, rewrite live blocks into the next CP stripe without clobbering newer writes, and reclaim drained segments after the CP commits.
+>   * Prove that a pool filled to 95% with fragmented 4 KiB overwrites and deleted snapshots reclaims space and sustains writes indefinitely without wedging.
+>
+> ### 3. Opus-Daemon-CLI (`bins/dbladed` & `bins/otapctl` or `crates/otap-daemon` & `crates/otap-ctl`)
+> * Create the daemon and CLI crates/binaries (`#![forbid(unsafe_code)]`):
+>   * **`dbladed`:** Hosts the pool engine, runs the periodic CP ticker and background cleaner, exposes `otap-ublk` devices on Linux, and listens on a control endpoint (Unix socket on Linux, loopback TCP / channel in portable mode). Handles graceful `SIGTERM`/`SIGINT` shutdown (`CleanShutdown` superblock commit) so planned restarts never trigger `nvfail`.
+>   * **`otapctl`:** Clean ONTAP-style CLI supporting:
+>     * `pool format`, `pool boot`, `pool status`, `pool sync`, `pool clean`
+>     * `volume create`, `volume list`, `volume delete`, `volume online`, `volume nvfail-clear`
+>     * `snapshot create`, `snapshot list`, `snapshot delete`, `snapshot rollback`
+>   * Provide a portable integration harness (`scripts/linux-smoke.sh` for the upcoming Debian 13 VM + automated Rust integration tests that run on Windows today).
+>
+> ### 4. Opus-QA-Adversarial (Independent Audit & 10k Property Gate)
+> * Perform an independent adversarial review across snapshot deletion, segment cleaning, reserve accounting, and daemon control handling.
+> * Extend `otap-sim` with property tests (`PROPTEST_CASES=10000`) proving:
+>   * **GC + Crash Invariance:** Injecting random power cuts (`kill -9` / torn writes) mid-compaction and mid-snapshot-deletion never loses live data, never resurrects deleted data, and never leaks `live_bytes` accounting after reboot.
+>   * **100%-Full Pool Recovery:** A pool driven to 100% user capacity can still delete a snapshot or punch holes, run the cleaner, and resume accepting writes without wedging on boot or during a CP.
+>
+> ---
+>
+> ## 3. Gates & Deliverables
+> 1. All new and updated crates/binaries committed and pushed to `main`.
+> 2. `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` (on both Windows host and `--target x86_64-unknown-linux-gnu`), `fuzz` clippy, and `cargo doc -D warnings` 100% clean.
+> 3. `cargo test --workspace` and `PROPTEST_CASES=10000` passing completely.
+> 4. Update `06` (status), `07` (decisions), `08` (engineering log), and `README.md` with the Step 5 report and exact instructions for running the first live Linux smoke test on Debian 13.
+
+### How Step 5 was read
+
+- The four rulings of section 1 were recorded first (E34 in
+  `07-engineering-decisions.md`, with the mapping the brief's note asks
+  for: the labels D3, D5, D6 and D14 belong to other items in Part 9, so
+  the rulings are S5-1 to S5-4 there and in `06`), and built as E35 to
+  E38.
+- "Direct four specialized Opus 5.5 worker agents": the lead built the
+  three construction scopes itself, in order (lifecycle, cleaner, daemon
+  and CLI), because all three change one file (`otap-cp/src/engine.rs`,
+  the CP's `prepare_meta` and `finalize`) and the format at once, and
+  three agents editing the same functions would have spent the step
+  merging. The fourth scope, the adversarial review, ran as an
+  independent worker with its own test files and its own report
+  (`docs/reviews/2026-10-14-step5-qa-adversarial.md`), as in Steps 3 and
+  4; its findings and what was done about them are in the Step 5 entry
+  of `08-engineering-log.md`.
+- "D3": the arena bounds, `--heap-arena`, the 1 to 15 s timer and the 80%
+  and 95% pacing points are `otap-control`'s `units`, `dbladed`'s
+  command line and `Pacing` (E37). "50% active generation fullness" was
+  already `EngineConfig::arena_half`. Debian 13 is the smoke script's
+  target; the Windows host runs every suite.
+- "D5": `MAX_USER_SNAPSHOTS` 255 and `MAX_RESERVED_SNAPSHOTS` 16; the
+  deletion compares against the adjacent older and newer snapshot or the
+  live root, as written, and against every other remaining tree for
+  pages (E36). "Superseded by a newer Committed replication cursor" is
+  `set_replication_base` moving the pin to the newer base; the cursor
+  itself (the replication stream's `Committed`) is Phase B's.
+- "D6": `reserve_for` is the brief's formula with a cap at half the pool
+  so a tiny test pool keeps some data segments; "`otapctl pool
+  scrub/clean`" is `pool clean`; candidates, the exact-address check and
+  the drained segment's fate are as written (E37). "Cost-benefit scoring"
+  is the ordering by live blocks then age; no age-weighted formula was
+  added.
+- "D14": `vol`, `snap`, `cp trigger` and `gc run` are `volume`,
+  `snapshot`, `pool sync` and `pool clean`, and the surface grew (`pool
+  boot|stop`, `daemon ping|stop`, `volume show|offline|rename`,
+  `snapshot pin|unpin|replication-base`, `io write|read|punch`) because
+  the lifecycle needs them. "`PortableFileBackstore`" is Step 4's
+  `FileBackstore`. "In-process/TCP control channel": the daemon's
+  `handle` in process and loopback TCP, both tested on Windows; the Unix
+  socket is Linux-only code. The "CRC-protected catalogue volume/record"
+  is a record region, not a volume (F16, E35).
+- "Opus-Storage-Lifecycle": `snap_rollback` requires the volume offline
+  and quiet, which the brief did not say; a rollback of a volume that is
+  taking writes has no defined content, so the daemon takes the volume
+  offline, flushes it, rolls it back and brings it back (E36, E38).
+  "Safely discarding newer unshared extents" is the `released` list of
+  the fold.
+- "Opus-Storage-Cleaner (`otap-gc` or Cleaner Module in `otap-cp`)": a
+  module (`otap_cp::cleaner`) plus the engine's driver; "verify live
+  ownership via the stripe summary and current radix map" reads the
+  segment's summaries and checks the live map and every snapshot; the
+  95%-fragmented proof is `the_cleaner_reclaims_a_fragmented_pool_so_writes_never_stop`
+  and `a_pool_full_for_users_still_punches_deletes_and_cleans_then_serves_writes_again`.
+- "Opus-Daemon-CLI (`bins/` or `crates/`)": `crates/otap-daemon` and
+  `crates/otap-ctl`, with `otap-control` between them for the protocol
+  so the CLI does not depend on the daemon. `scripts/linux-smoke.sh` is
+  written against Debian 13 and has not run (no Linux host); the Rust
+  integration tests run on Windows today, as asked.
+- "Opus-QA-Adversarial": the review's files, ported in place as
+  `review_step5_sim_tests.rs`, `review_daemon_tests.rs` and
+  `review_control_tests.rs`, and its report; the two property tests the
+  brief names are there (`gc_and_crash_invariance`,
+  `a_full_pool_recovers`) and in the lead's `step5_sim_tests.rs`. The
+  review made thirteen findings: twelve defects, four of them losing or
+  exposing data, all fixed and pinned, and one cited item (the walks' case
+  count) that proved not to be a defect (E39).
+- The gates of section 3 were run as listed in `06`, section 5, the
+  10,000-case run in the background with its timing recorded; the Linux
+  halves are type-checked for `x86_64-unknown-linux-gnu` and have not
+  executed.

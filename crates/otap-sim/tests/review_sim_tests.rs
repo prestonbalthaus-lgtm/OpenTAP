@@ -698,6 +698,10 @@ fn a_policy_fold_that_does_not_fit_gives_way_to_a_plain_cp() {
     cfg.volumes = vec![(0, pages * PAGE), (1, 64)];
     cfg.fold = no_auto_fold();
     cfg.fold.max_dirty_pages = 32;
+    // The Step 4 regime this test pins: no reserve beyond the boot and
+    // shutdown commits, and no cleaner.
+    cfg.reserve_segments = Some(0);
+    cfg.cleaner.background = false;
     let mut s = sim_with(cfg);
     s.boot().unwrap();
     // Fill the data segments to the metadata reserve, all committed.

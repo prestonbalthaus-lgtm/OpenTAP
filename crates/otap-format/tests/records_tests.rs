@@ -423,7 +423,7 @@ fn format_2_1_sizes_alignments_and_offsets() {
     assert_eq!(offset_of!(SnapRootPage, crc32c), 4092);
     assert_eq!(CPDIR_MAGIC, u32::from_le_bytes(*b"OTCD"));
     assert_eq!(SNAPROOT_MAGIC, u32::from_le_bytes(*b"OTSR"));
-    assert_eq!(FORMAT_VERSION, 0x0202);
+    assert_eq!(FORMAT_VERSION, 0x0203);
 }
 
 fn root_ref(i: u64) -> RootRef {
@@ -464,8 +464,10 @@ fn cp_log_dir_pages_round_trip_and_refuse_bad_entries() {
         bad.verify(),
         Err(FormatError::BadField { field: "count", .. })
     ));
-    // The fold never lies ahead of the CP, and fold pages belong to the fold
-    // CP only.
+    // The fold never lies ahead of the CP. Page entries in a CP that is not
+    // the fold were refused by format 2.1 and 2.2; since 2.3 (F18) any CP
+    // may list the map pages it wrote (a relocation rewrites a snapshot's
+    // pages), so the header accepts them.
     let mut bad = page;
     bad.hdr.fold_cp_seq = 43;
     bad.seal();
@@ -476,16 +478,10 @@ fn cp_log_dir_pages_round_trip_and_refuse_bad_entries() {
             ..
         })
     ));
-    let mut bad = page;
-    bad.hdr.page_entries = 1;
-    bad.seal();
-    assert!(matches!(
-        bad.verify(),
-        Err(FormatError::BadField {
-            field: "page_entries",
-            ..
-        })
-    ));
+    let mut later = page;
+    later.hdr.page_entries = 1;
+    later.seal();
+    assert!(later.verify().is_ok());
     let mut bad = page;
     bad.hdr.count = CP_LOG_DIR_ENTRIES as u16 + 1;
     bad.seal();
@@ -557,14 +553,17 @@ fn a_cp_log_directory_encodes_across_pages_and_decodes_to_the_same() {
             ));
         }
     }
-    // Pages outside the fold CP, and a fold ahead of the CP, never encode.
-    let bad = CpLogDir {
+    // Pages in a CP that is not the fold encode since format 2.3 (F18: a
+    // relocation rewrites a snapshot's pages in any CP); a fold ahead of
+    // the CP never encodes.
+    let later = CpLogDir {
         cp_seq: 10,
         fold_cp_seq: 9,
-        deltas: vec![],
+        deltas: vec![root_ref(3)],
         pages: vec![root_ref(1)],
     };
-    assert!(bad.encode(uuid(5)).is_err());
+    let bytes = later.encode(uuid(5)).unwrap();
+    assert_eq!(CpLogDir::decode(&bytes, &uuid(5)).unwrap(), later);
     let bad = CpLogDir {
         cp_seq: 10,
         fold_cp_seq: 11,

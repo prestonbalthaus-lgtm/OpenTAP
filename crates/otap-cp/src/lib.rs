@@ -90,6 +90,7 @@
 #![warn(rust_2018_idioms, unreachable_pub)]
 
 pub mod boot;
+pub mod cleaner;
 pub mod engine;
 pub mod layout;
 pub mod meta;
@@ -97,10 +98,12 @@ pub mod segments;
 pub mod traits;
 
 pub use boot::{BootError, BootSnapshot, BootState, TornReason};
+pub use cleaner::{CleanTarget, CleanerPolicy, RelocBlock, Scan, SkipReason};
 pub use engine::{
-    BootFailure, CpTrigger, Engine, EngineConfig, EngineError, Event, FoldPolicy, OperatorWarning,
-    PeekSource, Phase, PoolStatus, SnapshotInfo, Stats, VolumeSpec, VolumeStatus, MAX_PUNCH_BLOCKS,
-    MAX_REQUEST_BLOCKS, META_RESERVE_SEGMENTS,
+    reserve_for, BootFailure, CpTrigger, Engine, EngineConfig, EngineError, Event, FoldPolicy,
+    LivenessDrift, OperatorWarning, Pacing, PeekSource, Phase, PoolStatus, SnapshotInfo, Stats,
+    VolumeSpec, VolumeStatus, MAX_PUNCH_BLOCKS, MAX_REQUEST_BLOCKS, MAX_RESERVED_SNAPSHOTS,
+    MAX_USER_SNAPSHOTS, META_RESERVE_SEGMENTS,
 };
 pub use layout::{DiskLayout, LayoutError};
 pub use meta::{MetaError, MetaStream};

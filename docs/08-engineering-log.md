@@ -793,3 +793,239 @@ private folder was removed.
   durability defects of the Step 4 review were all in the boot, which
   the lead's own suites exercised through the simulator's crashes but
   never with a fold as the newest CP.
+
+## 2026-10-14: Phase C Step 5, snapshot deletion, the cleaner, `dbladed` and `otapctl`
+
+The brief (`10-phase-c-step-briefs.md`, "Step 5 brief") opened with four
+owner rulings labelled D3, D5, D6 and D14 that settle the arena bounds and
+the CP cadence, snapshot deletion and pins, the cleaner and its reserve,
+and the daemon with its catalogue; the labels belong to other items in
+Part 9, so they are recorded as S5-1 to S5-4 (E34) with the mapping, and
+`06` says which Part 9 decisions remain open. The three construction
+scopes were built by the lead in sequence, because they all change the
+CP's `prepare_meta` and `finalize` and the format at once; the fourth, the
+adversarial review, ran as an independent worker. How each phrase of the
+brief was read is the note at the end of the Step 5 brief in `10`.
+
+### What was built
+
+- **Format 2.3** (E35; F16 to F18 in the crate root): the name catalogue
+  (512-byte CRC-sealed records, canonical order, unique names per scope),
+  the commit's stripe list (what the boot verifies instead of deriving the
+  stripes from births, which a relocation stripe hides), `VOL_OFFLINE`,
+  and page entries allowed in any CP's directory. New vector set
+  `v2.3/` (sixteen images), manifest pinned; 2.0 to 2.2 keep decoding in
+  their lanes; the engine boots 2.3 pools only (nothing was released).
+- **The map** gained rollbacks, resizes and deletions in `CpInput` (each
+  needs a fold), the `released` list, a tolerant `collect_entries` and
+  `rewrite_pinned` (a snapshot's tree with new addresses and the same
+  births, for relocation), with a model test of each.
+- **The lifecycle** (E36): deletion releases exactly the blocks the
+  snapshot alone referenced, judged against the adjacent older and newer
+  snapshot or the live map; pins (`PIN_USER`, `PIN_SCHEDULE`, `PIN_CLONE`,
+  `PIN_REPLICATION`) refuse deletion, and the replication base supersedes
+  its predecessor; 255 user snapshots and 16 reserved slots per volume;
+  rollback at a fold with the generation bumped and the snapshot's size
+  restored; grow online, shrink offline; deletion of a volume; offline
+  volumes persisted; named volumes and snapshots; `audit_liveness`.
+- **The cleaner, the reserve, admission and pacing** (E37):
+  `reserve_for = min(max(8, n/12), n/2)` kept from front-door writes with
+  E31's two-segment floor inside it; the admission rule answering
+  `NoSpace` before anything is placed; pacing from 80% arena occupancy
+  with a stall at 95%; the cleaner at 70% utilisation, when the pool is
+  tight, or on request, two segments per CP (four when tight), candidates
+  by live blocks then age below 80% live, the exact-address check, relocation
+  stripes keeping births and CRCs, snapshot trees rewritten, drained
+  segments freed and discarded; the full-pool pump.
+- **The daemon and the CLI** (E38): `otap-control`, `otap-daemon`
+  (`dbladed`), `otap-ctl` (`otapctl`), `scripts/linux-smoke.sh`.
+- **The simulator** learned deletions (requested and confirmed), online and
+  offline, rollbacks with the issued-operation semantics (a rollback that
+  may or may not have landed is explained like a punch), resizes,
+  deletions of volumes, `request_clean`, `audit_liveness` in every
+  recovery, pacing with a zero delay (its clock does not advance by
+  itself), and a model that answers through rollbacks and resizes.
+
+### Defects the lead's suites found before the review
+
+1. **A snapshot taken in the same CP as a deletion lost blocks.** The
+   deletion's "is this block still referenced" question was asked of the
+   snapshot set *after* the CP, in which the new snapshot did not yet
+   appear with its entries, so blocks the new snapshot had just pinned
+   were released: a liveness leak the random walk's `audit_liveness`
+   caught. The comparison runs against the remaining set, new snapshots
+   included.
+2. **The cleaner chased its own tail.** A segment filled by relocation
+   stripes (full but for the slack of partial stripes) was the next CP's
+   best candidate, so the cleaner moved the same blocks every CP. A
+   candidate must be below 80% live (`CleanerPolicy::max_live_fraction`).
+3. **A rollback kept the volume's current size** when the snapshot had
+   been taken at another size; the rollback restores the snapshot's size.
+4. **A grow refused a CP that also carried the volume's deltas**; only a
+   shrink, a rollback and a deletion need a volume with no deltas.
+5. **Harness races**: the harness issued the next request before the engine
+   was quiet, so the CP it saw commit was not always the one that took the
+   request; `request_cp`, `request_fold` and `request_clean` wait for
+   `is_quiet()` first, and a boot that disagrees with the disk's volume
+   size takes the disk's.
+6. **Two protocol facts serde only reports at run time**, found by the
+   round-trip test of every reply: an internally tagged enum cannot
+   serialize a newtype variant holding a bare sequence (the list replies
+   became struct variants), and a report field named `kind` collides with
+   the tag (the snapshot's became `consistency`). The server now answers
+   an error reply when a reply does not encode instead of dropping the
+   connection.
+
+### The review
+
+The independent review (an Opus worker, "Opus-QA-Adversarial", 41 minutes
+of wall time) read the brief and the rulings, wrote 32 tests of its own in
+three files, and handed back a report
+(`reviews/2026-10-14-step5-qa-adversarial.md`) with thirteen findings:
+twelve defects reproduced by fifteen failing tests and one cited item that
+proved not to be a defect; twelve hazards it saw but did not test; and the
+two property tests the brief names, both passing (at 1,000 cases there; at
+10,000 in the gate below). Its verdict was that Step 5 was not ready to
+commit, and it was right. In its severity order, with what was done (E39):
+
+1. **D1, data loss.** A rollback asked for while a cleaning CP staged rode
+   that CP with the snapshot's root as it was before the relocation; the
+   drained segment was freed under the volume. Fixed: a CP with clean
+   targets takes no volume operation and no deletion; they wait for the
+   next CP (two-sided exclusion).
+2. **D2, data loss.** A rollback was accepted while a snapshot of the
+   volume rode the CP in flight (in neither the committed list nor the
+   waiting requests), the history forked, and deleting the target later
+   released blocks the live map named. Fixed: `snapshot_in_flight` covers
+   the job's requests; rollback, resize and deletion refuse with
+   `VolumeBusy`.
+3. **D3, data loss.** A stripe summary that failed its CRC was skipped as
+   never written and the segment drained anyway, freeing live blocks.
+   Fixed: zeros are absence, anything else is damage and skips the
+   segment; a scan that finds fewer referenced blocks than the table
+   counts skips it too.
+4. **D4, exposure.** A volume deletion accepted while a snapshot of it was
+   in flight left a snapshot of an absent volume for the next volume at
+   that index to inherit. Fixed as D2.
+5. **W1, wedge.** Deleting a snapshot that mapped a block beyond its
+   since-shrunk volume failed every CP from then on; in the daemon the
+   planned stop became a dirty boot. Fixed: `OutOfRange` means "not
+   referenced" in the deletion's lookups (a damaged newer neighbour makes
+   the deletion release nothing).
+6. **W2, wedge.** Cleaning blocks that 160 snapshots shared needed
+   metadata the plan never budgeted; CPs failed for space, the pool was
+   marked full while writes were still admitted, and every retry consumed
+   segments the failure never returned (free fell 10, 7, 4). Fixed four
+   ways: the plan counts the rewrites' metadata; snapshots sharing a tree
+   are rewritten once; a cleaning CP that fails for space blocks the plan
+   until a free; a failed attempt's data segments are freed at once.
+7. **W3, wedge.** A deletion or a volume operation asked for while a
+   cleaning CP staged failed the tick (`relocation for snapshot N, which
+   is gone`; `volume has deltas in the CP that carries its delete`) and the
+   CP's snapshot requests were dropped unanswered; the review's full-pool
+   property found it on its own. Fixed as D1.
+8. **W4, wedge.** One damaged byte in the catalogue tore every candidate
+   of the ring: no boot. Fixed: the boot drops the names with a warning
+   (`CatalogDamaged`), the next naming CP writes a fresh region, and a
+   nameless volume is `#<index>` to the daemon.
+9. **W5.** The daemon's probe read the two `A` slots only and refused a
+   pool whose start was wiped, which the engine boots from the `B` slots.
+   Fixed: the probe covers the ring.
+10. **R1.** `snapshot rollback --delete-newer` deleted snapshots one by one
+    until it met a pinned one, with the earlier ones gone. Fixed: every
+    newer snapshot is checked first; the deletions go together.
+11. **R2.** `pool format` without `--force` overwrote any file or device
+    that was not already a pool. Fixed: a non-blank first or last MiB is
+    refused.
+12. **R3.** A misspelled optional field decoded as its absence (`nmae`
+    released the replication base). Fixed: `deny_unknown_fields` on every
+    protocol type.
+13. **C1 (cited), not a defect.** The Step 4 and Step 5 random walks set
+    `cases: 64` in their `proptest!` configuration, and the review concluded
+    that the 10,000-case gate had run them at 64. The lead accepted the
+    reading and made both walks read `PROPTEST_CASES` themselves (64 the
+    default); the gate then disproved the finding: `step4_sim_tests` took
+    53 minutes, against 52 in the Step 4 gate and 20 seconds at 64 cases,
+    so the walks had run at 10,000 all along. The `proptest!` macro passes
+    an explicit configuration through proptest's `contextualize_config`,
+    which applies `PROPTEST_CASES` over any explicit count. The change
+    stays, as the visible statement of the intent; it changed nothing.
+
+Of the twelve hazards, nine were closed with the review (the full-pool pump
+for a pending deletion, `pool sync` and `pool clean` on a full pool, a
+signal interrupting a long request, loopback-only TCP, the 4 MiB frame
+bound and the idle timeout, the linear catalogue check, a deletion next to
+a damaged snapshot, `snapshot create` matched by uuid, the arena ceiling,
+the client's timeout); two are recorded as limits in `06` (relocated
+blocks and rewritten roots under a trusted opaque barrier); one (the
+catalogue and snapshot table rewritten whole) joins the incremental-tables
+item of Step 6.
+
+The review's files were ported in place as `review_step5_sim_tests.rs`
+(18 tests, the two properties included), `review_daemon_tests.rs` (9) and
+`review_control_tests.rs` (5): the fifteen `bug_*` tests took names that
+state the fixed behaviour and a note naming their defect; their scenarios
+and assertions are the reviewer's. Every one passes.
+
+### Dependencies added
+
+`serde` 1.0.229 (with `derive`), `serde_json` 1.0.154 and `signal-hook`
+0.4.5, pulling in `serde_core`, `serde_derive`, `signal-hook-registry`,
+`itoa`, `ryu`, `memchr` and `zmij`; every one MIT OR Apache-2.0 except
+`ryu` (Apache-2.0 OR BSL-1.0) and `memchr` (Unlicense OR MIT), checked in
+the registry sources on 2026-10-14. `otap-control` depends on
+`otap-format` for `BLOCK_SIZE` and the `PIN_*` bits so no client redefines
+them.
+
+### Gates
+
+**Gates (2026-10-14).** fmt clean (workspace and fuzz); clippy clean on
+the host, on `x86_64-unknown-linux-gnu` (the Linux halves of `otap-sys`,
+`otap-backstore`, `otap-ublk` and `otap-daemon` included) and on the fuzz
+crate; rustdoc clean with warnings denied; `cargo test --workspace`: 541
+tests and 2 doctests passed, 0 failed, 1 ignored (the vector writer), in
+3 min 13 s. `PROPTEST_CASES=10000 cargo test --workspace`: all 541 tests
+and 2 doctests passed, 1 ignored, in 179 min 46 s on this host
+(`step4_sim_tests` 53 min, `review_step5_sim_tests` 45 min, `map_tests`
+19 min, `adversarial_sim_tests` 17 min, `sim_tests` 15 min,
+`step5_sim_tests` 13 min; every other suite under six minutes), an hour
+longer than Step 4's run, which the two Step 5 simulator suites account
+for. Not run, for want of a Linux host: `scripts/linux-smoke.sh`, the ublk
+device, the hugetlbfs arena, the io_uring backstore and the fuzz targets.
+
+### Lessons
+
+- A `perl -pi -e 's|a\|b|c|'` substitution with `|` as the delimiter turns
+  every `\|` inside the pattern into a regex alternation (the escaped
+  delimiter is stripped first), and an empty alternative matches at
+  position 0: two source files were corrupted at their first line before
+  the mistake was seen. Use `/` as the delimiter and escape it, or splice
+  whole blocks from files; and run `cargo check` after any scripted edit
+  before doing anything else.
+- An internally tagged serde enum is a contract with two hidden clauses
+  (no bare sequences in newtype variants, no field named like the tag);
+  a test that round-trips every variant is the only thing that enforces
+  them.
+- A layout fact needs an oracle, again: a 128 MiB file under 2 MiB
+  segments holds 63 segments, not 64, because the first region is the
+  superblock ring; two tests had the number from arithmetic.
+- The cleaner needs a stopping rule as much as a starting rule: without
+  the live-fraction bound every "successful" cleaning manufactured the
+  next candidate.
+- When a deletion compares against "the other snapshots", the set must be
+  the one the CP commits, new snapshots included: the leak was in the
+  choice of set, not in the comparison.
+- A consistency point decides about shared state at three moments (the
+  cleaner plans at the cut, deletions and volume operations are taken at
+  the metadata, an in-flight snapshot counts at the commit); the review
+  found four data-losing defects in the gaps between them. Every decision
+  a CP makes about shared state is made against one view, or refused until
+  the view settles: a request that arrives after the plan waits for the
+  next CP.
+- A guard that checks "nothing waits" must count what the CP in flight
+  already took: the waiting list and the committed list are two of three
+  places a request can be.
+- A cited finding earns the same scrutiny as a reproduced one. C1 was
+  accepted on its reading and "fixed" before anyone measured it; the gate's
+  own timings, in the Step 4 log all along, disproved it. The lapse was the
+  lead's acceptance without a test, not the reviewer's reading.

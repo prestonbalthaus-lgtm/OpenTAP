@@ -1382,10 +1382,19 @@ fn multi_page_walk(seed: u64, ops: &[WalkOp]) -> Result<(), String> {
     Ok(())
 }
 
+/// The case count: `PROPTEST_CASES` when set (the 10,000-case gate), else
+/// `default` for the plain run.
+fn proptest_cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: None,
-        cases: 64,
+        cases: proptest_cases(64),
         max_shrink_iters: 512,
         ..ProptestConfig::default()
     })]

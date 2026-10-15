@@ -1017,3 +1017,519 @@ the refusal in E19.
   sizes a block device by its end and refuses an empty write.
 - **Enforced by** `crates/otap-geom/src/lib.rs`, `otap-cp/src/layout.rs`,
   `otap-backstore/src/file.rs`, the review's test files.
+
+## E34. The owner's Step 5 rulings (arena and CP cadence, snapshot deletion, the cleaner, the daemon) and how their labels map onto Part 9
+
+2026-10-14. Accepted (the owner's Step 5 brief, section 1; the brief is
+verbatim in `10-phase-c-step-briefs.md`).
+
+- **Context.** The Step 5 brief opens with four binding rulings labelled
+  D3, D5, D6 and D14 and asks that they be recorded before any Step 5
+  code, adding: "If your internal numbering in `05`/`06` assigns any
+  adjacent scope to D3, D5, D6, or D14, map the corresponding ruling
+  above and document the mapping cleanly in `07`." The numbers do not
+  match Part 9 of `05-architecture-brainstorm-03.md`, where D3 is the
+  v0.1 control-plane store (redb behind `StateStore`), D5 the nvfail
+  class table, D6 the identity after an unplanned failover and D14
+  `nvfail_force_lag`. None of those four is answered by the brief. The
+  brief's rulings are recorded here as **S5-1 to S5-4**, each with the
+  Part 9 or round-3 item it actually touches.
+- **S5-1 (the brief's "D3"): arena sizing, the hugepage fallback, CP
+  cadence, the platform baseline.** The production arena stays an 8 GiB
+  hugetlbfs arena of 2 MiB pages; `dbladed` must take any arena size
+  down to 64 MiB and a `--heap-arena` flag (aligned heap memory, no
+  hugepage reservation) for homelab hosts and CI VMs. The CP timer
+  defaults to 5 s, configurable 1 to 15 s, or 50% active-generation
+  fullness; back-pressure paces writes from 80% arena fullness and stalls
+  them at 95%. Debian 13 (Trixie, kernel 6.12 or later) is locked as the
+  Linux baseline and the Windows host remains a mandatory test target.
+  Part 9 mapping: not D3. It settles the arena arithmetic of sections 1.3
+  and 6.4 ("every size in the memory table is a profile value"), the CP
+  interval rule, the CI image of section 8.3 and the back-pressure delay
+  curve of week 6. A heap arena does not survive the daemon: a crash
+  under `--heap-arena` is a dirty boot that holds the write-active
+  volumes under nvfail, which the flag's documentation says; a clean
+  shutdown is unaffected. Part 9's D3 (the control-plane store) stays
+  open: Step 5's daemon keeps every durable fact in the pool (S5-4's
+  catalogue) and holds no store of its own, which narrows what a later
+  `StateStore` has to persist.
+- **S5-2 (the brief's "D5"): snapshot deletion, retention, replication
+  pinning.** Up to 255 user snapshots per volume plus reserved slots for
+  replication baselines. Deleting a snapshot unpins its record at the
+  next CP and decrements `SegEntry::live_bytes` exactly for the extents
+  the snapshot alone referenced, judged against the adjacent older and
+  newer snapshots or the live root, never touching a shared block. A
+  snapshot pinned as a replication base (`PIN_REPLICATION`) refuses user
+  deletion with a clear error until it is unpinned or superseded by a
+  newer base. Part 9 mapping: not D5 (nvfail classes). It closes the
+  deletion item E25 left open and the "space a snapshot pins returned on
+  deletion" item of week 7; the design is E36.
+- **S5-3 (the brief's "D6"): the segment cleaner and the reserve.** A
+  hard floor of `max(8, total_segments / 12)` free segments is kept from
+  front-door writes and reserved for the cleaner's relocation and the
+  metadata of folds, so a pool that is full for users can still commit
+  the CPs that delete a snapshot, punch holes or compact a segment.
+  Background cleaning starts above 70% segment utilisation or on
+  `otapctl pool clean`; candidates are data segments ordered by lowest
+  `live_bytes`, ties to the oldest `birth_cp`. A live block is relocated
+  only when the volume and LBA still map to the exact `(lseg, off)` being
+  cleaned, the remapped extents commit through the normal CP, and the
+  drained segment becomes `Free` (discarded whole on flash, overwritten
+  on rotational media). Part 9 mapping: not D6 (failover identity). It
+  settles the week 7 to 8 cleaner and the GC posture the round-3 audit
+  had listed as deferred ("cost-benefit GC with relocation tables"):
+  the cost-benefit order is adopted, the relocation tables are not. A
+  drained segment is freed, so `SegState::Relocated` and
+  `Superblock::reloc_index` stay reserved and unused; the design is E37.
+- **S5-4 (the brief's "D14"): `dbladed`, the control IPC, `otapctl`,
+  the catalogue.** The whole management lifecycle (`pool format`, `pool
+  boot`, `pool status`, `pool sync`, `pool clean`; `volume create`,
+  `list`, `delete`, `online`, `nvfail-clear`, with resize; `snapshot
+  create`, `list`, `delete`, `rollback`; a CP trigger and a GC run) runs
+  end to end on Linux (`UringBackstore` and ublk) and on the Windows and
+  portable harness (`FileBackstore`, an in-process or loopback TCP
+  control channel). The daemon handles `SIGTERM` and `SIGINT` with a
+  clean shutdown (the `CleanShutdown` commit) so a planned restart never
+  trips nvfail. Human-readable volume and snapshot names are persisted
+  in a CRC-protected catalogue record in the pool so they survive
+  reboots and crashes. Part 9 mapping: not D14 (`nvfail_force_lag`). It
+  settles week 6 (`dbladed`), the `otapctl` surface of R56 for a single
+  node, and amends F11: names are on disk now (F16, format 2.3), which
+  removes the obligation `06`, section 8, placed on the control plane.
+- **Consequences.** D3, D5, D6 and D14 of Part 9 remain unanswered; the
+  status document says so in its section 6. The brief's numbering is
+  kept in `10-phase-c-step-briefs.md` as written and is referred to here
+  only as S5-1 to S5-4.
+
+## E35. Format 2.3: the catalogue, the commit's stripe list, offline volumes, and pages in any directory
+
+2026-10-14. Accepted (Step 5; S5-4 for the catalogue, S5-3 for the stripe
+list and the relaxed directory; the rulings are F16 to F18 in the crate
+root of `otap-format`).
+
+- **Context.** F11 kept names off disk and made them the control plane's
+  problem; S5-4 puts them in the pool. The cleaner writes relocation
+  stripes whose blocks keep their old `birth_cp` and CRC (E37), so the
+  Step 4 boot rule "derive the stripes a CP wrote from the births in its
+  records and pages" (E30) cannot see a relocation stripe at all. A
+  rollback, a shrink and a deletion need the volume offline, and offline
+  has to survive a reboot. And a CP that relocates blocks a snapshot
+  references rewrites that snapshot's map pages outside a fold, which F12
+  forbade.
+- **What changed.** `FORMAT_MINOR` is 3 (`0x0203`). The superblock gains
+  `catalog: RootRef` at byte 1,728 and `cp_stripes: RootRef` at 1,744;
+  `reserved` shrinks to 2,332 bytes; `VolState` gains `VOL_OFFLINE`
+  (bit 1). Two new region types: the catalogue, 512-byte `CatalogRec`s
+  (kind, name length, flags, volume, snapshot uuid, creation time, a
+  255-byte name field, 221 reserved bytes, a CRC) in a canonical order
+  with unique keys and unique names per scope, names of 1 to 255 bytes of
+  UTF-8 without control characters or `/`; and the stripe list, 16-byte
+  `CpStripe`s `(pseg, idx, kind)` in strictly ascending order, at least
+  one when the root is not `NONE`. `CpLogDirHdr::verify` and
+  `CpLogDir::encode` no longer insist that `page_entries` is zero outside
+  a fold.
+- **What the boot does with them.** It verifies every stripe the list
+  names by summary CRC and identity (the CP's nonce included) before it
+  trusts the candidate, and no longer walks births for the purpose; it
+  verifies the directory's pages in every CP, not only the fold's; it
+  loads the catalogue and the offline flags with the roots. A catalogue
+  or stripe-list region that does not verify tears the candidate like any
+  other root region (E30).
+- **A 2.2 pool is refused.** The engine boots 2.3 pools only
+  (`BootError::OldLayout`, "this release reads 2.3 and later"): a 2.2 pool
+  has no stripe list to verify and no catalogue, and nothing was ever
+  released, so no upgrade path is written. The format crate still decodes
+  the 2.0, 2.1 and 2.2 vector sets in their lanes, which is what the
+  "any minor of its own major" rule of `09`, section 5, protects; the
+  engine's refusal is recorded here as the exception. The 2.3 set is
+  `crates/otap-format/tests/vectors/v2.3/` with its manifest hash pinned
+  in `format_tests.rs`; the older directories stay.
+- **Consequences.** The control plane owes nothing for names any more
+  (`06`, section 8, drops the F11 obligation). `SegState::Relocated` and
+  `Superblock::reloc_index` stay reserved and unused (E34, E37). Any
+  later field takes bytes from `reserved` and bumps the minor again.
+
+## E36. Snapshot deletion, pins, rollback, resize, deletion and offline: how the lifecycle is built
+
+2026-10-14. Accepted (Step 5, S5-2 and the "Opus-Storage-Lifecycle" scope
+of the brief; closes the deletion item E25 left open).
+
+- **Deletion releases exactly what the snapshot alone referenced.** A
+  request (`delete_snapshot`) marks the snapshot and asks for a CP; any
+  CP may carry it, a fold is not needed. In `prepare_meta` the deletions
+  are processed in id order against a *remaining* set that shrinks as each
+  is taken out: for each deleted snapshot the engine walks its pinned
+  tree and releases every data entry born after the next older snapshot
+  of the volume (what that older one shares, it keeps) which the next
+  newer snapshot, or the live map when there is none, does not name at
+  the same physical address; `data_live` of the segment goes down by exactly those blocks
+  and `audit_liveness` (a walk of every tree, counting per segment) checks
+  the result in every simulator recovery. Map pages and page indexes the
+  snapshot pinned are freed under one uniform rule (`page_referenced`,
+  `index_referenced`, deduplicated by address), so a page shared with a
+  neighbour is never freed. The record leaves the snapshot table with the
+  commit (`Event::SnapshotDeleted { released }`), and the catalogue entry
+  with it. A damaged snapshot (its root page or index did not verify at
+  boot) releases nothing when deleted, the safe direction, and the
+  engine records an `Internal` event; the blocks leak until a repair.
+- **A snapshot taken in the same CP as a deletion sees the new entries.**
+  The first version compared the deleted tree against the snapshots as
+  they were *after* the CP, which let a new snapshot's blocks count as
+  unshared and be released: the one accounting leak the lead's own audit
+  found. The comparison runs against the remaining set, new snapshots
+  included (`pinned_by(&remaining, ..)`), and the random walk pins it.
+- **Pins.** `PIN_USER`, `PIN_SCHEDULE`, `PIN_CLONE` are the operator's;
+  `PIN_REPLICATION` marks the replication base. `delete_snapshot`
+  refuses while any pin bit is set (`EngineError::SnapshotPinned`, with
+  the bits, "unpin it or supersede the replication base").
+  `set_snapshot_pins` records a change for the next CP
+  (`Event::SnapshotPinned`); `set_replication_base(vol, Some(id))` sets
+  the bit on the new base and clears it on the volume's previous base in
+  the same CP, so a newer committed base supersedes the old one and the
+  old one becomes deletable; `None` releases the base. Pins live in
+  `SnapRecord::flags` (format 2.0's field, used at last).
+- **Limits.** A volume holds at most 255 user and scheduled snapshots
+  (`MAX_USER_SNAPSHOTS`) and 16 replication baselines and divergent heads
+  (`MAX_RESERVED_SNAPSHOTS`), pending requests counted
+  (`EngineError::SnapshotLimit`).
+- **Rollback.** `rollback_volume(vol, snap)` needs the volume offline,
+  with nothing of it in the arena or in a CP in flight (`VolumeOnline`,
+  `VolumeDirty`), the snapshot its own and readable, and no newer
+  snapshot of the volume (`NewerSnapshots`: delete them first, which
+  `otapctl snapshot rollback --delete-newer` does). It is done at the
+  next CP, a fold: the live root and index become the snapshot's
+  (checkpointed at this CP), every live entry born after the snapshot is
+  released (`PreparedCp.released`), the volume's size becomes the
+  snapshot's, and the rollback generation moves on so a client sees a new
+  identity (section 7.6), `Event::VolumeRolledBack`. The CP refuses
+  deltas of the volume. The daemon's rollback takes the volume offline,
+  flushes it with a CP, waits for quiet, asks, waits for the event and
+  brings the volume back (E38).
+- **Resize.** A grow is allowed online and may share its CP with the
+  volume's deltas; the index is extended with `NONE` entries. A shrink
+  needs the volume offline and quiet, releases everything at or beyond
+  the new end and rewrites the boundary page with the entries beyond it
+  zeroed. Either way the index is rewritten at a fold,
+  `Event::VolumeResized`.
+- **Deletion of a volume.** Offline, quiet, no snapshots
+  (`HasSnapshots`); at a fold everything the volume mapped is released,
+  its root, index and catalogue entry go, and its index number may be
+  reused (`Event::VolumeDeleted`). Volumes are created by name at the
+  lowest free index (`create_named_volume`) and renamed in place.
+- **Offline.** `set_volume_online(vol, false)` is immediate: the engine
+  answers `Status::Offline` (the ublk door maps it to `ENODEV`) and the
+  next CP records `VOL_OFFLINE` so a reboot keeps it. A volume with a
+  pending rollback, resize or deletion cannot be brought online until the
+  operation commits, and only one such operation waits per volume
+  (`VolumeBusy`); the pending operation is dropped if its snapshot
+  vanishes before the CP.
+- **Rejected alternatives.** Deadlists (E25's plan: a per-snapshot list
+  of blocks it alone owns, maintained on every write) were not built: the
+  neighbour comparison at deletion time costs a walk of three trees once
+  per deletion and keeps the write path untouched, and the format's
+  `SnapRecord::deadlist` field stays reserved. A rollback that keeps the
+  newer snapshots (branching the volume) was not built: it would need
+  the newer trees to become orphans with their own roots, which is a
+  clone, not a rollback.
+
+## E37. The cleaner, the reserve, admission and pacing: how a full pool keeps working
+
+2026-10-14. Accepted (Step 5, S5-1 for pacing, S5-3 for the reserve and
+the cleaner; closes the "nothing frees a data segment with a live block"
+limit of `06` and the dead-segment item of E31).
+
+- **The reserve.** `reserve_for(n) = min(max(8, n / 12), n / 2)` free
+  segments are kept from front-door writes (`EngineConfig::reserve_segments`
+  overrides it; the review tests of Step 4 pin the old regime with 0).
+  Inside it stays E31's hard floor of two segments
+  (`META_RESERVE_SEGMENTS`) that no allocation crosses, so a boot or a
+  shutdown commit always finds room. Metadata may dip into the reserve
+  above the floor by design: that is what it is for, so a CP that deletes
+  a snapshot, punches holes or relocates blocks always has its segments.
+- **Admission.** A write of `blocks` blocks is taken only when
+  `unflushed_blocks + blocks <= (free - reserve) * data_blocks_per_segment
+  + the open data segment's remaining blocks`; otherwise it is answered
+  `NoSpace` at once (`Stats::admission_refusals`) and nothing is placed.
+  `PoolStatus::admissible_blocks` is what clients may still write. The
+  rule counts what is acknowledged and not yet on disk, so a burst cannot
+  acknowledge more than the next CPs can place outside the reserve.
+- **Pacing.** `Pacing { pace_at: 0.80, stall_at: 0.95, max_delay_ns:
+  50 ms }`: from 80% arena occupancy an acknowledgement is delayed by a
+  quadratic curve to 50 ms at 95%, in a FIFO the engine completes on later
+  ticks; at 95% and above the acknowledgement waits until occupancy falls
+  (a CP). Reads are never paced. The simulator runs with
+  `max_delay_ns = 0` because its clock does not advance by itself; a
+  named test drives the curve.
+- **When the cleaner runs.** `CleanerPolicy { utilization: 0.70,
+  max_segments_per_cp: 2, background: true, margin_segments: 4,
+  max_live_fraction: 0.80 }`. `plan_clean` runs when a CP job starts
+  (never for the boot or shutdown commits, never while a snapshot
+  deletion or a volume operation is pending, never while a map page is
+  damaged): on request (`request_clean`, `otapctl pool clean`,
+  `CpTrigger::Clean`), or in the background when segments in use exceed
+  70% of the pool, or whenever the pool is *tight* (free segments down to
+  the reserve plus four), when the budget doubles. Candidates are data
+  segments ordered by lowest live blocks then oldest `birth_cp`, excluding
+  the open segment, segments protected since the boot, segments awaiting
+  a discard, dead segments, and segments the scan found uncleanable; a
+  segment above 80% live is not a candidate at all. The first version
+  had no such bound and chased its own tail: a segment filled by one
+  cleaning became the next cleaning's candidate.
+- **What a relocation does.** `cleaner::scan` reads the candidate's
+  stripes and, through the `References` trait, keeps only the blocks
+  whose `(vol, lba)` still maps to exactly this `(lseg, off)` in the live
+  map or in a snapshot, skipping blocks the same CP replaces and holes
+  (S5-3's "never overwrite a newer write"). The live blocks are written
+  as relocation stripes (`StripeKind::Relocate`) carrying their old
+  births and CRCs, their map entries are rewritten as deltas (live map)
+  or by `rewrite_pinned` with a new root page (snapshots), the CP lists
+  every stripe it wrote in `cp_stripes` (F17) so the boot verifies them,
+  and `data_live` moves from the old segment to the new. The drained
+  segment is forced to zero live (an `Internal` event records any drift)
+  and freed after the deferral like any other: a whole-segment discard on
+  flash, overwrite on rotational media. Relocation tables are not used
+  (E34): nothing on disk says a block moved; the map simply names the new
+  address.
+- **A full pool pumps itself.** `maybe_pump` runs consistency points of
+  its own (`CpTrigger::Clean`, no generation) while the pool is full or
+  tight and there is something to gain (deferred frees to advance, or
+  candidates to compact), at most three in a row until something is
+  freed, so a pool that refuses writes recovers without a client's help
+  and a boot on a full pool does not wedge. The space check before a
+  relocation (`free >= stripes needed + 1 + the floor`) keeps the pump
+  from eating the floor.
+- **What the tests prove.** A fragmented pool (4 KiB overwrites) at 95%
+  keeps accepting writes with the cleaner on and refuses them with it
+  off; a pool full for users still punches, deletes a snapshot, cleans
+  and serves writes again; relocation never clobbers a write that landed
+  since; the admission rule keeps the reserve free; the random walk mixes
+  cleaning, deletions, rollbacks and crashes with `audit_liveness` after
+  every recovery (`step5_sim_tests.rs`; the review's `review_step5_sim_tests.rs`).
+- **Limits.** The scan reads whole segments through the backstore and
+  compares against every snapshot tree; on a 100 TiB pool with many
+  snapshots that is the cost of a cleaning CP, and the incremental tables
+  of a later step are where it is paid down. The 80% bound means a pool
+  whose every segment is 80% to 100% live cannot be compacted, which is
+  the right answer (there is nothing to gain) but a pool can reach
+  `NoSpace` with free space scattered inside such segments.
+
+## E38. `dbladed`, the control protocol, `otapctl` and the catalogue in the daemon
+
+2026-10-14. Accepted (Step 5, S5-4 and the "Opus-Daemon-CLI" scope).
+
+- **Three crates.** `otap-control` (the protocol: `Request` and `Response`
+  as internally tagged JSON, `op` and `kind`, a `ControlError` with an
+  `ErrorCode` the CLI acts on; 4-byte little-endian length frames bounded
+  at 64 MiB, 4 MiB since E39; the `Endpoint` syntax `unix:<path>` or
+  `tcp:<addr>:<port>`, with `/run/opentap/dbladed.sock` the Linux default
+  and `127.0.0.1:7421` elsewhere; a blocking `Client`; the shared size and
+  bound helpers; the format's `BLOCK_SIZE` and `PIN_*` re-exported so no
+  client redefines them), `otap-daemon` (`dbladed`) and `otap-ctl`
+  (`otapctl`), all `#![forbid(unsafe_code)]`. The protocol carries no
+  data path; the `Io*` requests move whole blocks as hexadecimal (at most
+  256 per request) for the smoke test and the portable harness, where no
+  block device exists.
+- **One engine thread.** The daemon's engine thread owns the `Engine`
+  over `Box<dyn Backstore>` and a composite front door (the channel the
+  `Io*` requests feed, and on Linux one `UblkFrontDoor` per online
+  volume, polled round-robin); it ticks the engine, and executes every
+  control request between ticks, so nothing else ever touches the engine
+  and no lock exists. A request that needs a consistency point ticks the
+  engine until the event it waits for arrives (`VolumeCreated`,
+  `SnapshotCreated` or `SnapshotFailed`, `SnapshotDeleted`,
+  `VolumeRolledBack`, `VolumeResized`, `VolumeDeleted`, `NvfailCleared`,
+  `SnapshotPinned`, `CpCommitted`, `Stopped`), within `--op-timeout`
+  (120 s by default), and the data path keeps flowing because those
+  ticks serve it; requests whose durability has no event of its own
+  (online and offline, a rename, a replication base) wait for quiet,
+  request a CP and wait for its commit. Requests are answered one at a
+  time, so a long operation (a rollback, a shutdown) delays the next
+  request behind it; the control plane is not a hot path. When the last
+  tick did nothing the thread waits for a request with a backoff from
+  200 µs to 2 ms, so an idle daemon costs little and a request on a
+  device waits at most 2 ms; the busy-polled reactor of E16 is a later
+  step.
+- **Devices.** On Linux a ublk device is created and started on the
+  engine thread (the driver pins the queue to the task that issued its
+  first fetch) for every online volume at boot and at `volume create`
+  or `volume online`; it is taken down at `volume offline`, before a
+  rollback, at `pool stop` and at exit (the front door answers `ENODEV`
+  while the requests the engine holds drain, then `STOP_DEV` and
+  `DEL_DEV`), and recreated at the new size after a resize. The device
+  advertises 4 KiB blocks, a volatile cache with FUA, discards, and
+  requests bounded by half the arena. `--no-ublk` serves no devices;
+  Windows never does.
+- **Boot and format.** `pool format` writes a fresh pool with a new
+  aggregate identity (sixteen bytes of a BLAKE3 digest over the clocks,
+  the process and a counter, with the UUID version bits) and refuses a
+  device that already holds a pool unless `--force`. `pool boot` probes
+  the first superblock slot (and `A1` at every candidate stripe when
+  `A0` is torn) for the aggregate's identity and the recorded geometry
+  (F15), opens the device under that geometry (an operator override that
+  disagrees is refused), opens the arena (`--arena-file` on hugetlbfs,
+  re-attached with its contents; `--heap-arena` on heap memory, which
+  dies with the process), boots the engine with no configured volumes
+  (every volume comes from the disk), ticks until the boot commit is
+  durable and exposes the devices. A block device goes through the
+  geometry planner and `UringBackstore`; a file gets a 64 KiB stripe and
+  2 MiB segments below 1 GiB, a 1 MiB stripe and 64 MiB segments above,
+  flash media and no discards unless told otherwise, and `FileBackstore`.
+  The CP timer is `--cp-interval` (1 to 15 s, 5 by default), set on the
+  profile before the engine sees it.
+- **Shutdown.** `SIGTERM` and `SIGINT` set a flag the engine thread polls
+  (`signal-hook`); `pool stop`, `daemon stop`, the flag and the loss of
+  the last handle all run the same path: every device down, the engine's
+  clean shutdown, the `Stopped` event. A final CP that found no segment
+  (`clean == false`) is reported as an error and the daemon says what it
+  means (a hugetlbfs arena keeps the writes, a heap arena loses them).
+- **The server.** Unix socket (mode 0660; a stale socket nobody answers
+  is taken over, a live one refused) or TCP; one thread per connection,
+  one request per frame; a frame that is not a request gets a
+  `BadRequest` reply and the connection goes on; a reply that does not
+  encode gets an error reply instead of a dropped connection. The
+  protocol test round-trips every request and reply variant through
+  JSON, which caught two serde facts the first version tripped on: an
+  internally tagged enum cannot serialize a newtype variant that holds a
+  bare sequence (the list replies are struct variants), and a report
+  field named `kind` collides with the tag (the snapshot's is
+  `consistency`).
+- **`otapctl`.** `otapctl [--control E] [--json] [--timeout S] <group>
+  <verb> --flags`: `daemon ping|stop`; `pool format|boot|status|sync|
+  clean|stop`; `volume create|list|show|delete|online|offline|resize|
+  rename|nvfail-clear`; `snapshot create|list|delete|rollback
+  [--delete-newer]|pin|unpin|replication-base`; `io write|read|punch`.
+  Sizes take `K`, `M`, `G`, `T`; `--json` prints the reply as the daemon
+  sent it; exit status 0 for a reply, 1 for a refusal, 2 for a command
+  line that does not parse, 3 when the daemon cannot be reached. The
+  brief's `vol`, `snap`, `cp trigger` and `gc run` are `volume`,
+  `snapshot`, `pool sync` and `pool clean`.
+- **Names.** Every name lives in the pool's catalogue (F16): the daemon
+  resolves names to indexes and ids on every request and keeps no table
+  of its own, so a crash or a reboot cannot lose or confuse a name; the
+  daemon holds no durable state at all beyond its command line.
+- **Tests.** The daemon runs in process (`Daemon::new` and `handle`)
+  against a file: format, boot, the whole lifecycle, a clean restart that
+  keeps names and content, a dirty restart that holds the volume under
+  nvfail until cleared, the refusals, the boot at start, the signal
+  flag, and the server over loopback TCP with two clients and a bad
+  frame; `otapctl` runs as a process against that daemon. The Linux path
+  (`UringBackstore`, the devices, the Unix socket, the signals under
+  systemd) is `scripts/linux-smoke.sh`, written for Debian 13 and never
+  run: there is still no Linux host.
+- **Not done.** No `UBLK_F_USER_RECOVERY` re-attach of a device after a
+  daemon crash: the device is created with the flag, so the driver keeps
+  a killed daemon's devices quiesced; the restarted daemon creates new
+  ones (the `/dev/ublkbN` numbers change) and the old ones linger until
+  a tool deletes them or the module is reloaded. A clean stop deletes its
+  devices. One queue per device. No systemd units. No `--write-journal`.
+  The control plane is a single serialized thread and the `Io*` path is
+  a test aid, not a data path.
+
+## E39. After the Step 5 review: the cleaner, the lifecycle and the daemon decide together
+
+2026-10-14. Accepted (the Step 5 adversarial review,
+`reviews/2026-10-14-step5-qa-adversarial.md`; the findings and their fixes
+are in the Step 5 entry of `08-engineering-log.md`). Amends E36, E37 and
+E38; nothing here changes the format.
+
+- **The cleaner and the lifecycle exclude each other both ways** (D1, W3).
+  E37 had the cleaner refuse to plan while a snapshot deletion or a volume
+  operation waited; a request that arrived *after* the plan rode the same
+  CP, and a rollback took the snapshot's root as it was before that CP
+  rewrote it, so the live map named a segment the CP drained. Now a CP
+  that carries clean targets takes no deletion and no volume operation
+  (`prepare_meta`, `should_fold`): what arrived after the plan waits for
+  the next CP, which plans no clean while it is pending. The daemon's
+  waits see the event one CP later.
+- **A snapshot in flight blocks the volume's operations** (D2, D4). A
+  rollback, a resize or a deletion refused only the snapshot requests still
+  waiting; one the CP in flight had already taken was in neither list, so
+  the operation landed behind a snapshot newer than the state it was asked
+  for (a forked history, whose deletion then released live blocks). All
+  three now refuse with `VolumeBusy` while a snapshot request of the volume
+  waits or rides the CP in flight (`snapshot_in_flight`).
+- **A summary that does not parse is damage, not absence** (D3). The scan
+  skipped a stripe whose summary failed its CRC as never written and the
+  drain freed its live blocks. A summary of zeros is a stripe never
+  written; anything else that does not parse skips the segment
+  (`SkipReason::Summary`). And the scan reports every referenced block it
+  saw (`Scan::referenced`, the CP's own replacements included): a count
+  below the table's live count means a stripe it could not read as written
+  vouches for blocks it cannot see, and the segment is skipped, not
+  drained.
+- **A deletion beyond the volume's end releases, not fails** (W1). The
+  deletion's lookups in the newer neighbour or the live map answered
+  `OutOfRange` for a block beyond a since-shrunk volume, which failed the
+  CP, and every CP after it (the deletion stayed pending): the daemon's
+  stop could not write its clean record. `OutOfRange` is "not referenced"
+  in both lookups. A damaged newer neighbour, which cannot be walked, makes
+  the deletion release nothing (the safe direction, recorded).
+- **The plan budgets the rewrites, shares them, waits after a failure, and
+  a failed attempt gives its segments back** (W2). The cleaning CP needed
+  a copy of every touched page, an index and a root page per snapshot that
+  referenced a relocated block, which the plan never counted: with 160
+  snapshots sharing one tree the CPs failed for space, the pool was marked
+  full while the admission rule still admitted, and every retry re-staged
+  into segments the failure never returned. Now: `rewrite_cost` counts the
+  pages per distinct tree, an index per tree, a root page per snapshot and
+  the live deltas' records, and candidates that do not fit are not taken;
+  snapshots that share a tree (the same index region) are rewritten once
+  and point at the one copy, so a clean never un-shares a tree; a cleaning
+  CP that fails for space sets `clean_blocked_at` and no clean is planned
+  until a segment is freed (the request stands); the data segments an
+  attempt allocated (`job_data_segments`) are freed at once when it fails,
+  since no committed CP names them.
+- **A damaged catalogue drops the names, not the pool** (W4). Every
+  candidate of the ring names the one catalogue region (F16 carries it
+  forward), so a CRC failure in it tore every candidate. The boot now goes
+  on with no names, `OperatorWarning::CatalogDamaged` says so, the next
+  naming CP writes a fresh region, and the daemon addresses a nameless
+  volume as `#<index>` so it can be renamed. A read error of the region
+  still fails the candidate, as every root's does.
+- **The daemon probes the whole ring** (W5): `A0`, then for each candidate
+  stripe `A1` and the two `B` slots at the end of the device (F7), so a
+  pool whose start was wiped boots, and a format without `--force` cannot
+  overwrite it.
+- **`pool format` refuses anything but a blank device without `--force`**
+  (R2): a first or last MiB with a non-zero byte is someone's data.
+- **`snapshot rollback --delete-newer` checks before it deletes** (R1):
+  every newer snapshot's pins and the target's state are checked first;
+  the deletions are issued together and waited for together; a refusal
+  leaves the history whole.
+- **Unknown fields are refused** (R3): `deny_unknown_fields` on every
+  request, reply and report, so a misspelled optional field cannot read as
+  its absence (`nmae` is not "release the replication base").
+- **The walks' case count was never the gate's problem** (C1, cited, not
+  reproduced). The review read `cases: 64` in the Step 4 and Step 5 random
+  walks and concluded that the 10,000-case gate had run them at 64. It had
+  not: the `proptest!` macro passes an explicit configuration through
+  proptest's `contextualize_config`, which applies `PROPTEST_CASES` over
+  any explicit count, and the Step 4 gate's 52-minute `step4_sim_tests`
+  (20 seconds at 64 cases) had shown it. Both walks now read the variable
+  themselves, 64 the default, so the intent is in the file rather than in
+  proptest's source; the gate's behaviour is unchanged (53 minutes).
+- **Hazards the review saw, closed with it:** a full pool with a pending
+  deletion or volume operation runs a CP for it (`maybe_pump`); `pool
+  sync` and `pool clean` on a full pool request the CP instead of waiting
+  for a quiet the pool cannot reach, and answer the attempt's failure
+  rather than a timeout; a signal interrupts an operation's wait (the
+  shutdown's own waits excepted), so `SIGTERM` is not delayed by the
+  operation timeout; a TCP control address that is not loopback is refused
+  without `--allow-remote-control`; frames are bounded at 4 MiB and an
+  idle connection is closed after five minutes; the catalogue check is
+  linear; the daemon's `snapshot create` waits for its own uuid, not any
+  snapshot of the volume; the arena is capped at 256 GiB; `otapctl` waits
+  ten minutes for a reply by default.
+- **Hazards left as limits** (`06`, section 8): a block that already fails
+  its CRC is relocated under its recorded CRC and, under a trusted opaque
+  barrier, makes the relocating CP look torn at an unclean boot; a
+  rewritten snapshot root page is not verified as the CP's own, so under
+  an opaque barrier a lost one reads as a damaged snapshot rather than a
+  torn CP; the catalogue and the snapshot table are rewritten whole in
+  every CP that changes them.
+- **Lesson** (also in the log): the cleaner's plan, the snapshot set and
+  the volume operations were decided at three different moments of one CP
+  (the plan at the cut, the deletions and operations at the metadata, the
+  in-flight snapshot at the commit) and nothing stopped a request that
+  landed in between. Every decision a CP makes about shared state must be
+  made against the same view, or refused until the view settles.

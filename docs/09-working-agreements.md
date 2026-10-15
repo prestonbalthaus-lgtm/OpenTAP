@@ -128,13 +128,21 @@ parallel builds. Rules:
 - Temporary files, extracted sources and toolchains go to the session
   scratchpad, never into the tree.
 - The 10,000-case gate (`PROPTEST_CASES=10000 cargo test --workspace`)
-  takes about 41 minutes and runs in the background with its output
-  captured to a file; nothing else uses cargo meanwhile. The two simulator
-  random walks (`sim_tests` and `adversarial_sim_tests`) are single
-  property tests, so more test threads do not shorten them; after one
-  build they can be run as two separate test processes at once to halve
-  the wall time. Their seeds differ per run, so the gate is repeated over
-  time rather than treated as final once.
+  takes about three hours (116 minutes after Step 4, 180 after Step 5; the
+  figures are in `06`, section 5) and runs in the background with its
+  output captured to a file; nothing else uses cargo meanwhile. The
+  variable overrides an explicit `cases` in a `proptest!` configuration,
+  so no property test is exempt from the gate. The simulator random walks
+  (`sim_tests`, `adversarial_sim_tests`, `step4_sim_tests`,
+  `step5_sim_tests`) are single property tests, so more test threads do
+  not shorten them; after one build they can be run as separate test
+  processes at once to cut the wall time. Their seeds differ per run, so
+  the gate is repeated over time rather than treated as final once.
+- Scripted edits of source files (perl, sed) are limited to one-line,
+  literal replacements, never with `|` as the perl delimiter when the
+  pattern holds a `\|`, and `cargo check` runs right after; multi-line
+  edits go through the editor's exact-match replace or a whole-block
+  splice from a file (Step 4 mangled three files this way, Step 5 two).
 - The owner prefers the work done well over done fast: case counts are
   never trimmed and the review is never skipped to save time.
 

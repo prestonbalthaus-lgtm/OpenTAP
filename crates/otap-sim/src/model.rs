@@ -68,6 +68,10 @@ pub struct WriteRecord {
     pub committed_at: Option<u64>,
     /// A discard or a write of zeros: its blocks read as zeros.
     pub punch: bool,
+    /// A volume rollback (Step 5): every block of the volume reads as the
+    /// snapshot's image, which this holds, until a later operation covers
+    /// it. `lba` is 0 and `blocks` the volume's size.
+    pub rollback: Option<Vec<Expected>>,
 }
 
 /// What a recovered block decoded to.
@@ -172,6 +176,81 @@ impl Model {
         self.sizes.insert(vol, size);
     }
 
+    /// Forgets a volume the engine deleted (durably): its operations go
+    /// with it.
+    pub fn remove_volume(&mut self, vol: u32) {
+        self.sizes.remove(&vol);
+        self.writes.retain(|w| w.vol != vol);
+        self.reindex();
+    }
+
+    /// Records a durable resize: a grow reads zeros beyond the old end, a
+    /// shrink drops what lay beyond the new one (recorded as a punch with
+    /// operation number `op`, so a later grow reads zeros there too).
+    pub fn resize(&mut self, op: u64, vol: u32, size: u64) {
+        let old = self.sizes.get(&vol).copied().unwrap_or(0);
+        if size < old {
+            self.issued_punch(op, vol, size, (old - size) as u32);
+            self.acked(op, 0);
+            if let Some(w) = self.writes.iter_mut().find(|w| w.op == op) {
+                w.landed = true;
+            }
+        }
+        self.sizes.insert(vol, size);
+    }
+
+    /// Records a rollback of `vol` to `image` (the volume's expected
+    /// content when the snapshot was taken) issued as operation `op`: once
+    /// it lands, every block reads as the image says until a later
+    /// operation covers it. Like a write, it is in the model from the
+    /// moment it is issued and a recovery check decides whether it landed;
+    /// [`confirm`](Self::confirm) records that the engine reported it
+    /// durable.
+    pub fn rollback(&mut self, op: u64, vol: u32, image: Vec<Expected>) {
+        debug_assert!(self.writes.last().is_none_or(|w| w.op < op));
+        // The volume takes the snapshot's size back: blocks beyond it (a
+        // grow since) read as nothing if the volume grows again.
+        let size = self
+            .sizes
+            .get(&vol)
+            .copied()
+            .unwrap_or(0)
+            .max(image.len() as u64);
+        let index = self.writes.len();
+        for lba in 0..size {
+            self.by_block.entry((vol, lba)).or_default().push(index);
+        }
+        let mut image = image;
+        image.resize(size as usize, None);
+        self.writes.push(WriteRecord {
+            op,
+            vol,
+            lba: 0,
+            blocks: u32::try_from(size).unwrap_or(u32::MAX),
+            seq: 0,
+            acked: false,
+            landed: false,
+            committed_at: None,
+            punch: false,
+            rollback: Some(image),
+        });
+    }
+
+    /// Records that the engine reported operation `op` (a rollback)
+    /// durable: it is part of the image from now on.
+    pub fn confirm(&mut self, op: u64) {
+        if let Some(w) = self.writes.iter_mut().find(|w| w.op == op) {
+            w.acked = true;
+            w.landed = true;
+        }
+    }
+
+    /// Takes the engine's word for a volume's size (after a boot, or a
+    /// rollback that restored the snapshot's size).
+    pub fn set_size(&mut self, vol: u32, size: u64) {
+        self.sizes.insert(vol, size);
+    }
+
     /// The data of a write.
     #[must_use]
     pub fn data_of(op: u64, vol: u32, lba: u64, blocks: u32) -> Vec<u8> {
@@ -212,6 +291,7 @@ impl Model {
             landed: false,
             committed_at: None,
             punch,
+            rollback: None,
         });
     }
 
@@ -275,15 +355,31 @@ impl Model {
     }
 
     /// The newest operation with `op <= limit` covering the block, the
-    /// block's position in it, and whether it is a punch.
+    /// block's position in it, and whether it is a punch; through a
+    /// rollback, what the snapshot's image held at the block.
     #[must_use]
     pub fn expected(&self, vol: u32, lba: u64, limit: u64) -> Expected {
         let list = self.by_block.get(&(vol, lba))?;
-        list.iter()
+        let w = list
+            .iter()
             .rev()
             .map(|i| &self.writes[*i])
-            .find(|w| w.op <= limit)
-            .map(|w| (w.op, (lba - w.lba) as u32, w.punch))
+            .find(|w| w.op <= limit)?;
+        match &w.rollback {
+            Some(image) => image.get(lba as usize).copied().flatten(),
+            None => Some((w.op, (lba - w.lba) as u32, w.punch)),
+        }
+    }
+
+    /// `true` when a recovered block agrees with an expectation.
+    fn agrees(d: Decoded, expected: Expected) -> bool {
+        match (d, expected) {
+            (Decoded::Zero, None) | (Decoded::Zero, Some((_, _, true))) => true,
+            (Decoded::Write { op, k: pos }, Some((e_op, e_pos, false))) => {
+                op == e_op && pos == e_pos
+            }
+            _ => false,
+        }
     }
 
     /// The whole image of `vol` as the issued operations leave it: what a
@@ -327,6 +423,7 @@ impl Model {
                         if !self.writes.iter().any(|w| {
                             w.op == op
                                 && !w.punch
+                                && w.rollback.is_none()
                                 && w.vol == vol
                                 && lba >= w.lba
                                 && lba < w.lba + u64::from(w.blocks)
@@ -342,38 +439,37 @@ impl Model {
                 decoded.push((vol, lba, d));
             }
         }
-        // A zero block where the prefix expects data means a later punch
-        // landed: the prefix reaches at least the oldest punch above `j`
-        // that covers the block. Raising `j` can change other blocks'
-        // expectations, so iterate to a fixed point (the bound only rises).
+        // A block that does not agree with the prefix at `j` may be
+        // explained by a later punch or rollback covering it: the prefix
+        // reaches at least the oldest such operation above `j`. Raising `j`
+        // can change other blocks' expectations, so iterate to a fixed
+        // point (the bound only rises).
         loop {
             let mut raised = false;
             for (vol, lba, d) in &decoded {
-                if *d != Decoded::Zero {
+                let expected = self.expected(*vol, *lba, j);
+                if Self::agrees(*d, expected) {
                     continue;
                 }
-                if let Some((_, _, false)) = self.expected(*vol, *lba, j) {
-                    let next_punch = self
-                        .by_block
-                        .get(&(*vol, *lba))
-                        .into_iter()
-                        .flatten()
-                        .map(|i| &self.writes[*i])
-                        .filter(|w| w.punch && w.op > j)
-                        .map(|w| w.op)
-                        .min();
-                    match next_punch {
-                        Some(p) => {
-                            j = p;
-                            raised = true;
-                        }
-                        None => {
-                            return Err(format!(
-                                "volume {vol} LBA {lba}: zeros where write {:?} is expected under \
-                                 prefix bound {j} and no later punch covers it",
-                                self.expected(*vol, *lba, j)
-                            ));
-                        }
+                let next = self
+                    .by_block
+                    .get(&(*vol, *lba))
+                    .into_iter()
+                    .flatten()
+                    .map(|i| &self.writes[*i])
+                    .filter(|w| (w.punch || w.rollback.is_some()) && w.op > j)
+                    .map(|w| w.op)
+                    .min();
+                match next {
+                    Some(p) => {
+                        j = p;
+                        raised = true;
+                    }
+                    None => {
+                        return Err(format!(
+                            "volume {vol} LBA {lba}: holds {d:?} where {expected:?} is expected \
+                             under prefix bound {j} and no later punch or rollback covers it"
+                        ));
                     }
                 }
             }
@@ -383,14 +479,7 @@ impl Model {
         }
         for (vol, lba, d) in &decoded {
             let expected = self.expected(*vol, *lba, j);
-            let ok = match (*d, expected) {
-                (Decoded::Zero, None) | (Decoded::Zero, Some((_, _, true))) => true,
-                (Decoded::Write { op, k: pos }, Some((e_op, e_pos, false))) => {
-                    op == e_op && pos == e_pos
-                }
-                _ => false,
-            };
-            if !ok {
+            if !Self::agrees(*d, expected) {
                 return Err(format!(
                     "volume {vol} LBA {lba}: holds {d:?}, expected {expected:?} under prefix bound {j}"
                 ));
@@ -401,15 +490,9 @@ impl Model {
         // operation too; the prefix is the largest operation number whose
         // state it equals (what a reader cannot tell apart was not lost).
         let consistent_at = |limit: u64| {
-            decoded.iter().all(
-                |(vol, lba, d)| match (d, self.expected(*vol, *lba, limit)) {
-                    (Decoded::Zero, None) | (Decoded::Zero, Some((_, _, true))) => true,
-                    (Decoded::Write { op, k: pos }, Some((e_op, e_pos, false))) => {
-                        *op == e_op && *pos == e_pos
-                    }
-                    _ => false,
-                },
-            )
+            decoded
+                .iter()
+                .all(|(vol, lba, d)| Self::agrees(*d, self.expected(*vol, *lba, limit)))
         };
         for w in &self.writes {
             if w.op > j && consistent_at(w.op) {

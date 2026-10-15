@@ -432,8 +432,23 @@ pub struct FreedIndex {
     pub root: RootRef,
 }
 
-/// What a consistency point asks of the map.
+/// A volume this CP rolls back to a pinned root (Step 5, E36): its live
+/// tree becomes the snapshot's, pages shared, and every live entry born
+/// after the snapshot is released.
 #[derive(Debug, Clone)]
+pub struct Rollback {
+    /// The volume.
+    pub vol: u32,
+    /// The CP the snapshot pins: entries born after it are released.
+    pub birth_cp: u64,
+    /// The pinned root.
+    pub root: MapRoot,
+    /// Its index.
+    pub index: Vec<PageIndexEntry>,
+}
+
+/// What a consistency point asks of the map.
+#[derive(Debug, Clone, Default)]
 pub struct CpInput {
     /// The CP's sequence, above the committed one.
     pub cp_seq: u64,
@@ -449,6 +464,14 @@ pub struct CpInput {
     /// The longest region the writer takes, in 4 KiB pages (a delta longer
     /// than this is split into several regions).
     pub max_region_pages: u32,
+    /// Volumes this CP rolls back to a snapshot (needs `fold`; the volume
+    /// must have no deltas in this CP).
+    pub rollbacks: Vec<Rollback>,
+    /// Volumes this CP resizes to `(vol, lba_count)` (needs `fold`; a
+    /// shrink must have no deltas at or beyond the new size).
+    pub resizes: Vec<(u32, u64)>,
+    /// Volumes this CP deletes (needs `fold`; no deltas).
+    pub deletes: Vec<u32>,
 }
 
 /// What [`MapSet::apply`] takes once the CP is durable.
@@ -462,6 +485,7 @@ pub struct MapUpdate {
     new_volumes: Vec<(u32, MapRoot, Vec<PageIndexEntry>)>,
     fold_roots: Vec<(u32, MapRoot, Vec<PageIndexEntry>)>,
     new_pages: Vec<(u64, Box<MapPage>)>,
+    deletes: Vec<u32>,
 }
 
 impl MapUpdate {
@@ -506,11 +530,17 @@ pub struct PreparedCp {
     /// which is what a snapshot pins.
     pub fold_roots: Vec<(u32, MapRoot, Vec<PageIndexEntry>)>,
     /// Map pages (`(vol, page_no)`) that did not verify when the CP looked
-    /// up the entries its records replace: the old entry was taken as
-    /// unmapped (the replaced block's bytes stay counted live, the safe
-    /// direction) and the engine reports the page. A fold that must
-    /// rewrite such a page fails instead.
+    /// up the entries its records replace, or when a rollback, shrink or
+    /// deletion walked them: the old entry was taken as unmapped (the
+    /// replaced block's bytes stay counted live, the safe direction) and
+    /// the engine reports the page. A fold that must rewrite such a page
+    /// fails instead.
     pub damaged_pages: Vec<(u32, u64)>,
+    /// Entries a rollback, a shrink or a deletion stops referencing:
+    /// `(vol, lba, entry)`, data or hole, nothing new in their place. The
+    /// engine's liveness accounting takes them like replaced entries whose
+    /// successor is unmapped.
+    pub released: Vec<(u32, u64, MapEntry)>,
 }
 
 /// What a replayed delta region held.
@@ -553,6 +583,10 @@ pub struct MapSet {
     last_replayed: Option<(u64, u64)>,
     stats: MapStats,
 }
+
+/// What a tolerant walk collects: the entries in LBA order, and the map
+/// pages that did not verify.
+type CollectedEntries = (Vec<(u64, MapEntry)>, Vec<u64>);
 
 impl MapSet {
     /// An empty map for `agg_id` (a freshly formatted pool: CP 0 is the
@@ -887,6 +921,82 @@ impl MapSet {
         if input.max_region_pages == 0 {
             return Err(MapError::Internal("max_region_pages is zero".into()));
         }
+        // Rollbacks, resizes and deletions rewrite a volume's root outside
+        // the delta log, so the CP that carries them must be a fold: a boot
+        // then replays no record from before the change (a record for a
+        // deleted volume, or beyond a shrunk one, would refuse the boot).
+        let changes_roots =
+            !input.rollbacks.is_empty() || !input.resizes.is_empty() || !input.deletes.is_empty();
+        if changes_roots && !input.fold {
+            return Err(MapError::Internal(
+                "a rollback, resize or deletion needs a fold CP".into(),
+            ));
+        }
+        for rb in &input.rollbacks {
+            let v = self
+                .vols
+                .get(&rb.vol)
+                .ok_or(MapError::NoSuchVolume { vol: rb.vol })?;
+            rb.root.validate()?;
+            if rb.root.vol != rb.vol
+                || rb.root.is_absent()
+                || rb.index.len() != map_pages_for(rb.root.lba_count)
+                || rb.birth_cp > self.committed_cp
+            {
+                return Err(MapError::Internal(format!(
+                    "rollback of volume {} names a root that is not its own",
+                    rb.vol
+                )));
+            }
+            let _ = v;
+            if input.deltas.iter().any(|(vol, _, _)| *vol == rb.vol) {
+                return Err(MapError::Internal(format!(
+                    "rollback of volume {} with deltas in the same CP",
+                    rb.vol
+                )));
+            }
+        }
+        for (vol, lba_count) in &input.resizes {
+            let v = self
+                .vols
+                .get(vol)
+                .ok_or(MapError::NoSuchVolume { vol: *vol })?;
+            if *lba_count == 0 || *lba_count > MAX_LBA + 1 {
+                return Err(MapError::BadSize {
+                    vol: *vol,
+                    lba_count: *lba_count,
+                });
+            }
+            if *lba_count < v.lba_count()
+                && input
+                    .deltas
+                    .iter()
+                    .any(|(dv, lba, _)| dv == vol && *lba >= *lba_count)
+            {
+                return Err(MapError::Internal(format!(
+                    "shrink of volume {vol} with deltas beyond its new size"
+                )));
+            }
+            if input.rollbacks.iter().any(|r| r.vol == *vol) {
+                return Err(MapError::Internal(format!(
+                    "volume {vol} is rolled back and resized in one CP"
+                )));
+            }
+        }
+        for vol in &input.deletes {
+            if !self.vols.contains_key(vol) {
+                return Err(MapError::NoSuchVolume { vol: *vol });
+            }
+            if input.deltas.iter().any(|(dv, _, _)| dv == vol)
+                || input.rollbacks.iter().any(|r| r.vol == *vol)
+                || input.resizes.iter().any(|(rv, _)| rv == vol)
+                || input.new_volumes.iter().any(|(nv, _)| nv == vol)
+            {
+                return Err(MapError::Internal(format!(
+                    "volume {vol} is deleted and changed in one CP"
+                )));
+            }
+        }
         // New volumes: a root with an all-absent index, placed now.
         let mut new_volumes = Vec::new();
         let mut written = Vec::new();
@@ -1027,13 +1137,16 @@ impl MapSet {
         }
 
         // The fold: dirty pages rewritten copy on write, indexes and roots
-        // of the volumes concerned rewritten, every root re-stamped.
+        // of the volumes concerned rewritten, every root re-stamped; a
+        // rolled-back volume takes the snapshot's root and index whole, a
+        // resized one a longer or shorter index, a deleted one leaves.
         let mut fold_roots = Vec::new();
         let mut new_pages = Vec::new();
         let mut freed_pages = Vec::new();
         let mut freed_indexes = Vec::new();
         let mut freed_deltas = Vec::new();
         let mut page_roots = Vec::new();
+        let mut released = Vec::new();
         if input.fold {
             // Every volume with a root before this CP, and every volume
             // this CP creates: a record for a new volume goes into its
@@ -1046,7 +1159,71 @@ impl MapSet {
             for (vol, root, index) in &new_volumes {
                 folded.push((*vol, index.clone(), *root, true));
             }
-            for (vol, mut index, root, is_new) in folded {
+            for (vol, mut index, mut root, is_new) in folded {
+                if input.deletes.contains(&vol) {
+                    // Everything the volume maps is released and every
+                    // region of its tree is freed.
+                    let (gone, damaged) = self.collect_entries(reader, vol, 0, 0)?;
+                    released.extend(gone.into_iter().map(|(lba, e)| (vol, lba, e)));
+                    for page_no in damaged {
+                        if !damaged_pages.contains(&(vol, page_no)) {
+                            damaged_pages.push((vol, page_no));
+                        }
+                    }
+                    for (page_no, old) in index.iter().enumerate() {
+                        if !old.is_none() {
+                            freed_pages.push(FreedPage {
+                                vol,
+                                page_no: page_no as u64,
+                                root: page_root_ref(old),
+                            });
+                        }
+                    }
+                    freed_indexes.push(FreedIndex {
+                        vol,
+                        root: index_root_ref(&root),
+                    });
+                    continue;
+                }
+                if let Some(rb) = input.rollbacks.iter().find(|r| r.vol == vol) {
+                    // The live entries born after the snapshot go; the
+                    // snapshot's pages become the live pages, so a live page
+                    // the snapshot does not share is freed, as is the live
+                    // index when it is not the snapshot's.
+                    let (gone, damaged) = self.collect_entries(reader, vol, 0, rb.birth_cp)?;
+                    released.extend(gone.into_iter().map(|(lba, e)| (vol, lba, e)));
+                    for page_no in damaged {
+                        if !damaged_pages.contains(&(vol, page_no)) {
+                            damaged_pages.push((vol, page_no));
+                        }
+                    }
+                    for (page_no, old) in index.iter().enumerate() {
+                        let shared = rb
+                            .index
+                            .get(page_no)
+                            .is_some_and(|e| !e.is_none() && e.page_pba == old.page_pba);
+                        if !old.is_none() && !shared {
+                            freed_pages.push(FreedPage {
+                                vol,
+                                page_no: page_no as u64,
+                                root: page_root_ref(old),
+                            });
+                        }
+                    }
+                    if root.index_pba != rb.root.index_pba {
+                        freed_indexes.push(FreedIndex {
+                            vol,
+                            root: index_root_ref(&root),
+                        });
+                    }
+                    let new_root = MapRoot {
+                        checkpoint_cp_seq: input.cp_seq,
+                        ..rb.root
+                    };
+                    new_root.validate()?;
+                    fold_roots.push((vol, new_root, rb.index.clone()));
+                    continue;
+                }
                 let mut dirty: BTreeSet<u64> = if is_new {
                     BTreeSet::new()
                 } else {
@@ -1055,6 +1232,47 @@ impl MapSet {
                 for ((dv, lba), _) in deltas.range((vol, 0)..=(vol, u64::MAX)) {
                     debug_assert_eq!(*dv, vol);
                     dirty.insert(MapPage::page_of(*lba));
+                }
+                // A resize: the index grows with absent pages, or shrinks
+                // (the entries beyond the new size are released, their
+                // pages freed, and a page the new end cuts through is
+                // rewritten without them).
+                let resize = input
+                    .resizes
+                    .iter()
+                    .find(|(v, _)| *v == vol)
+                    .map(|(_, size)| *size);
+                let new_size = resize.unwrap_or(root.lba_count);
+                if let Some(size) = resize {
+                    let pages = map_pages_for(size);
+                    if size < root.lba_count {
+                        let (gone, damaged) = self.collect_entries(reader, vol, size, 0)?;
+                        released.extend(gone.into_iter().map(|(lba, e)| (vol, lba, e)));
+                        for page_no in damaged {
+                            if !damaged_pages.contains(&(vol, page_no)) {
+                                damaged_pages.push((vol, page_no));
+                            }
+                        }
+                        for (page_no, old) in index.iter().enumerate().skip(pages) {
+                            if !old.is_none() {
+                                freed_pages.push(FreedPage {
+                                    vol,
+                                    page_no: page_no as u64,
+                                    root: page_root_ref(old),
+                                });
+                            }
+                        }
+                        index.truncate(pages);
+                        dirty.retain(|p| (*p as usize) < pages);
+                        if !size.is_multiple_of(MAP_ENTRIES_PER_PAGE as u64)
+                            && !index[pages - 1].is_none()
+                        {
+                            dirty.insert(pages as u64 - 1);
+                        }
+                    } else {
+                        index.resize(pages, PageIndexEntry::NONE);
+                    }
+                    root.lba_count = size;
                 }
                 let mut max_birth = root.max_birth;
                 for page_no in &dirty {
@@ -1074,6 +1292,12 @@ impl MapSet {
                     for ((_, lba), e) in deltas.range((vol, first)..=(vol, last)) {
                         page.entries[MapPage::slot_of(*lba)] = *e;
                     }
+                    // Beyond a shrunk volume's end nothing is mapped.
+                    if new_size <= last {
+                        for lba in new_size.max(first)..=last {
+                            page.entries[MapPage::slot_of(lba)] = MapEntry::UNMAPPED;
+                        }
+                    }
                     let root_ref = writer.place(page.as_bytes())?;
                     written.push(root_ref);
                     page_roots.push(root_ref);
@@ -1091,7 +1315,7 @@ impl MapSet {
                     new_pages.push((root_ref.pba, Box::new(page)));
                     self.stats.pages_written += 1;
                 }
-                let new_root = if dirty.is_empty() {
+                let new_root = if dirty.is_empty() && resize.is_none() {
                     MapRoot {
                         checkpoint_cp_seq: input.cp_seq,
                         ..root
@@ -1132,10 +1356,15 @@ impl MapSet {
             },
             pages: page_roots,
         };
-        let highest = sizes.keys().next_back().map_or(0, |v| *v as usize + 1);
+        let highest = sizes
+            .keys()
+            .rfind(|v| !input.deletes.contains(v))
+            .map_or(0, |v| *v as usize + 1);
         let mut roots_table = vec![MapRoot::ABSENT; highest];
         for (vol, m) in &self.vols {
-            roots_table[*vol as usize] = m.root;
+            if !input.deletes.contains(vol) {
+                roots_table[*vol as usize] = m.root;
+            }
         }
         for (vol, root, _) in &new_volumes {
             roots_table[*vol as usize] = *root;
@@ -1154,6 +1383,7 @@ impl MapSet {
             new_volumes,
             fold_roots: fold_roots.clone(),
             new_pages,
+            deletes: input.deletes.clone(),
         };
         Ok(PreparedCp {
             update,
@@ -1166,11 +1396,179 @@ impl MapSet {
             freed_deltas,
             fold_roots,
             damaged_pages,
+            released,
         })
+    }
+
+    /// Every committed entry of `vol` at or above `from_lba` with a birth
+    /// above `base_cp` (data and holes), in LBA order, and the map pages
+    /// that did not verify on the way (their entries are unknown and
+    /// reported, never failing the walk). The overlay is consulted first.
+    fn collect_entries(
+        &mut self,
+        reader: &mut dyn PageReader,
+        vol: u32,
+        from_lba: u64,
+        base_cp: u64,
+    ) -> Result<CollectedEntries, MapError> {
+        let v = self.vols.get(&vol).ok_or(MapError::NoSuchVolume { vol })?;
+        let index = v.index.clone();
+        let overlay: Vec<(u64, MapEntry)> =
+            v.overlay.range(from_lba..).map(|(l, e)| (*l, *e)).collect();
+        let lba_count = v.lba_count();
+        let mut out = Vec::new();
+        let mut damaged = Vec::new();
+        let first_page = MapPage::page_of(from_lba) as usize;
+        for (page_no, entry) in index.iter().enumerate().skip(first_page) {
+            let first = MapPage::first_lba(page_no as u64);
+            let last = (first + MAP_ENTRIES_PER_PAGE as u64 - 1).min(lba_count - 1);
+            let mut page_entries: Option<Box<MapPage>> = None;
+            if !entry.is_none() && u64::from(entry.max_birth) > base_cp {
+                match self.page(reader, entry) {
+                    Ok(page) => page_entries = Some(Box::new(*page)),
+                    Err(MapError::Format(_)) => damaged.push(page_no as u64),
+                    Err(e) => return Err(e),
+                }
+            }
+            let mut ov = overlay
+                .iter()
+                .filter(|(l, _)| *l >= first && *l <= last)
+                .peekable();
+            for lba in first.max(from_lba)..=last {
+                let in_overlay = match ov.peek() {
+                    Some((l, e)) if *l == lba => {
+                        ov.next();
+                        Some(*e)
+                    }
+                    _ => None,
+                };
+                let e = match (in_overlay, &page_entries) {
+                    (Some(e), _) => e,
+                    (None, Some(page)) => page.entries[MapPage::slot_of(lba)],
+                    (None, None) => continue,
+                };
+                if !e.is_unmapped() && u64::from(e.birth_cp) > base_cp {
+                    out.push((lba, e));
+                }
+            }
+        }
+        Ok((out, damaged))
+    }
+
+    /// Rewrites a pinned root's pages so the listed blocks point at new
+    /// addresses (a relocation): every `(lba, old, new)` names the entry
+    /// the page holds now and what it becomes, with the same birth and
+    /// CRC. The touched pages are written copy on write, then a new index
+    /// region; nothing in this map changes (a pinned root is not the live
+    /// map), and the caller places the new root page and queues the old
+    /// regions for freeing. Refuses an entry that does not match the page.
+    pub fn rewrite_pinned(
+        &mut self,
+        reader: &mut dyn PageReader,
+        writer: &mut dyn RegionWriter,
+        pinned: &PinnedRoot,
+        changes: &[(u64, MapEntry, MapEntry)],
+    ) -> Result<RewrittenRoot, MapError> {
+        let mut by_page: BTreeMap<u64, Vec<(u64, MapEntry, MapEntry)>> = BTreeMap::new();
+        for change in changes {
+            let (lba, old, new) = *change;
+            if lba >= pinned.root.lba_count {
+                return Err(MapError::OutOfRange {
+                    vol: pinned.vol,
+                    lba,
+                });
+            }
+            new.validate()?;
+            if !old.is_data()
+                || !new.is_data()
+                || old.birth_cp != new.birth_cp
+                || old.crc32c != new.crc32c
+            {
+                return Err(MapError::Internal(format!(
+                    "relocation of {}/{lba} changes more than the address",
+                    pinned.vol
+                )));
+            }
+            by_page
+                .entry(MapPage::page_of(lba))
+                .or_default()
+                .push(*change);
+        }
+        let mut index = pinned.index.clone();
+        let mut pages = Vec::new();
+        let mut new_pages = Vec::new();
+        let mut freed_pages = Vec::new();
+        for (page_no, changes) in by_page {
+            let old_entry = index[page_no as usize];
+            if old_entry.is_none() {
+                return Err(MapError::Internal(format!(
+                    "relocation in an absent page {page_no} of volume {}",
+                    pinned.vol
+                )));
+            }
+            let mut page = *self.page(reader, &old_entry)?;
+            for (lba, old, new) in changes {
+                let slot = MapPage::slot_of(lba);
+                if page.entries[slot] != old {
+                    return Err(MapError::Internal(format!(
+                        "relocation of {}/{lba}: the pinned page holds another entry",
+                        pinned.vol
+                    )));
+                }
+                page.entries[slot] = new;
+            }
+            let root_ref = writer.place(page.as_bytes())?;
+            pages.push(root_ref);
+            let entry = page.index_entry(root_ref.pba);
+            debug_assert_eq!(entry.max_birth, old_entry.max_birth);
+            index[page_no as usize] = entry;
+            freed_pages.push(FreedPage {
+                vol: pinned.vol,
+                page_no,
+                root: page_root_ref(&old_entry),
+            });
+            new_pages.push((root_ref.pba, Box::new(page)));
+            self.stats.pages_written += 1;
+        }
+        let bytes = index_image(&index);
+        let index_ref = writer.place(&bytes)?;
+        let root = MapRoot {
+            index_pba: index_ref.pba,
+            index_pages: index_ref.pages / INDEX_PAGE_BLOCKS,
+            index_crc: index_ref.crc32c,
+            ..pinned.root
+        };
+        root.validate()?;
+        Ok(RewrittenRoot {
+            pinned: PinnedRoot {
+                vol: pinned.vol,
+                root,
+                index,
+            },
+            pages,
+            index: index_ref,
+            freed_pages,
+            freed_index: FreedIndex {
+                vol: pinned.vol,
+                root: index_root_ref(&pinned.root),
+            },
+            new_pages,
+        })
+    }
+
+    /// Keeps pages a committed CP wrote (a rewritten snapshot's) in the
+    /// cache.
+    pub fn cache_pages(&mut self, pages: Vec<(u64, Box<MapPage>)>) {
+        for (pba, page) in pages {
+            self.cache.insert(pba, page);
+        }
     }
 
     /// Makes a prepared CP the committed state. Nothing here can refuse.
     pub fn apply(&mut self, update: MapUpdate) {
+        for vol in &update.deletes {
+            self.vols.remove(vol);
+        }
         for (vol, root, index) in update.new_volumes {
             self.vols.insert(
                 vol,
@@ -1334,6 +1732,25 @@ impl MapSet {
         }
         Ok(())
     }
+}
+
+/// What [`MapSet::rewrite_pinned`] produced: the pinned root as it stands
+/// after the relocation, the regions written and the regions the old root
+/// stops referencing.
+#[derive(Debug, Clone)]
+pub struct RewrittenRoot {
+    /// The root with its new index.
+    pub pinned: PinnedRoot,
+    /// The map pages written, for the CP's directory.
+    pub pages: Vec<RootRef>,
+    /// The index region written.
+    pub index: RootRef,
+    /// The pages the old root referenced at the rewritten page numbers.
+    pub freed_pages: Vec<FreedPage>,
+    /// The old index region.
+    pub freed_index: FreedIndex,
+    /// The pages, for the cache once the CP commits.
+    pub new_pages: Vec<(u64, Box<MapPage>)>,
 }
 
 /// A snapshot's root: a volume's map as of a fold CP, complete on disk,

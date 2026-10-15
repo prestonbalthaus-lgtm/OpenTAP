@@ -273,9 +273,11 @@ fn superblock_field_offsets() {
     assert_eq!(offset_of!(Superblock, geom_stripe_bytes), 1712);
     assert_eq!(offset_of!(Superblock, geom_segment_bytes), 1716);
     assert_eq!(offset_of!(Superblock, geom_capacity_bytes), 1720);
-    assert_eq!(offset_of!(Superblock, reserved), 1728);
+    assert_eq!(offset_of!(Superblock, catalog), 1728);
+    assert_eq!(offset_of!(Superblock, cp_stripes), 1744);
+    assert_eq!(offset_of!(Superblock, reserved), 1760);
     assert_eq!(offset_of!(Superblock, crc32c), 4092);
-    assert_eq!(1728 + SUPERBLOCK_RESERVED + 4, SUPERBLOCK_SIZE);
+    assert_eq!(1760 + SUPERBLOCK_RESERVED + 4, SUPERBLOCK_SIZE);
 
     assert_eq!(offset_of!(SuperblockSlot, sb), 0);
     assert_eq!(offset_of!(SuperblockSlot, vols), 4096);
@@ -398,7 +400,7 @@ fn stream_field_offsets() {
 
 #[test]
 fn constants_and_magics() {
-    assert_eq!(FORMAT_VERSION, 0x0202);
+    assert_eq!(FORMAT_VERSION, 0x0203);
     assert_eq!(STREAM_VERSION, 0x0100);
     assert_eq!(&SUPERBLOCK_MAGIC.to_le_bytes(), b"OTSB");
     assert_eq!(&INTENT_MAGIC.to_le_bytes(), b"OTIN");
@@ -571,7 +573,7 @@ proptest! {
         prop_assert!(decoded == slot);
         prop_assert_eq!(decoded.as_bytes(), slot.as_bytes());
         prop_assert_eq!(decoded.sb.compute_crc(), decoded.sb.crc32c);
-        prop_assert_eq!(&decoded.sb.reserved[..], &bytes[1728..4092]);
+        prop_assert_eq!(&decoded.sb.reserved[..], &bytes[1760..4092]);
     }
 }
 
@@ -2057,12 +2059,33 @@ const V2_1_NAMES: [&str; 14] = [
 /// images, rewritten by the 2.2 builders.
 const V2_2_NAMES: [&str; 14] = V2_1_NAMES;
 
+/// Format 2.3 adds the catalogue and the stripe list, and two roots to the
+/// superblock.
+const V2_3_NAMES: [&str; 16] = [
+    "superblock_slot.bin",
+    "superblock_slot_minor1.bin",
+    "intent_slot.bin",
+    "stripe_summary.bin",
+    "map_page.bin",
+    "page_index_page.bin",
+    "map_root.bin",
+    "stream_frame.bin",
+    "hole_records.bin",
+    "seg_entries.bin",
+    "snap_records.bin",
+    "cp_log_page.bin",
+    "cp_log_dir.bin",
+    "snap_root_page.bin",
+    "catalog.bin",
+    "cp_stripes.bin",
+];
+
 /// The stored sets, oldest first. Regenerating a set is a format change:
 /// bump `FORMAT_MINOR` or `STREAM_MINOR`, add a set here with a new
 /// directory, run `cargo test -p otap-format -- --ignored
 /// write_golden_vectors` and pin the value it prints, keeping every previous
 /// directory for the N-1 lane.
-const VECTOR_SETS: [VectorSet; 3] = [
+const VECTOR_SETS: [VectorSet; 4] = [
     VectorSet {
         dir: "v2.0",
         manifest_blake3: "73b1f4d3a6729fe19b0d13f050aaaed33165d7f07584fd26174c7861332b3af6",
@@ -2083,6 +2106,13 @@ const VECTOR_SETS: [VectorSet; 3] = [
         format_version: 0x0202,
         header: "otap-format golden vectors: format 2.2 stream 1.0",
         names: &V2_2_NAMES,
+    },
+    VectorSet {
+        dir: "v2.3",
+        manifest_blake3: "6ba96829be86737cbda56c55108536e643688e92a3037e75e13ea28c99db425b",
+        format_version: 0x0203,
+        header: "otap-format golden vectors: format 2.3 stream 1.0",
+        names: &V2_3_NAMES,
     },
 ];
 
@@ -2121,6 +2151,8 @@ fn golden_slot() -> SuperblockSlot {
     sb.map_roots = RootRef::new(200, 4, 1);
     sb.seg_table = RootRef::new(300, 1, 2);
     sb.reloc_index = RootRef::NONE;
+    sb.catalog = RootRef::new(800, 1, 0x0CA7_A106);
+    sb.cp_stripes = RootRef::new(801, 1, 0x0577_19E5);
     sb.cp_log_head = RootRef::new(400, 16, 3);
     sb.snap_table = RootRef::new(500, 1, 4);
     sb.cluster_state = RootRef::new(600, 8, 5);
@@ -2398,6 +2430,27 @@ fn golden_snap_root_page() -> SnapRootPage {
     .unwrap()
 }
 
+/// Format 2.3: two named volumes and a named snapshot of each, in the
+/// canonical order (volumes by index, then snapshots by volume and uuid).
+fn golden_catalog() -> Vec<CatalogRec> {
+    vec![
+        CatalogRec::volume(0, "data", 1_759_000_000_000_000_000).unwrap(),
+        CatalogRec::volume(2, "vm-images", 1_759_100_000_000_000_000).unwrap(),
+        CatalogRec::snapshot(0, uuid(12), "before-upgrade", 1_759_500_000_000_000_000).unwrap(),
+        CatalogRec::snapshot(2, uuid(11), "nightly.2026-10-14", 1_759_000_000_000_000_000).unwrap(),
+    ]
+}
+
+/// Format 2.3: the stripes commit 42 wrote: two ingest stripes and one
+/// relocation stripe.
+fn golden_cp_stripes() -> Vec<CpStripe> {
+    vec![
+        CpStripe::new(17, 3, StripeKind::Ingest).unwrap(),
+        CpStripe::new(17, 4, StripeKind::Ingest).unwrap(),
+        CpStripe::new(18, 0, StripeKind::Relocate).unwrap(),
+    ]
+}
+
 /// Every golden image, built by the current builders.
 fn golden_images() -> Vec<(&'static str, Vec<u8>)> {
     let (stripe, stripe_len) = golden_stripe();
@@ -2434,6 +2487,11 @@ fn golden_images() -> Vec<(&'static str, Vec<u8>)> {
         (
             "snap_root_page.bin",
             golden_snap_root_page().as_bytes().to_vec(),
+        ),
+        ("catalog.bin", catalog_image(&golden_catalog()).unwrap()),
+        (
+            "cp_stripes.bin",
+            cp_stripes_image(&golden_cp_stripes()).unwrap(),
         ),
     ]
 }
@@ -2566,6 +2624,12 @@ fn decode_set(files: &HashMap<String, Vec<u8>>, set: &VectorSet) {
     } else {
         assert_eq!(slot.sb.geometry(), None);
     }
+    if set.format_version >= 0x0203 {
+        assert_eq!(slot.sb.catalog, RootRef::new(800, 1, 0x0CA7_A106));
+        assert_eq!(slot.sb.cp_stripes, RootRef::new(801, 1, 0x0577_19E5));
+    } else {
+        assert!(slot.sb.catalog.is_none() && slot.sb.cp_stripes.is_none());
+    }
     assert_eq!(slot.sb.inbound[0].group, 1);
     assert!(slot.sb.inbound[0].is_valid());
     assert!(slot.sb.durable_log.is_none());
@@ -2589,8 +2653,17 @@ fn decode_set(files: &HashMap<String, Vec<u8>>, set: &VectorSet) {
     } else {
         let minor1 = minor1.unwrap();
         assert_eq!(minor1.sb.ver, set.format_version + 1);
-        if set.format_version >= 0x0202 {
+        if set.format_version >= 0x0203 {
             assert_eq!(minor1.sb.reserved[..4], [1, 2, 3, 4]);
+            assert_eq!(minor1.sb.geometry(), slot.sb.geometry());
+            assert_eq!(minor1.sb.catalog, slot.sb.catalog);
+        } else if set.format_version == 0x0202 {
+            // The 2.2 writer put its demonstration bytes where 2.3 keeps the
+            // catalogue root: a reference with no pages, which names
+            // nothing, as a later minor giving meaning to reserved bytes.
+            assert_eq!(minor1.sb.catalog.pba, 0x0403_0201);
+            assert!(minor1.sb.catalog.is_none());
+            assert_eq!(minor1.sb.reserved[..4], [0, 0, 0, 0]);
             assert_eq!(minor1.sb.geometry(), slot.sb.geometry());
         } else {
             // The 2.0 writer put its demonstration bytes where 2.1 now keeps
@@ -2742,5 +2815,20 @@ fn decode_set(files: &HashMap<String, Vec<u8>>, set: &VectorSet) {
         assert_eq!(snap_root.root, root);
         assert_eq!(snap_root.deadlist, RootRef::new(702, 1, 0xDEAD_BEEF));
         assert!(snap_root.root.verify_index(&index.0).is_ok());
+    }
+
+    // The 2.3 structures exist in the sets written at 2.3 and later.
+    if set.format_version >= 0x0203 {
+        let catalog = parse_catalog(&files["catalog.bin"]).unwrap();
+        assert_eq!(catalog, golden_catalog());
+        assert_eq!(catalog[0].name(), "data");
+        assert_eq!(catalog[0].catalog_kind(), Some(CatalogKind::Volume));
+        assert_eq!(catalog[3].name(), "nightly.2026-10-14");
+        assert_eq!((catalog[3].vol, catalog[3].snap_uuid), (2, uuid(11)));
+        assert_eq!(files["catalog.bin"].len(), BLOCK_SIZE);
+        let stripes = parse_cp_stripes(&files["cp_stripes.bin"]).unwrap();
+        assert_eq!(stripes, golden_cp_stripes());
+        assert_eq!(stripes[2].stripe_kind(), Some(StripeKind::Relocate));
+        assert_eq!((stripes[0].pseg, stripes[0].idx), (17, 3));
     }
 }

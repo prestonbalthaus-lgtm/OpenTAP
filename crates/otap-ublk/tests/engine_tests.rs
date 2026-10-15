@@ -13,7 +13,9 @@ use otap_ublk::{MockTransport, UblkFrontDoor, Watermarks, EINVAL, EIO, ENODEV};
 
 const STRIPE: u32 = 32 * 1024;
 const SPS: u64 = 8;
-const SEGMENTS: u64 = 40;
+// Enough segments that the reserve (S5-3) leaves room for every test's
+// writes: 96 of 256 KiB, 8 reserved.
+const SEGMENTS: u64 = 96;
 const DEPTH: u16 = 16;
 const VOL_BLOCKS: u64 = 256;
 
@@ -59,6 +61,9 @@ fn config_for(size_blocks: u64) -> EngineConfig {
         max_overlay_entries: 512,
     };
     cfg.cache_pages = 8;
+    // Virtual time: a paced acknowledgement would wait for an advance
+    // nobody makes.
+    cfg.pacing.max_delay_ns = 0;
     cfg
 }
 

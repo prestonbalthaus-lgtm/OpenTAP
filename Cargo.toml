@@ -18,6 +18,9 @@ members = [
     "crates/otap-geom",
     "crates/otap-backstore",
     "crates/otap-ublk",
+    "crates/otap-control",
+    "crates/otap-daemon",
+    "crates/otap-ctl",
 ]
 # The cargo-fuzz package is its own workspace: it needs nightly and links
 # libFuzzer, so it must not take part in `cargo test --workspace`.
@@ -60,6 +63,15 @@ parking_lot = "0.12.5"
 io-uring = "0.7.15"
 rustix = "1.1.5"
 memmap2 = "0.9.11"
+# The control protocol between `dbladed` and `otapctl` (Step 5, E38):
+# length-prefixed JSON over a Unix socket or loopback TCP. Versions are the
+# 2026-10-14 crates.io snapshot; every package they pull in is MIT or
+# Apache-2.0 (ryu Apache-2.0 or BSL-1.0, memchr Unlicense or MIT).
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# SIGTERM and SIGINT as a flag the daemon polls (Linux; the C runtime's
+# signals on Windows), so a planned stop is a clean shutdown.
+signal-hook = "0.4.5"
 # libfuzzer-sys 0.4 is declared by fuzz/Cargo.toml, which is outside this
 # workspace (see `exclude`).
 

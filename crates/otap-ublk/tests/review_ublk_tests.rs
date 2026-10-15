@@ -402,6 +402,9 @@ fn engine() -> UblkEngine {
         max_overlay_entries: 512,
     };
     cfg.cache_pages = 8;
+    // Virtual time: a paced acknowledgement would wait for an advance
+    // nobody makes.
+    cfg.pacing.max_delay_ns = 0;
     let clock = SimClock::new(1_700_000_000_000_000_000);
     let mut disk = SimBackstore::new(profile, 17).unwrap();
     UblkEngine::format(&mut disk, &clock, &cfg).unwrap();

@@ -1,0 +1,23 @@
+[package]
+name = "otap-ctl"
+description = "otapctl, OpenTAP's command-line control client (Step 5, E38): ONTAP-style `<group> <verb> --flags` commands for pools, volumes, snapshots and the smoke test's data path, spoken to dbladed over the control protocol on a Unix socket or loopback TCP. Human-readable output by default, JSON with --json. No unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "otapctl"
+path = "src/main.rs"
+
+[dependencies]
+otap-control = { path = "../otap-control" }
+serde_json.workspace = true
+
+[dev-dependencies]
+otap-daemon = { path = "../otap-daemon" }

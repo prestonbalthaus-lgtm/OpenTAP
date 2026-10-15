@@ -35,9 +35,10 @@ use crate::checksum::crc32c;
 use crate::constants::{
     BLOCK_SIZE, CPDIR_MAGIC, CPLOG_MAGIC, CP_LOG_DIR_ENTRIES, CP_LOG_DIR_HDR_SIZE,
     CP_LOG_DIR_PAGE_SIZE, CP_LOG_PAGE_HDR_SIZE, CP_LOG_PAGE_SIZE, CP_LOG_RECS_PER_PAGE,
-    CP_LOG_REC_SIZE, FORMAT_MAJOR, FORMAT_VERSION, MAX_CP_SEQ, MAX_LBA, MAX_SEG_BYTES,
-    MAX_STRIPE_BYTES, MAX_VOL, MIN_STRIPE_BYTES, NULL_PSEG, SEG_ENTRY_SIZE, SNAPROOT_MAGIC,
-    SNAP_RECORD_SIZE, SNAP_ROOT_CRC_OFFSET, SNAP_ROOT_PAGE_SIZE, SNAP_ROOT_RESERVED,
+    CP_LOG_REC_SIZE, CP_STRIPE_SIZE, FORMAT_MAJOR, FORMAT_VERSION, MAX_CP_SEQ, MAX_LBA,
+    MAX_SEG_BYTES, MAX_STRIPE_BYTES, MAX_VOL, MIN_STRIPE_BYTES, NULL_PSEG, SEG_ENTRY_SIZE,
+    SNAPROOT_MAGIC, SNAP_RECORD_SIZE, SNAP_ROOT_CRC_OFFSET, SNAP_ROOT_PAGE_SIZE,
+    SNAP_ROOT_RESERVED,
 };
 use crate::map::{MapEntry, MapRoot};
 use crate::types::{
@@ -819,10 +820,12 @@ const _: () = {
 /// The superblock's `cp_log_head` names a directory region: a run of
 /// [`CpLogDirPage`]s listing, as [`RootRef`]s, the delta regions (runs of
 /// [`CpLogPage`]s) of every consistency point since the last fold, in CP
-/// order, followed by the map pages the fold wrote when this CP is the fold
-/// (so a boot that selects it can verify them). Every page of one region
-/// carries the same `cp_seq`, `fold_cp_seq`, `agg_id`, `delta_entries` and
-/// `page_entries`; `page_seq` numbers the pages from 0.
+/// order, followed by the map pages the writing CP wrote (the pages a fold
+/// rewrote, and since format 2.3 the pages a relocation wrote for a
+/// snapshot's tree in any CP), so a boot that selects the CP can verify
+/// them. Every page of one region carries the same `cp_seq`,
+/// `fold_cp_seq`, `agg_id`, `delta_entries` and `page_entries`; `page_seq`
+/// numbers the pages from 0.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(C)]
 pub struct CpLogDirHdr {
@@ -841,8 +844,11 @@ pub struct CpLogDirHdr {
     pub agg_id: Uuid,
     /// Delta regions in the whole directory (the first entries).
     pub delta_entries: u32,
-    /// Fold page regions in the whole directory (the entries after the
-    /// deltas); non-zero only when `cp_seq == fold_cp_seq`.
+    /// Map page regions in the whole directory (the entries after the
+    /// deltas): the pages `cp_seq` wrote. Before format 2.3 these were a
+    /// fold's pages only and the field was non-zero only when
+    /// `cp_seq == fold_cp_seq`; a 2.3 writer lists the pages a relocation
+    /// wrote for a snapshot tree in any CP.
     pub page_entries: u32,
     /// The page's position in the directory region, from 0.
     pub page_seq: u32,
@@ -889,9 +895,6 @@ impl CpLogDirHdr {
                 value: self.fold_cp_seq,
                 max: self.cp_seq,
             });
-        }
-        if self.page_entries != 0 && self.fold_cp_seq != self.cp_seq {
-            return Err(bad_field("page_entries", u64::from(self.page_entries)));
         }
         Ok(())
     }
@@ -997,7 +1000,8 @@ pub struct CpLogDir {
     /// The delta regions of CPs `fold_cp_seq..=cp_seq`, in CP order (a CP
     /// without changes has none; a CP may have several).
     pub deltas: Vec<RootRef>,
-    /// The map pages the fold wrote, when `cp_seq == fold_cp_seq`.
+    /// The map pages `cp_seq` wrote: a fold's rewritten pages, and the
+    /// pages a relocation wrote for a snapshot's tree (format 2.3).
     pub pages: Vec<RootRef>,
 }
 
@@ -1017,9 +1021,6 @@ impl CpLogDir {
                 value: self.fold_cp_seq,
                 max: self.cp_seq,
             });
-        }
-        if !self.pages.is_empty() && self.fold_cp_seq != self.cp_seq {
-            return Err(bad_field("page_entries", self.pages.len() as u64));
         }
         let delta_entries =
             u32::try_from(self.deltas.len()).map_err(|_| bad_field("delta_entries", u64::MAX))?;
@@ -1315,4 +1316,135 @@ const _: () = {
     assert!(offset_of!(SnapRootPage, deadlist) == 104);
     assert!(offset_of!(SnapRootPage, reserved) == 120);
     assert!(offset_of!(SnapRootPage, crc32c) == SNAP_ROOT_CRC_OFFSET);
+};
+
+// ---------------------------------------------------------------------------
+// Format 2.3: the consistency point's stripe list (F17)
+// ---------------------------------------------------------------------------
+
+/// One entry of a consistency point's stripe list (F17): a data stripe the
+/// CP wrote, named by segment and index, with the stripe's kind for the
+/// record. The superblock's `cp_stripes` root names a region of these,
+/// padded to whole pages; a boot verifies every listed stripe's summary
+/// against the CP's identity before it trusts the commit, whatever the
+/// births of the blocks inside (a relocation stripe carries old births).
+#[derive(
+    FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, PartialEq, Eq, Hash, Default, Debug,
+)]
+#[repr(C)]
+pub struct CpStripe {
+    /// The physical segment, never [`NULL_PSEG`].
+    pub pseg: u64,
+    /// The stripe's index within the segment.
+    pub idx: u32,
+    /// A [`crate::StripeKind`] byte.
+    pub kind: u8,
+    /// Reserved, zero.
+    pub rsvd: [u8; 3],
+}
+
+impl CpStripe {
+    /// An entry for stripe `idx` of segment `pseg` of `kind`.
+    pub fn new(pseg: u64, idx: u32, kind: crate::StripeKind) -> Result<Self, FormatError> {
+        let entry = Self {
+            pseg,
+            idx,
+            kind: kind.as_u8(),
+            rsvd: [0; 3],
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    /// The decoded kind.
+    #[must_use]
+    pub const fn stripe_kind(&self) -> Option<crate::StripeKind> {
+        crate::StripeKind::from_u8(self.kind)
+    }
+
+    /// `true` for an all-zero entry (the end of a list).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.pseg == 0 && self.idx == 0 && self.kind == 0
+    }
+
+    /// Checks the fields: a segment and a defined kind.
+    pub const fn validate(&self) -> Result<(), FormatError> {
+        if self.pseg == NULL_PSEG {
+            return Err(bad_field("pseg", 0));
+        }
+        if self.stripe_kind().is_none() {
+            return Err(bad_field("kind", self.kind as u64));
+        }
+        Ok(())
+    }
+}
+
+/// The stripe list region (F17): `entries` in strictly ascending
+/// `(pseg, idx)` order, at least one, each validated, padded with zero
+/// bytes to whole 4 KiB pages. A CP that wrote no data stripe writes no
+/// region (`cp_stripes` is [`RootRef::NONE`]).
+pub fn cp_stripes_image(entries: &[CpStripe]) -> Result<Vec<u8>, FormatError> {
+    if entries.is_empty() {
+        return Err(bad_field("count", 0));
+    }
+    let mut last: Option<(u64, u32)> = None;
+    for (i, entry) in entries.iter().enumerate() {
+        entry.validate()?;
+        let key = (entry.pseg, entry.idx);
+        if last.is_some_and(|l| key <= l) {
+            return Err(bad_field("idx", i as u64));
+        }
+        last = Some(key);
+    }
+    let mut bytes = entries.as_bytes().to_vec();
+    let padded = bytes.len().div_ceil(BLOCK_SIZE).max(1) * BLOCK_SIZE;
+    bytes.resize(padded, 0);
+    Ok(bytes)
+}
+
+/// Parses a stripe list region: entries until the first all-zero one, each
+/// validated, strictly ascending, at least one, and only zero bytes after.
+pub fn parse_cp_stripes(bytes: &[u8]) -> Result<Vec<CpStripe>, FormatError> {
+    if !bytes.len().is_multiple_of(BLOCK_SIZE) {
+        return Err(FormatError::BadLength {
+            expected: bytes.len().div_ceil(BLOCK_SIZE) * BLOCK_SIZE,
+            found: bytes.len(),
+        });
+    }
+    let mut out: Vec<CpStripe> = Vec::new();
+    let mut rest: &[u8] = bytes;
+    while rest.len() >= CP_STRIPE_SIZE {
+        let (chunk, tail) = rest.split_at(CP_STRIPE_SIZE);
+        if chunk.iter().all(|b| *b == 0) {
+            break;
+        }
+        let entry: CpStripe = copy_out(chunk)?;
+        entry.validate()?;
+        if entry.rsvd != [0; 3] {
+            return Err(bad_field("rsvd", out.len() as u64));
+        }
+        let key = (entry.pseg, entry.idx);
+        if out.last().is_some_and(|l| key <= (l.pseg, l.idx)) {
+            return Err(bad_field("idx", out.len() as u64));
+        }
+        out.push(entry);
+        rest = tail;
+    }
+    if out.is_empty() {
+        return Err(bad_field("count", 0));
+    }
+    if rest.iter().any(|b| *b != 0) {
+        return Err(bad_field("pseg", out.len() as u64));
+    }
+    Ok(out)
+}
+
+const _: () = {
+    assert!(size_of::<CpStripe>() == CP_STRIPE_SIZE);
+    assert!(align_of::<CpStripe>() == 8);
+    assert!(offset_of!(CpStripe, pseg) == 0);
+    assert!(offset_of!(CpStripe, idx) == 8);
+    assert!(offset_of!(CpStripe, kind) == 12);
+    assert!(offset_of!(CpStripe, rsvd) == 13);
 };

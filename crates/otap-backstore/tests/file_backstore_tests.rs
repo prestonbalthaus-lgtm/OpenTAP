@@ -63,6 +63,9 @@ fn config() -> EngineConfig {
         max_overlay_entries: 512,
     };
     cfg.cache_pages = 8;
+    // Virtual time: a paced acknowledgement would wait for an advance
+    // nobody makes.
+    cfg.pacing.max_delay_ns = 0;
     cfg
 }
 

@@ -6,10 +6,10 @@
 //! every volume's page index, the CP log directory and its delta regions,
 //! the snapshot table and every pinned root are read and verified against
 //! the roots (E14: a boot trusts only what a root names exactly), the
-//! deltas are replayed into the map, the map pages a fold wrote are
-//! verified when the candidate is the fold, and every stripe the candidate
-//! wrote (named by its own delta records, or by the entries born at it in
-//! the pages when the candidate is a fold) is checked by its summary (CRC
+//! deltas are replayed into the map, the map pages the candidate wrote
+//! (a fold's, or a relocation's rewrite of a snapshot's tree) are
+//! verified, and every stripe the candidate wrote (its stripe list, F17,
+//! ingest and relocation stripes alike) is checked by its summary (CRC
 //! and identity, including the CP's nonce); under a trusted opaque barrier
 //! after an unclean stop the data blocks of those stripes are checked
 //! against their descriptors too (E21). The first candidate that passes is
@@ -30,10 +30,10 @@ use std::collections::HashMap;
 
 use otap_format::checksum::crc32c;
 use otap_format::{
-    parse_map_roots, parse_snap_table, BlockKind, CpLogDir, FormatError, FromBytes, FromZeros,
-    IntentSlot, MapPage, MapRoot, RootRef, SbSlot, SegKind, SegState, SnapRecord, SnapRootPage,
-    StripeId, StripeSummary, SuperblockSlot, Uuid, BLOCK_SIZE, INTENT_SLOT_SIZE, MAP_PAGE_SIZE,
-    SNAP_ROOT_PAGE_SIZE, SUPERBLOCK_SLOTS, SUPERBLOCK_SLOT_SIZE,
+    parse_catalog, parse_cp_stripes, parse_map_roots, parse_snap_table, BlockKind, CatalogRec,
+    CpLogDir, CpStripe, FormatError, FromBytes, FromZeros, IntentSlot, MapRoot, RootRef, SbSlot,
+    SegKind, SegState, SnapRecord, SnapRootPage, StripeId, StripeSummary, SuperblockSlot, Uuid,
+    BLOCK_SIZE, INTENT_SLOT_SIZE, SNAP_ROOT_PAGE_SIZE, SUPERBLOCK_SLOTS, SUPERBLOCK_SLOT_SIZE,
 };
 use otap_map::{index_root_ref, volume_regions, MapError, MapSet, PinnedRoot};
 
@@ -52,9 +52,10 @@ pub enum BootError {
     NoSuperblock(FormatError),
     /// A slot was written by a newer format: a hard stop (F7).
     NewerFormat(FormatError),
-    /// The newest slot was written by format 2.0, whose `cp_log_head` held
-    /// a whole-map dump (E14); Step 4 reads the directory of F12 and no
-    /// release wrote 2.0 (F14). Re-format the pool.
+    /// The newest slot was written by a format before 2.3: 2.0's
+    /// `cp_log_head` held a whole-map dump (E14), 2.1 recorded no geometry
+    /// (F15) and 2.2 no stripe list (F17); no release wrote any of them.
+    /// Re-format the pool.
     OldLayout {
         /// The `ver` field found.
         ver: u16,
@@ -85,7 +86,7 @@ impl fmt::Display for BootError {
             Self::NewerFormat(e) => write!(f, "{e}"),
             Self::OldLayout { ver } => write!(
                 f,
-                "the pool was written by format {}.{}; this release reads 2.2 and later",
+                "the pool was written by format {}.{}; this release reads 2.3 and later",
                 ver >> 8,
                 ver & 0xff
             ),
@@ -226,11 +227,22 @@ pub struct BootState {
     pub protected: Vec<u64>,
     /// The snapshots on disk, in id order.
     pub snapshots: Vec<BootSnapshot>,
-    /// The regions behind the selected slot's `map_roots`, `cp_log_head`
-    /// and `snap_table` roots, which the next CP replaces.
+    /// The regions behind the selected slot's `map_roots`, `cp_log_head`,
+    /// `snap_table`, `cp_stripes` and `seg_table` roots, which the next CP
+    /// replaces.
     pub table_regions: Vec<RootRef>,
     /// Consistency points since the fold that wrote a delta.
     pub cps_since_fold: u64,
+    /// The catalogue (F16) as the selected CP wrote it, or empty when it
+    /// did not verify.
+    pub catalog: Vec<CatalogRec>,
+    /// Its region, carried forward by a CP that changes no name; `NONE`
+    /// when the catalogue did not verify, so the next naming CP writes a
+    /// fresh one.
+    pub catalog_ref: RootRef,
+    /// Why the catalogue was dropped, when it did not verify: the engine
+    /// reports it as an operator warning.
+    pub catalog_damage: Option<String>,
 }
 
 impl BootState {
@@ -254,7 +266,7 @@ pub fn evaluate<B: Backstore>(
             other => BootError::NoSuperblock(other),
         })?;
     if let Some(newest) = ranked.first() {
-        if (newest.sb.ver & 0xff) < 2 {
+        if (newest.sb.ver & 0xff) < 3 {
             return Err(BootError::OldLayout { ver: newest.sb.ver });
         }
         let profile = (
@@ -312,6 +324,9 @@ pub fn evaluate<B: Backstore>(
         snapshots,
         table_regions,
         cps_since_fold,
+        catalog,
+        catalog_ref,
+        catalog_damage,
     } = loaded;
     Ok(BootState {
         slot: *ranked[index],
@@ -326,6 +341,9 @@ pub fn evaluate<B: Backstore>(
         snapshots,
         table_regions,
         cps_since_fold,
+        catalog,
+        catalog_ref,
+        catalog_damage,
     })
 }
 
@@ -338,6 +356,9 @@ struct Loaded {
     snapshots: Vec<BootSnapshot>,
     table_regions: Vec<RootRef>,
     cps_since_fold: u64,
+    catalog: Vec<CatalogRec>,
+    catalog_ref: RootRef,
+    catalog_damage: Option<String>,
 }
 
 /// Everything a slot's roots reach: the regions, the parsed tables, the
@@ -348,11 +369,15 @@ struct Walk {
     indexes: Vec<(u32, Vec<u8>)>,
     dir: CpLogDir,
     deltas: Vec<Vec<u8>>,
-    /// The pages the fold wrote, when the CP is the fold: what names the
-    /// stripes a fold CP wrote.
-    fold_pages: Vec<Vec<u8>>,
     snapshots: Vec<BootSnapshot>,
     table_regions: Vec<RootRef>,
+    /// The stripes the CP wrote (F17), to be verified.
+    stripes: Vec<CpStripe>,
+    /// The catalogue and its region.
+    catalog: Vec<CatalogRec>,
+    catalog_ref: RootRef,
+    /// Why the catalogue was dropped, when it did not verify.
+    catalog_damage: Option<String>,
 }
 
 /// Reads every region a slot's map and snapshot roots name and verifies
@@ -423,14 +448,43 @@ fn walk_cp<B: Backstore>(
         regions.push(*delta);
         deltas.push(bytes);
     }
-    // The fold's pages, when this CP is the fold: every one must verify,
-    // and they name the stripes the fold CP wrote.
-    let mut fold_pages = Vec::new();
-    if dir.cp_seq == dir.fold_cp_seq {
-        for page in &dir.pages {
-            fold_pages.push(read_root(b, layout, page, "fold page")?);
-        }
+    // The pages this CP wrote (a fold's, or the ones a relocation wrote
+    // for a snapshot's tree): every one must verify, or the CP did not
+    // land whole.
+    for page in &dir.pages {
+        read_root(b, layout, page, "map page")?;
     }
+    // The stripe list (F17): what the CP wrote and the boot verifies.
+    let stripes = if sb.cp_stripes.is_none() {
+        Vec::new()
+    } else {
+        let bytes = read_root(b, layout, &sb.cp_stripes, "cp_stripes")?;
+        regions.push(sb.cp_stripes);
+        table_regions.push(sb.cp_stripes);
+        parse_cp_stripes(&bytes).map_err(|e| TornReason::Map(format!("stripe list: {e}")))?
+    };
+    // The catalogue (F16), carried forward unchanged by most CPs. One that
+    // does not verify is damage to the names, not to the candidate: every
+    // candidate of the ring names the same region, so tearing on it would
+    // make the pool unbootable for a name. The boot goes on with no names,
+    // reports it, and the next CP that names something writes a fresh
+    // region. A read error is the device's, and fails the candidate as
+    // every other root's does.
+    let (catalog, catalog_ref, catalog_damage) = if sb.catalog.is_none() {
+        (Vec::new(), RootRef::NONE, None)
+    } else {
+        match read_root(b, layout, &sb.catalog, "catalog") {
+            Err(TornReason::Io(e)) => return Err(TornReason::Io(e)),
+            Err(reason) => (Vec::new(), RootRef::NONE, Some(reason.to_string())),
+            Ok(bytes) => match parse_catalog(&bytes) {
+                Ok(records) => {
+                    regions.push(sb.catalog);
+                    (records, sb.catalog, None)
+                }
+                Err(e) => (Vec::new(), RootRef::NONE, Some(format!("catalogue: {e}"))),
+            },
+        }
+    };
     // The snapshots: the table, each root page, each pinned index. Damage
     // to a snapshot an older CP took is the snapshot's, not the
     // candidate's: it is reported and the boot goes on; a root page or
@@ -469,9 +523,12 @@ fn walk_cp<B: Backstore>(
         indexes,
         dir,
         deltas,
-        fold_pages,
         snapshots,
         table_regions,
+        stripes,
+        catalog,
+        catalog_ref,
+        catalog_damage,
     })
 }
 
@@ -554,53 +611,27 @@ fn load_cp<B: Backstore>(
         },
     )
     .map_err(|e| TornReason::Map(format!("map roots: {e}")))?;
-    let mut born: Vec<(u64, u32)> = Vec::new();
     let mut delta_cps: Vec<u64> = Vec::new();
     for bytes in &walk.deltas {
         let replayed = map
             .replay(bytes)
             .map_err(|e| TornReason::Map(format!("cp log replay: {e}")))?;
-        if replayed.cp_seq == sb.cp_seq {
-            for rec in &replayed.records {
-                let entry = rec.map_entry();
-                if entry.is_data() {
-                    born.push((entry.lseg(), entry.off()));
-                }
-            }
-        }
         if replayed.cp_seq > walk.dir.fold_cp_seq && delta_cps.last() != Some(&replayed.cp_seq) {
             delta_cps.push(replayed.cp_seq);
         }
     }
     map.set_delta_roots(walk.dir.deltas.clone(), delta_cps.len() as u64);
-    // A fold CP's records are in its pages: every entry born at this CP
-    // names a stripe it wrote.
-    for bytes in &walk.fold_pages {
-        let page = MapPage::read_from_bytes(&bytes[..MAP_PAGE_SIZE.min(bytes.len())])
-            .map_err(|_| TornReason::Map("a fold page is not a whole page".into()))?;
-        for entry in &page.entries {
-            if entry.is_data() && u64::from(entry.birth_cp) == sb.cp_seq {
-                born.push((entry.lseg(), entry.off()));
-            }
-        }
-    }
-    // Every stripe this CP wrote must still read as this CP's: its summary
+    // Every stripe this CP wrote (its stripe list, F17: ingest and
+    // relocation alike) must still read as this CP's: its summary
     // verifies, and, when the barrier was only trusted (E21) and the stop
     // was not clean, so does every data block against its descriptor (a
     // controller cache can lose a block behind an intact summary).
-    born.sort_unstable();
-    born.dedup();
     let check_data = b.profile().trusts_opaque_barrier() && !sb.is_clean_shutdown();
-    let mut last: Option<(u64, u32)> = None;
     let summary_len = layout.summary.summary_bytes;
     let stripe_len = layout.stripe_bytes as usize;
     let mut buf = vec![0u8; if check_data { stripe_len } else { summary_len }];
-    for (lseg, off) in born {
-        let idx = layout.stripe_of_off(off);
-        if last == Some((lseg, idx)) {
-            continue;
-        }
-        last = Some((lseg, idx));
+    for entry in &walk.stripes {
+        let (lseg, idx) = (entry.pseg, entry.idx);
         let pba = layout.stripe_pba(lseg, idx).ok_or(TornReason::Stripe {
             lseg,
             idx,
@@ -734,6 +765,9 @@ fn load_cp<B: Backstore>(
             regions
         },
         cps_since_fold: delta_cps.len() as u64,
+        catalog: walk.catalog,
+        catalog_ref: walk.catalog_ref,
+        catalog_damage: walk.catalog_damage,
     })
 }
 

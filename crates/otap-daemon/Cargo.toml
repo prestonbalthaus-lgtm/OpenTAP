@@ -1,0 +1,31 @@
+[package]
+name = "otap-daemon"
+description = "OpenTAP's data daemon, dbladed (Step 5, E38): hosts the consistency-point engine over a block device (io_uring on Linux) or a file, runs the CP ticker and the cleaner, exposes one ublk device per online volume on Linux, and answers the control protocol on a Unix socket or loopback TCP, with a clean shutdown on SIGTERM and SIGINT. The library is the daemon; the binary parses the command line and runs it. No unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "dbladed"
+path = "src/bin/dbladed.rs"
+
+[dependencies]
+otap-arena = { path = "../otap-arena" }
+otap-backstore = { path = "../otap-backstore" }
+otap-control = { path = "../otap-control" }
+otap-cp = { path = "../otap-cp" }
+otap-format = { path = "../otap-format" }
+otap-geom = { path = "../otap-geom" }
+otap-sys = { path = "../otap-sys" }
+otap-ublk = { path = "../otap-ublk" }
+blake3.workspace = true
+signal-hook.workspace = true
+
+[dev-dependencies]
+otap-sim = { path = "../otap-sim" }

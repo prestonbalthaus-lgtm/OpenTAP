@@ -116,6 +116,23 @@ impl HugeArena {
         Ok(Self::from_mapping(map, len, page_size))
     }
 
+    /// A private, zeroed arena of `len` bytes on ordinary heap memory,
+    /// aligned to `page_size`, on every host: `dbladed --heap-arena`
+    /// (S5-1), for a homelab host or a CI VM that reserved no huge pages.
+    /// It does not survive the process: a daemon crash on a heap arena is
+    /// a dirty boot that holds the write-active volumes under nvfail,
+    /// which a clean shutdown avoids.
+    ///
+    /// # Errors
+    /// [`io::ErrorKind::InvalidInput`] if `len` is not a positive multiple of
+    /// the page size, [`io::ErrorKind::OutOfMemory`] when the allocation
+    /// fails.
+    pub fn heap(len: usize, page_size: HugePageSize) -> io::Result<Self> {
+        check_len(len, page_size)?;
+        let map = imp::Mapping::heap(len, page_size)?;
+        Ok(Self::from_mapping(map, len, page_size))
+    }
+
     fn from_mapping(map: imp::Mapping, len: usize, page_size: HugePageSize) -> Self {
         debug_assert_eq!(map.as_slice().len(), len);
         debug_assert!(map.as_ptr().addr().is_multiple_of(page_size.bytes()));
@@ -218,6 +235,48 @@ fn check_len(len: usize, page_size: HugePageSize) -> io::Result<()> {
     Ok(())
 }
 
+/// A zeroed heap buffer over-allocated by one page less one byte, of which
+/// the page-aligned window `[offset, offset + len)` is the arena. The
+/// buffer never grows, so the window never moves. The heap arena of every
+/// host, and the only arena off Linux.
+struct HeapBuffer {
+    buf: Vec<u8>,
+    offset: usize,
+    len: usize,
+}
+
+impl HeapBuffer {
+    fn new(len: usize, page_size: HugePageSize) -> io::Result<Self> {
+        let align = page_size.bytes();
+        let too_large = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a {len}-byte arena does not fit this host's address space"),
+            )
+        };
+        let total = len.checked_add(align - 1).ok_or_else(too_large)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(total)
+            .map_err(|err| io::Error::new(io::ErrorKind::OutOfMemory, err))?;
+        buf.resize(total, 0);
+        let base = buf.as_ptr().addr();
+        let offset = base.checked_next_multiple_of(align).ok_or_else(too_large)? - base;
+        Ok(Self { buf, offset, len })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[self.offset..self.offset + self.len]
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[self.offset..self.offset + self.len]
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.buf.as_ptr().wrapping_add(self.offset)
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::fs::{File, OpenOptions};
@@ -229,17 +288,21 @@ mod imp {
     use rustix::fs::{flock, fstatfs, statfs, FlockOperation, StatFs};
     use rustix::io::Errno;
 
-    use super::HugePageSize;
+    use super::{HeapBuffer, HugePageSize};
 
     /// `HUGETLBFS_MAGIC` (`include/uapi/linux/magic.h`).
     const HUGETLBFS_MAGIC: u32 = 0x9584_58f6;
 
-    /// The mapping, and for a file-backed arena the open file that carries
-    /// its exclusive lock. Fields drop in order: the mapping is unmapped
-    /// before the file is closed and the lock released.
-    pub(super) struct Mapping {
-        map: MmapMut,
-        _locked_file: Option<File>,
+    /// The memory behind an arena: a huge-page mapping (and for a
+    /// file-backed arena the open file that carries its exclusive lock;
+    /// fields drop in order, so the mapping is unmapped before the file is
+    /// closed and the lock released), or a heap buffer.
+    pub(super) enum Mapping {
+        Huge {
+            map: MmapMut,
+            _locked_file: Option<File>,
+        },
+        Heap(HeapBuffer),
     }
 
     impl Mapping {
@@ -248,10 +311,14 @@ mod imp {
                 .len(len)
                 .huge(Some(page_size.page_bits()))
                 .map_anon()?;
-            Ok(Self {
+            Ok(Self::Huge {
                 map,
                 _locked_file: None,
             })
+        }
+
+        pub(super) fn heap(len: usize, page_size: HugePageSize) -> io::Result<Self> {
+            Ok(Self::Heap(HeapBuffer::new(len, page_size)?))
         }
 
         pub(super) fn map_file(
@@ -321,30 +388,48 @@ mod imp {
             // `&self`/`&mut self` of the arena, so references to it obey the
             // borrow rules.
             let map = unsafe { MmapOptions::new().len(len).map_mut(&file) }?;
-            Ok(Self {
+            Ok(Self::Huge {
                 map,
                 _locked_file: Some(file),
             })
         }
 
         pub(super) fn as_slice(&self) -> &[u8] {
-            &self.map
+            match self {
+                Self::Huge { map, .. } => map,
+                Self::Heap(heap) => heap.as_slice(),
+            }
         }
 
         pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
-            &mut self.map
+            match self {
+                Self::Huge { map, .. } => map,
+                Self::Heap(heap) => heap.as_mut_slice(),
+            }
         }
 
         pub(super) fn as_ptr(&self) -> *const u8 {
-            self.map.as_ptr()
+            match self {
+                Self::Huge { map, .. } => map.as_ptr(),
+                Self::Heap(heap) => heap.as_ptr(),
+            }
         }
 
+        /// Locks a huge mapping; a heap arena is ordinary memory, which
+        /// `mlock` would pin page by page for no benefit a homelab host
+        /// wants, so it is left to the kernel.
         pub(super) fn lock(&self) -> io::Result<()> {
-            self.map.lock()
+            match self {
+                Self::Huge { map, .. } => map.lock(),
+                Self::Heap(_) => Ok(()),
+            }
         }
 
         pub(super) fn exclude_from_core_dumps(&self) -> io::Result<()> {
-            self.map.advise(Advice::DontDump)
+            match self {
+                Self::Huge { map, .. } => map.advise(Advice::DontDump),
+                Self::Heap(_) => Ok(()),
+            }
         }
     }
 
@@ -378,34 +463,18 @@ mod imp {
     use std::io;
     use std::path::Path;
 
-    use super::HugePageSize;
+    use super::{HeapBuffer, HugePageSize};
 
-    /// A zeroed heap buffer over-allocated by one page less one byte, of which
-    /// the page-aligned window `[offset, offset + len)` is the arena. The
-    /// buffer never grows, so the window never moves.
-    pub(super) struct Mapping {
-        buf: Vec<u8>,
-        offset: usize,
-        len: usize,
-    }
+    /// Off Linux every arena is a heap buffer.
+    pub(super) struct Mapping(HeapBuffer);
 
     impl Mapping {
         pub(super) fn anonymous(len: usize, page_size: HugePageSize) -> io::Result<Self> {
-            let align = page_size.bytes();
-            let too_large = || {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("a {len}-byte arena does not fit this host's address space"),
-                )
-            };
-            let total = len.checked_add(align - 1).ok_or_else(too_large)?;
-            let mut buf = Vec::new();
-            buf.try_reserve_exact(total)
-                .map_err(|err| io::Error::new(io::ErrorKind::OutOfMemory, err))?;
-            buf.resize(total, 0);
-            let base = buf.as_ptr().addr();
-            let offset = base.checked_next_multiple_of(align).ok_or_else(too_large)? - base;
-            Ok(Self { buf, offset, len })
+            Self::heap(len, page_size)
+        }
+
+        pub(super) fn heap(len: usize, page_size: HugePageSize) -> io::Result<Self> {
+            Ok(Self(HeapBuffer::new(len, page_size)?))
         }
 
         pub(super) fn map_file(
@@ -424,15 +493,15 @@ mod imp {
         }
 
         pub(super) fn as_slice(&self) -> &[u8] {
-            &self.buf[self.offset..self.offset + self.len]
+            self.0.as_slice()
         }
 
         pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
-            &mut self.buf[self.offset..self.offset + self.len]
+            self.0.as_mut_slice()
         }
 
         pub(super) fn as_ptr(&self) -> *const u8 {
-            self.buf.as_ptr().wrapping_add(self.offset)
+            self.0.as_ptr()
         }
 
         pub(super) fn lock(&self) -> io::Result<()> {
