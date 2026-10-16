@@ -1064,3 +1064,103 @@ Lessons:
 - Twelve agents launched at once can exhaust a usage limit together. A
   large fan-out is better staged, so a limit stops it between agents
   rather than in the middle of all of them.
+
+## 2026-10-15: the four cut-off readers run again, and their maps verified
+
+The owner asked for everything the usage limit had cut off to be run
+again, and for the reader that had almost finished to be run from the
+start rather than trusted, "because we don't want silent corruption or
+silent data failures". So the four readers (`arena-index-replay`,
+`docs-rules`, `linux-wsl`, `engine-lifecycle-snapshots`) were run from
+scratch with their 2026-10-14 assignments, told not to read the other
+maps, and each new map was then checked against the code by two
+independent verifier agents per round: one re-checking every file:line
+citation and quotation, one checking that the map answers every item of
+its assignment and contradicts neither itself nor the code. An editor
+agent fixed what they found and the next round checked again. The new
+arena map was also compared with the old partial one: the old reader had
+never read the saved driver, and several of its statements would have
+steered scope A wrong (that a reissued request keeps its tag, a reaper
+rule that would delete a device another daemon is recovering, that a
+second kill during the boot is harmless). The 32 correct items the old
+map had and the new lacked were checked and merged into the new one, and
+the old map was replaced.
+
+The workspace test gate was run again on the unchanged tree first: 541
+tests and 2 doctests passed, 1 ignored, in 2 min 49 s (the Step 5 numbers).
+
+The agents hit the lead's usage limit a second time, with the first two
+verification rounds done and the third started. The owner then set the
+rule that worker agents run on Opus 5.5 and the lead's model is for the
+lead alone. The run was continued on Opus from the journal of the stopped
+run (see the lessons), the rounds capped at six per map, with one more
+bounded round after the arena merge.
+
+Findings per round (each a wrong citation, a missing item or a
+contradiction; the citation verifier's count of checked citations in
+parentheses; every finding fixed unless noted):
+
+| Round | `arena-index-replay` | `docs-rules` | `linux-wsl` | `engine-lifecycle-snapshots` |
+|---|---|---|---|---|
+| 1 | 11 (954) | 8 (645) | 14 (640) | 17 (640) |
+| 2 | 6 (1047) | 9 (1017) | 4 (1150) | 4 (900) |
+| 3 | 32 (1110) | 4 (1094) | 24 (830), 1 disputed | 15 (1150) |
+| 4 | 14 (1240) | 20 (1263) | 15 (1200) | 23 (1200) |
+| 5 | 9 (1341) | 18 (1344) | 16 (1200) | 21 (1560) |
+| 6 | 12 (1392) | 19 (1591) | 7 (1450) | 14 (1650) |
+| after the merge | 12, then 6 (1760) | | | |
+| final audit | 6 (1743), 1 substantive; every fix checked | 24 (1788), 6 substantive; 23 fixes checked, 1 re-fixed unchecked | 17 (1500), 1 substantive; 15 fixes checked, 1 sentence re-fixed unchecked | 13 (1150), none substantive; every fix checked |
+
+Rounds 1 and 2 ran on the lead's model, the rest on Opus. The rounds did
+not converge to nothing: the maps roughly doubled in size under repair
+(to 190 to 250 KB each), every repaired claim is a new claim to check,
+and verifiers at full effort find something every time. Most late
+findings were minor (a citation a few lines off, a quotation attributed
+to the wrong line, a thin answer); some were substantive (a kill inside
+the final shutdown CP's window gives a clean boot that skips the data CRC
+pass, so a guarantee stated for every `kill -9` did not hold as written;
+the daemon's `io write` path bypasses a replica's offline state; a lost
+`Committed` frame was unhandled). So the last round was made a bounded
+audit: every finding tagged substantive or minor, one repair, and a
+checker agent that re-read every fixed place against the code. It ran in
+the small hours of 2026-10-16: 60 findings over the four maps, 8 of them
+substantive (a proposed arena fix that would itself have destroyed the
+arena under a damaged lap word; two misstatements of the driver's
+`DEL_DEV` wait and of the recovery command's checks; a device-identity
+key that cannot tell a removed volume's leftover device from a new volume
+at the same index; a wrong claim about what a conservative dirty boot
+holds; a scope C design statement never cited; a premise about the device
+path that the brief does not make). The editors fixed all 60, the checker
+confirmed 57 fixes in place, and the three it found wrong or partial (one
+sentence in each of `docs-rules.md` and `linux-wsl.md`) were fixed once
+more, unchecked. Every finding of every round is kept in
+`OpenTAP-local/step6/rerun-2026-10-15/verify/`.
+
+What the four maps found is summarised in `step6/README.md` section 2:
+six candidate defects in the code as it stands (the hold a stopped boot
+never recorded, the stale seal after a kill inside a multi-block fill, the
+snapshot deletion that wedges the CPs on a damaged map page, the
+`START_DEV` wait on the serving thread, the larger `--arena-bytes` that
+recreates the arena, the late commits) and the facts the design must
+honour. All of it is agents' claims checked by agents; the lead reads it
+in the design phase, which starts now.
+
+Lessons:
+
+- Worker agents run on Opus 5.5, never on the lead's model. Twice now a
+  fan-out of readers and verifiers on the lead's model has exhausted its
+  usage limit mid-run and stopped the lead with it. Every `agent()` call
+  in a workflow carries `model: 'opus'`.
+- A workflow's resume cache is keyed by call sequence, and a pipeline's
+  call order depends on which agent finishes first, so a resumed pipeline
+  re-ran almost everything. The journal holds every agent's result; the
+  continuation was hand-written from it, with the completed rounds'
+  findings written to files the next verifiers read. Write a stage's
+  results to files as they land, so a continuation never needs the cache.
+- Agent verification of agent-written documents does not converge on its
+  own. Cap the rounds, tag severity, keep repairs to the smallest change,
+  and end with a check of every fix in place rather than another round
+  over the whole file.
+- A reader that writes its file first keeps its work when it is cut off
+  (the 2026-10-14 lesson, confirmed: all four maps were complete on disk
+  when the limit struck, and the run was continued rather than restarted).
