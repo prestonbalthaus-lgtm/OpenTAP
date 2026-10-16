@@ -141,7 +141,7 @@ fn run_verification(d: &mut Daemon) -> VerifyReport {
 }
 
 fn pool(d: &mut Daemon) -> PoolReport {
-    match ok(d, &Request::PoolStatus) {
+    match ok(d, &Request::PoolStatus {}) {
         Response::Pool(p) => p,
         other => panic!("{other:?}"),
     }
@@ -171,7 +171,7 @@ fn pool_verify_runs_as_a_job_between_requests_and_attests_a_healthy_pool() {
         },
     );
     write(&mut d, 0, &vec![0xEE; 8 * BLOCK_SIZE]);
-    ok(&mut d, &Request::PoolSync);
+    ok(&mut d, &Request::PoolSync {});
     // Started: answered at once with the job's report, the view taken.
     let first = verify_report(ok(&mut d, &Request::PoolVerify {}));
     assert_eq!(first.state, VerifyState::Running);
@@ -184,7 +184,7 @@ fn pool_verify_runs_as_a_job_between_requests_and_attests_a_healthy_pool() {
     );
     // Requests are answered while it runs: a write and a sync.
     write(&mut d, 40, &vec![0x11; BLOCK_SIZE]);
-    ok(&mut d, &Request::PoolSync);
+    ok(&mut d, &Request::PoolSync {});
     let mut report = verify_report(ok(&mut d, &Request::PoolVerifyStatus {}));
     assert_eq!(
         report.cp_seq, first.cp_seq,
@@ -206,7 +206,7 @@ fn pool_verify_runs_as_a_job_between_requests_and_attests_a_healthy_pool() {
     assert_eq!(report.phase, "finished");
     // A second verification of a later CP.
     write(&mut d, 44, &vec![0x22; BLOCK_SIZE]);
-    ok(&mut d, &Request::PoolSync);
+    ok(&mut d, &Request::PoolSync {});
     let later = run_verification(&mut d);
     assert_eq!(later.verdict, Some(VerifyVerdict::Clean), "{later:?}");
     assert!(later.cp_seq > report.cp_seq);
@@ -227,7 +227,7 @@ fn pool_verify_finds_a_flipped_byte_and_the_pool_status_carries_it() {
     }
     marked[..16].copy_from_slice(b"step6b-verify-ok");
     write(&mut d, 9, &marked);
-    ok(&mut d, &Request::PoolSync);
+    ok(&mut d, &Request::PoolSync {});
     let file = std::fs::read(&device).unwrap();
     let at = file
         .windows(16)
@@ -281,7 +281,7 @@ fn pool_verify_can_be_cancelled_and_needs_a_pool() {
     for lba in 0..64u64 {
         write(&mut d, lba * 8, &vec![lba as u8; 8 * BLOCK_SIZE]);
     }
-    ok(&mut d, &Request::PoolSync);
+    ok(&mut d, &Request::PoolSync {});
     let started = verify_report(ok(&mut d, &Request::PoolVerify {}));
     if started.state == VerifyState::Running {
         let cancelled = verify_report(ok(&mut d, &Request::PoolVerifyCancel {}));

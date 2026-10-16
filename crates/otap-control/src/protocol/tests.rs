@@ -206,7 +206,7 @@ fn cursor_report() -> ReplicationCursorReport {
 #[test]
 fn every_reply_round_trips() {
     let replies: Vec<Reply> = vec![
-        Ok(Response::Ok),
+        Ok(Response::Ok {}),
         Ok(Response::Pong {
             protocol: PROTOCOL_VERSION,
             version: "0.1.0".into(),
@@ -289,7 +289,7 @@ fn every_reply_round_trips() {
     let json = serde_json::to_value(Response::Pool(pool_report())).unwrap();
     assert_eq!(json["kind"], "pool");
     assert_eq!(json["segments"], 63);
-    let json = serde_json::to_value(Response::Ok).unwrap();
+    let json = serde_json::to_value(Response::Ok {}).unwrap();
     assert_eq!(json, serde_json::json!({ "kind": "ok" }));
     let json = serde_json::to_value(ControlError::new(ErrorCode::BadRequest, "x")).unwrap();
     assert_eq!(json["code"], "bad_request");
@@ -298,7 +298,7 @@ fn every_reply_round_trips() {
 #[test]
 fn every_request_round_trips() {
     let requests = vec![
-        Request::Ping,
+        Request::Ping {},
         Request::PoolFormat {
             device: "/dev/sdb".into(),
             size_bytes: Some(1 << 30),
@@ -333,16 +333,16 @@ fn every_request_round_trips() {
             arena: ArenaKind::Heap,
             cp_interval_secs: 1,
         },
-        Request::PoolStatus,
-        Request::PoolSync,
-        Request::PoolClean,
-        Request::PoolStop,
-        Request::DaemonStop,
+        Request::PoolStatus {},
+        Request::PoolSync {},
+        Request::PoolClean {},
+        Request::PoolStop {},
+        Request::DaemonStop {},
         Request::VolumeCreate {
             name: "data".into(),
             size_bytes: 10 << 30,
         },
-        Request::VolumeList,
+        Request::VolumeList {},
         Request::VolumeShow {
             name: "data".into(),
         },
@@ -448,7 +448,7 @@ fn every_request_round_trips() {
     for request in &requests {
         round_trip(request);
     }
-    let json = serde_json::to_value(Request::VolumeList).unwrap();
+    let json = serde_json::to_value(Request::VolumeList {}).unwrap();
     assert_eq!(json, serde_json::json!({ "op": "volume_list" }));
     let json = serde_json::to_value(Request::PoolBoot {
         device: "d".into(),

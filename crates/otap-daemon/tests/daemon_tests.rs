@@ -161,7 +161,7 @@ fn snapshots(d: &mut Daemon, volume: Option<&str>) -> Vec<SnapshotReport> {
 }
 
 fn volumes(d: &mut Daemon) -> Vec<VolumeReport> {
-    match ok(d, &Request::VolumeList) {
+    match ok(d, &Request::VolumeList {}) {
         Response::Volumes { volumes } => volumes,
         other => panic!("volume list answered {other:?}"),
     }
@@ -170,7 +170,7 @@ fn volumes(d: &mut Daemon) -> Vec<VolumeReport> {
 #[test]
 fn a_daemon_without_a_pool_answers_ping_and_refuses_the_rest() {
     let mut d = daemon();
-    match ok(&mut d, &Request::Ping) {
+    match ok(&mut d, &Request::Ping {}) {
         Response::Pong {
             protocol,
             pool_booted,
@@ -183,11 +183,11 @@ fn a_daemon_without_a_pool_answers_ping_and_refuses_the_rest() {
         other => panic!("{other:?}"),
     }
     for req in [
-        Request::PoolStatus,
-        Request::PoolSync,
-        Request::PoolClean,
-        Request::PoolStop,
-        Request::VolumeList,
+        Request::PoolStatus {},
+        Request::PoolSync {},
+        Request::PoolClean {},
+        Request::PoolStop {},
+        Request::VolumeList {},
         Request::SnapshotList { volume: None },
         Request::IoRead {
             volume: "x".into(),
@@ -198,7 +198,7 @@ fn a_daemon_without_a_pool_answers_ping_and_refuses_the_rest() {
         assert_eq!(err(&mut d, &req).code, ErrorCode::NoPool, "{req:?}");
     }
     assert!(!d.exit_requested());
-    assert_eq!(ok(&mut d, &Request::DaemonStop), Response::Ok);
+    assert_eq!(ok(&mut d, &Request::DaemonStop {}), Response::Ok {});
     assert!(d.exit_requested());
 }
 
@@ -383,7 +383,7 @@ fn format_boot_and_the_whole_lifecycle_then_a_clean_restart() {
     // Rollback of an online volume: offline, flushed, rolled back, online.
     assert_eq!(write_fill(&mut d, "data", 1, 0xcd, 1).status, "ok");
     assert!(matches!(
-        ok(&mut d, &Request::PoolSync),
+        ok(&mut d, &Request::PoolSync {}),
         Response::Committed { .. }
     ));
     assert_eq!(
@@ -509,7 +509,7 @@ fn format_boot_and_the_whole_lifecycle_then_a_clean_restart() {
         .find(|s| s.name.as_deref() == Some("s1"))
         .unwrap();
     assert_eq!(s1_now.flags, 0, "a newer base supersedes the old one");
-    assert_eq!(ok(&mut d, &delete), Response::Ok);
+    assert_eq!(ok(&mut d, &delete), Response::Ok {});
     assert_eq!(
         ok(
             &mut d,
@@ -518,7 +518,7 @@ fn format_boot_and_the_whole_lifecycle_then_a_clean_restart() {
                 name: None,
             }
         ),
-        Response::Ok
+        Response::Ok {}
     );
     assert_eq!(
         ok(
@@ -528,7 +528,7 @@ fn format_boot_and_the_whole_lifecycle_then_a_clean_restart() {
                 name: "s3".into(),
             }
         ),
-        Response::Ok
+        Response::Ok {}
     );
     assert!(snapshots(&mut d, None).is_empty());
     assert_eq!(err(&mut d, &delete).code, ErrorCode::NotFound);
@@ -606,14 +606,14 @@ fn format_boot_and_the_whole_lifecycle_then_a_clean_restart() {
             online: false,
         },
     );
-    assert_eq!(ok(&mut d, &delete_db), Response::Ok);
+    assert_eq!(ok(&mut d, &delete_db), Response::Ok {});
     assert!(volumes(&mut d).is_empty());
 
     // A cleaning CP and a sync answer with their commits.
-    let Response::Committed { cp_seq: cleaned } = ok(&mut d, &Request::PoolClean) else {
+    let Response::Committed { cp_seq: cleaned } = ok(&mut d, &Request::PoolClean {}) else {
         panic!("clean")
     };
-    let Response::Committed { cp_seq: synced } = ok(&mut d, &Request::PoolSync) else {
+    let Response::Committed { cp_seq: synced } = ok(&mut d, &Request::PoolSync {}) else {
         panic!("sync")
     };
     assert!(synced > cleaned);
@@ -621,17 +621,17 @@ fn format_boot_and_the_whole_lifecycle_then_a_clean_restart() {
     // A volume that survives a clean restart with its name and content.
     volume(&mut d, &create("keep", 16 << 20));
     assert_eq!(write_fill(&mut d, "keep", 7, 0x77, 3).status, "ok");
-    let Response::Committed { .. } = ok(&mut d, &Request::PoolStop) else {
+    let Response::Committed { .. } = ok(&mut d, &Request::PoolStop {}) else {
         panic!("stop")
     };
     assert!(matches!(
-        ok(&mut d, &Request::Ping),
+        ok(&mut d, &Request::Ping {}),
         Response::Pong {
             pool_booted: false,
             ..
         }
     ));
-    assert_eq!(err(&mut d, &Request::PoolStatus).code, ErrorCode::NoPool);
+    assert_eq!(err(&mut d, &Request::PoolStatus {}).code, ErrorCode::NoPool);
     let report = pool(&mut d, &boot_req(&device));
     assert!(
         report.last_boot.starts_with("clean boot"),
@@ -648,10 +648,10 @@ fn format_boot_and_the_whole_lifecycle_then_a_clean_restart() {
         decode_hex(&read(&mut d, "keep", 7, 3).data_hex).unwrap(),
         vec![0x77; 3 * BLOCK_SIZE]
     );
-    assert_eq!(ok(&mut d, &Request::DaemonStop), Response::Ok);
+    assert_eq!(ok(&mut d, &Request::DaemonStop {}), Response::Ok {});
     assert!(d.exit_requested());
     assert!(matches!(
-        ok(&mut d, &Request::Ping),
+        ok(&mut d, &Request::Ping {}),
         Response::Pong {
             pool_booted: false,
             ..
@@ -715,7 +715,7 @@ fn a_dirty_restart_holds_the_volume_under_nvfail_until_it_is_cleared() {
         "a clear of a clear volume is a no-op"
     );
     assert!(matches!(
-        ok(&mut d, &Request::PoolStop),
+        ok(&mut d, &Request::PoolStop {}),
         Response::Committed { .. }
     ));
 }
@@ -795,7 +795,7 @@ fn boot_refuses_a_missing_blank_or_mismatched_device() {
     assert_eq!(nowhere.code, ErrorCode::NotFound, "no size, no file");
     assert!(matches!(ok(&mut d, &boot_req(&device)), Response::Pool(_)));
     assert!(matches!(
-        ok(&mut d, &Request::PoolStop),
+        ok(&mut d, &Request::PoolStop {}),
         Response::Committed { .. }
     ));
 }
@@ -816,14 +816,14 @@ fn a_configured_device_boots_at_start_and_a_bad_one_fails_the_spawn() {
     cfg.cp_interval_secs = 1;
     let (handle, thread) = Daemon::spawn(cfg.clone(), Arc::clone(&stop)).unwrap();
     assert!(matches!(
-        handle.call(&Request::Ping).unwrap(),
+        handle.call(&Request::Ping {}).unwrap(),
         Response::Pong {
             pool_booted: true,
             ..
         }
     ));
     assert!(matches!(
-        handle.call(&Request::PoolStatus).unwrap(),
+        handle.call(&Request::PoolStatus {}).unwrap(),
         Response::Pool(_)
     ));
     // A signal: the flag stops the engine thread with a clean shutdown.
@@ -831,7 +831,7 @@ fn a_configured_device_boots_at_start_and_a_bad_one_fails_the_spawn() {
     thread.join().unwrap();
     assert!(handle.is_stopped());
     assert_eq!(
-        handle.call(&Request::Ping).unwrap_err().code,
+        handle.call(&Request::Ping {}).unwrap_err().code,
         ErrorCode::Io,
         "a stopped daemon answers nothing"
     );
@@ -843,7 +843,7 @@ fn a_configured_device_boots_at_start_and_a_bad_one_fails_the_spawn() {
         "{}",
         report.last_boot
     );
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 
     let mut bad = cfg;
     bad.device = Some(PathBuf::from(scratch.path("missing.img")));
@@ -932,12 +932,15 @@ fn the_server_answers_over_tcp_and_survives_a_bad_frame() {
         let e = reply.unwrap().unwrap_err();
         assert_eq!(e.code, ErrorCode::BadRequest);
         // The connection goes on.
-        otap_control::write_frame(&mut raw, &Request::Ping).unwrap();
+        otap_control::write_frame(&mut raw, &Request::Ping {}).unwrap();
         let reply: Option<otap_control::Reply> = otap_control::read_frame(&mut raw).unwrap();
         assert!(matches!(reply.unwrap().unwrap(), Response::Pong { .. }));
     }
 
-    assert_eq!(client.call(&Request::DaemonStop).unwrap(), Response::Ok);
+    assert_eq!(
+        client.call(&Request::DaemonStop {}).unwrap(),
+        Response::Ok {}
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     while !handle.is_stopped() {
         assert!(Instant::now() < deadline, "the engine thread did not stop");

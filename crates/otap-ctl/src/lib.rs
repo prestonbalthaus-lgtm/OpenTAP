@@ -118,7 +118,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return 3;
         }
     };
-    if !matches!(cmd.request, Request::Ping) {
+    if !matches!(cmd.request, Request::Ping {}) {
         if let Err(e) = client.hello() {
             let _ = writeln!(err, "otapctl: {e}");
             return 3;

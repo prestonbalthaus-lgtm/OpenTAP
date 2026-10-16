@@ -255,7 +255,7 @@ fn a_pool_whose_a_slots_were_wiped_boots_from_its_b_slots() {
     volume(&mut d, &create("data", 16 << 20));
     assert_eq!(write_fill(&mut d, "data", 5, 0x5e, 2).status, "ok");
     assert!(matches!(
-        ok(&mut d, &Request::PoolStop),
+        ok(&mut d, &Request::PoolStop {}),
         Response::Committed { .. }
     ));
     {
@@ -319,7 +319,7 @@ fn deleting_a_snapshot_after_a_shrink_commits_and_the_pool_stops_cleanly() {
         volume: "data".into(),
         name: "s1".into(),
     });
-    let stopped = d.handle(&Request::PoolStop);
+    let stopped = d.handle(&Request::PoolStop {});
     assert!(
         deleted.is_ok() && matches!(stopped, Ok(Response::Committed { .. })),
         "the deletion: {deleted:?}; the clean stop: {stopped:?}"
@@ -382,7 +382,7 @@ fn concurrent_clients_are_served_in_turn_and_every_answer_is_right() {
                         assert!(matches!(s, Response::Snapshot(_)), "{s:?}");
                     } else {
                         assert!(matches!(
-                            h.call(&Request::PoolSync).unwrap(),
+                            h.call(&Request::PoolSync {}).unwrap(),
                             Response::Committed { .. }
                         ));
                     }
@@ -408,7 +408,7 @@ fn concurrent_clients_are_served_in_turn_and_every_answer_is_right() {
         .collect();
     for _ in 0..20 {
         assert!(matches!(
-            handle.call(&Request::Ping).unwrap(),
+            handle.call(&Request::Ping {}).unwrap(),
             Response::Pong { .. }
         ));
     }
@@ -422,7 +422,10 @@ fn concurrent_clients_are_served_in_turn_and_every_answer_is_right() {
         panic!("a list")
     };
     assert_eq!(snapshots.len(), 9);
-    assert_eq!(handle.call(&Request::DaemonStop).unwrap(), Response::Ok);
+    assert_eq!(
+        handle.call(&Request::DaemonStop {}).unwrap(),
+        Response::Ok {}
+    );
     thread.join().unwrap();
     // The stop was clean.
     let mut d = Daemon::new(config());
@@ -430,7 +433,7 @@ fn concurrent_clients_are_served_in_turn_and_every_answer_is_right() {
         Response::Pool(p) => assert!(p.last_boot.starts_with("clean boot"), "{}", p.last_boot),
         other => panic!("{other:?}"),
     }
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 /// When the last handle goes (the control server ended), the engine thread
@@ -470,7 +473,7 @@ fn dropping_every_handle_stops_the_pool_cleanly() {
         vec![0x77; BLOCK_SIZE],
         "the acknowledged write survived the stop"
     );
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 /// Malformed input over TCP: an empty frame and a frame of the wrong shape
@@ -534,7 +537,10 @@ fn malformed_frames_are_answered_or_end_the_connection_and_the_daemon_serves_on(
     // New clients are served.
     let mut client = Client::connect(&endpoint, Some(Duration::from_secs(30))).unwrap();
     assert!(matches!(client.hello().unwrap(), Response::Pong { .. }));
-    assert_eq!(client.call(&Request::DaemonStop).unwrap(), Response::Ok);
+    assert_eq!(
+        client.call(&Request::DaemonStop {}).unwrap(),
+        Response::Ok {}
+    );
     engine.join().unwrap();
     serving.join().unwrap().unwrap();
 }
@@ -566,7 +572,7 @@ fn names_at_their_bounds_are_kept_or_refused_and_survive_a_restart() {
     snapshot(&mut d, &snap(unicode, &"s".repeat(255)));
     assert!(d.handle(&snap(unicode, "nightly")).is_err());
     assert!(matches!(
-        ok(&mut d, &Request::PoolStop),
+        ok(&mut d, &Request::PoolStop {}),
         Response::Committed { .. }
     ));
     ok(&mut d, &boot_req(&device));
@@ -574,7 +580,7 @@ fn names_at_their_bounds_are_kept_or_refused_and_survive_a_restart() {
     names.sort();
     assert_eq!(names, vec!["nightly".to_string(), "s".repeat(255)]);
     assert_eq!(snapshot_names(&mut d, &long), vec!["nightly".to_string()]);
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 /// I/O requests at the edges of a volume and of the protocol: a read at
@@ -636,5 +642,5 @@ fn io_requests_at_the_edges_are_answered_not_crashed() {
         })
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::BadRequest);
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }

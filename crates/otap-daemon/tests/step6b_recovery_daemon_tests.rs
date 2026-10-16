@@ -147,7 +147,7 @@ fn show(d: &mut Daemon, name: &str) -> VolumeReport {
 }
 
 fn sync(d: &mut Daemon) {
-    ok(d, &Request::PoolSync);
+    ok(d, &Request::PoolSync {});
 }
 
 /// Clears the hold a dirty boot over a lost heap arena put on `name`.
@@ -280,7 +280,7 @@ fn a_volume_device_is_stamped_recorded_and_served() {
     );
     assert!(show(&mut d, "a").device.is_some());
     // A clean stop deletes every device and leaves no record.
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
     assert!(kernel.device_ids().is_empty());
     assert!(!bindings::file_path(&scratch.state(), &agg).exists());
 }
@@ -385,7 +385,7 @@ fn a_restart_after_kill_re_attaches_the_same_devices_before_serving() {
     assert!(devices(&mut d)
         .iter()
         .all(|r| r.state == DeviceState::Serving));
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 #[test]
@@ -414,7 +414,7 @@ fn the_requests_queued_at_a_dead_daemons_device_are_answered_once_by_the_next() 
     clear(&mut d, "a");
     let id = kernel.submit_read(dev, 0, 1);
     assert_eq!(wait(&mut d, &kernel, id), BLOCK_SIZE as i32);
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 #[test]
@@ -464,7 +464,7 @@ fn a_daemon_killed_between_start_and_end_of_the_recovery_is_restarted_again() {
     let read = kernel.submit_read(dev, 3, 1);
     assert_eq!(wait(&mut d, &kernel, read), BLOCK_SIZE as i32);
     assert_eq!(kernel.completion(read).unwrap().data, Some(block(0x77)));
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 #[test]
@@ -558,7 +558,7 @@ fn a_device_not_quiesced_in_time_is_listed_stale_and_reaped_on_request() {
     // The dying process's last reference frees the number.
     kernel.release_char(old);
     assert!(!kernel.device_ids().contains(&old));
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 #[test]
@@ -656,7 +656,7 @@ fn stale_and_foreign_devices_are_listed_and_only_stale_ones_are_reaped() {
     );
     assert_eq!(e.code, ErrorCode::Io);
     assert_eq!(reaped(&mut d, Some(another), false).len(), 1);
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 #[test]
@@ -706,7 +706,7 @@ fn the_device_verbs_work_with_no_pool_booted_and_refuse_without_ublk() {
     // The pool then boots and gives its volume a new device.
     boot(&mut d, &scratch);
     assert!(show(&mut d, "a").device.is_some());
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
     // Without ublk the verbs are refused, not answered with an empty list.
     let mut off = Daemon::new(DaemonConfig {
         ublk: false,
@@ -759,7 +759,7 @@ fn a_device_left_without_a_record_is_found_by_its_stamp() {
         record(&scratch.state(), &agg).bound(0).map(|b| b.0),
         Some(dev)
     );
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 #[test]
@@ -798,7 +798,7 @@ fn a_recorded_device_whose_volume_is_gone_is_listed_stale() {
     assert!(record(&scratch.state(), &agg).is_stale(orphan));
     assert!(kernel.info(orphan).is_some(), "listed, not deleted");
     assert_eq!(reaped(&mut d, Some(orphan), false).len(), 1);
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 #[test]
@@ -842,7 +842,7 @@ fn a_second_daemon_on_a_served_pool_is_refused_before_it_opens_it() {
     let id = kernel.submit_read(dev, 1, 1);
     assert_eq!(wait(&mut first, &kernel, id), BLOCK_SIZE as i32);
     assert_eq!(kernel.completion(id).unwrap().data, Some(block(0x11)));
-    ok(&mut first, &Request::PoolStop);
+    ok(&mut first, &Request::PoolStop {});
 }
 
 #[test]
@@ -883,7 +883,7 @@ fn a_recorded_number_the_driver_gave_to_another_device_is_left_alone() {
             .any(|e| e.contains("no longer carries the stamp")),
         "{events:?}"
     );
-    ok(&mut d, &Request::PoolStop);
+    ok(&mut d, &Request::PoolStop {});
 }
 
 #[test]

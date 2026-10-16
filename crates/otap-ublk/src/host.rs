@@ -241,6 +241,42 @@ pub trait HostDevice: DeviceControl {
     fn delete(self: Box<Self>) -> Result<(), TransportError>;
 }
 
+/// The host's devices as a listing reports them: each of `ids` described
+/// by `describe` (`GET_DEV_INFO` and `GET_PARAMS`, answering `Ok(None)` for
+/// a device deleted since the listing, `Err(errno)` for a refusal). The
+/// one policy both [`UblkHost`] implementations follow, so the in-memory
+/// driver exercises what the Linux one does.
+///
+/// A device that answers `EINVAL` is left out: the 6.12 driver refuses
+/// `GET_DEV_INFO` without the character device's path for a device made
+/// with `UBLK_F_UNPRIVILEGED_DEV` (`ublk_ctrl_uring_cmd_permission`), and
+/// OpenTAP makes only privileged devices, so such a device is other
+/// software's and none of this daemon's business. One of them used to fail
+/// the whole listing, and with it every pool boot (the Step 6 review's R4).
+///
+/// # Errors
+/// Any other refusal, which fails the whole listing.
+pub fn listing(
+    ids: &[u32],
+    mut describe: impl FnMut(u32) -> Result<Option<DevInfo>, i32>,
+) -> Result<Vec<DevInfo>, TransportError> {
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        match describe(id) {
+            Ok(Some(info)) => out.push(info),
+            Ok(None) => {}
+            Err(errno) if errno == crate::frontdoor::EINVAL => {}
+            Err(errno) => {
+                return Err(TransportError {
+                    what: "GET_DEV_INFO",
+                    errno,
+                })
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The control plane of the host's ublk driver.
 pub trait UblkHost {
     /// This process's pid, which `START_DEV` and `END_USER_RECOVERY` name.

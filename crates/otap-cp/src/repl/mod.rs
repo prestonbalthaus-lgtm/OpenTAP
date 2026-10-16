@@ -495,6 +495,35 @@ pub fn newest_transfer<B: Backstore, F: FrontDoor, C: Clock>(
         .max_by_key(|s| s.cp_seq)
 }
 
+/// `true` when the pool itself says volume `vol` is a replication
+/// destination: its newest transfer snapshot carries the replication pin,
+/// which a sink sets on the base it committed and `replicate release`
+/// clears. With the sink record lost (a state directory on a tmpfs after a
+/// host reboot) this is what keeps the mirror marked, so a partial delta is
+/// never brought online (the Step 6 review's D6); a volume without it is
+/// not a mirror and is refused as a destination unless a record names it
+/// (D5).
+#[must_use]
+pub fn is_mirror_by_pool<B: Backstore, F: FrontDoor, C: Clock>(
+    eng: &Engine<B, F, C>,
+    vol: u32,
+) -> bool {
+    newest_transfer(eng, vol).is_some_and(|b| b.flags & PIN_REPLICATION != 0)
+}
+
+/// A snapshot of identity `uuid` held by a volume of this pool other than
+/// `vol`: a destination snapshot cannot take that identity, since uuids are
+/// unique per pool (the Step 6 review's W1).
+pub(crate) fn snapshot_elsewhere<B: Backstore, F: FrontDoor, C: Clock>(
+    eng: &Engine<B, F, C>,
+    uuid: Uuid,
+    vol: Option<u32>,
+) -> Option<SnapshotInfo> {
+    eng.snapshots()
+        .into_iter()
+        .find(|s| s.uuid == uuid && Some(s.vol) != vol)
+}
+
 /// A snapshot as a job remembers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SnapRef {
@@ -823,7 +852,42 @@ impl Replicator {
             if rec.dst_agg != agg {
                 continue;
             }
+            let mut rec = rec;
             let vol = rec.dst_vol;
+            if (rec.cursor.landing.is_some() || !rec.landing_target.is_nil())
+                && rec.outlived_by_rewind(eng.cp_seq(), eng.cp_nonce())
+            {
+                // The boot rewound below the CP the record was written after:
+                // chunks it calls landed may be gone with that CP. Right
+                // after the boot commit is the one moment a rewind of a
+                // single CP is visible (the boot commits under the lost CP's
+                // number), so the landing is forgotten here, durably, before
+                // any source can resume from it (the Step 6 review's D3).
+                rec.forget_landing();
+                match rec.encode() {
+                    Ok(bytes) => {
+                        if let Err(e) = self.store.save(key, &bytes) {
+                            lines.push(format!(
+                                "replication: the sink record {key} cannot be saved ({e}); it is \
+                                 removed, and the destination is reconciled from the pool"
+                            ));
+                            let _ = self.store.remove(key);
+                        }
+                    }
+                    Err(e) => {
+                        lines.push(format!(
+                            "replication: the sink record {key} cannot be rewritten ({e}); it is \
+                             removed, and the destination is reconciled from the pool"
+                        ));
+                        let _ = self.store.remove(key);
+                    }
+                }
+                lines.push(format!(
+                    "replication: the pool rewound below the sink record of volume {}; the delta \
+                     in flight starts over from the base",
+                    volume_label(eng, vol)
+                ));
+            }
             match eng.volume(vol) {
                 Some(v) if v.present && v.offline => match eng.set_replica(vol, true) {
                     Ok(()) => lines.push(format!(
@@ -854,7 +918,39 @@ impl Replicator {
                 }
             }
         }
+        // A mirror whose record is gone (the state directory emptied, as a
+        // tmpfs is at a host reboot) is still a mirror: the pool says so by
+        // the replication pin on its newest transfer snapshot, and its live
+        // volume may hold part of a delta (the Step 6 review's D6).
+        for (vol, info) in eng.volumes() {
+            if info.present && info.offline && !eng.is_replica(vol) && is_mirror_by_pool(eng, vol) {
+                match eng.set_replica(vol, true) {
+                    Ok(()) => lines.push(format!(
+                        "replication: volume {} holds a pinned transfer snapshot and no sink \
+                         record; it stays a mirror (its next transfer starts from that base; \
+                         `replicate release` ends the relationship)",
+                        volume_label(eng, vol)
+                    )),
+                    Err(e) => lines.push(format!(
+                        "replication: volume {vol} cannot be marked as a mirror: {e}"
+                    )),
+                }
+            }
+        }
         lines
+    }
+
+    /// Forgets the sink record of destination volume `vol`: the daemon
+    /// calls it when the volume is deleted, so a record never outlives its
+    /// volume and attaches to the next volume at that index (the Step 6
+    /// review's D7).
+    ///
+    /// # Errors
+    /// The store's, as text.
+    pub fn forget(&mut self, vol: u32) -> Result<(), String> {
+        self.store
+            .remove(&SinkRecord::key(vol))
+            .map_err(|e| format!("the sink record of volume {vol} cannot be removed: {e}"))
     }
 
     /// Hands over a connection a listener accepted; it is routed once its

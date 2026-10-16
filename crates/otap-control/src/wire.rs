@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn frames_round_trip_and_bounds_hold() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &Request::Ping).unwrap();
+        write_frame(&mut buf, &Request::Ping {}).unwrap();
         write_frame(
             &mut buf,
             &Request::VolumeCreate {
@@ -153,7 +153,7 @@ mod tests {
         .unwrap();
         let mut cursor = io::Cursor::new(buf);
         let a: Option<Request> = read_frame(&mut cursor).unwrap();
-        assert_eq!(a, Some(Request::Ping));
+        assert_eq!(a, Some(Request::Ping {}));
         let b: Option<Request> = read_frame(&mut cursor).unwrap();
         assert!(matches!(b, Some(Request::VolumeCreate { .. })));
         let c: Option<Request> = read_frame(&mut cursor).unwrap();

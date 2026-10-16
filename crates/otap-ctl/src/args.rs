@@ -249,9 +249,13 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                 return Err("a bare `--`".to_string());
             }
             if let Some((name, value)) = rest.split_once('=') {
-                flags
-                    .values
-                    .insert(format!("--{name}"), Some(value.to_string()));
+                let flag = format!("--{name}");
+                if BOOL_FLAGS.contains(&flag.as_str()) {
+                    // A switch has no value: `--stale=false` must not read
+                    // as `--stale` (the Step 6 review's R2).
+                    return Err(format!("{flag} is a switch and takes no value ({arg:?})"));
+                }
+                flags.values.insert(flag, Some(value.to_string()));
             } else if BOOL_FLAGS.contains(&arg) {
                 flags.values.insert(arg.to_string(), None);
             } else {
@@ -308,8 +312,8 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut wait_verify = false;
     let mut wait_job = false;
     let request = match (group.as_str(), verb.as_str()) {
-        ("daemon", "ping") => Request::Ping,
-        ("daemon", "stop") => Request::DaemonStop,
+        ("daemon", "ping") => Request::Ping {},
+        ("daemon", "stop") => Request::DaemonStop {},
         ("pool", "format") => Request::PoolFormat {
             device: flags.required("--device")?,
             size_bytes: flags.size("--size")?,
@@ -345,9 +349,9 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                     .unwrap_or(DEFAULT_CP_INTERVAL_SECS),
             }
         }
-        ("pool", "status") => Request::PoolStatus,
-        ("pool", "sync") => Request::PoolSync,
-        ("pool", "clean") => Request::PoolClean,
+        ("pool", "status") => Request::PoolStatus {},
+        ("pool", "sync") => Request::PoolSync {},
+        ("pool", "clean") => Request::PoolClean {},
         ("pool", "verify") => {
             let no_wait = flags.flag("--no-wait");
             let status = flags.flag("--status");
@@ -366,14 +370,14 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                 }
             }
         }
-        ("pool", "stop") => Request::PoolStop,
+        ("pool", "stop") => Request::PoolStop {},
         ("volume", "create") => Request::VolumeCreate {
             name: flags.required("--name")?,
             size_bytes: flags
                 .size("--size")?
                 .ok_or_else(|| "`volume create` needs --size".to_string())?,
         },
-        ("volume", "list") => Request::VolumeList,
+        ("volume", "list") => Request::VolumeList {},
         ("volume", "show") => Request::VolumeShow {
             name: flags.required("--name")?,
         },
@@ -682,17 +686,17 @@ mod tests {
         assert_eq!(cmd.control.to_string(), "tcp:127.0.0.1:9");
         assert!(cmd.json);
         assert_eq!(cmd.timeout, Duration::from_secs(7));
-        assert_eq!(cmd.request, Request::PoolStatus);
+        assert_eq!(cmd.request, Request::PoolStatus {});
         let Parsed::Run(cmd) = parse(&args("--control=tcp:127.0.0.1:9 daemon ping")).unwrap()
         else {
             panic!("a command")
         };
-        assert_eq!(cmd.request, Request::Ping);
+        assert_eq!(cmd.request, Request::Ping {});
     }
 
     #[test]
     fn every_verb_parses() {
-        assert_eq!(request("daemon stop"), Request::DaemonStop);
+        assert_eq!(request("daemon stop"), Request::DaemonStop {});
         assert_eq!(
             request("pool format --device /dev/sdb --media hdd --stripe 1M --segment 64M --flush-opaque --strict-flush --force"),
             Request::PoolFormat {
@@ -750,8 +754,8 @@ mod tests {
         );
         assert_eq!(arena_bytes, DEFAULT_ARENA_BYTES);
         assert_eq!(cp_interval_secs, DEFAULT_CP_INTERVAL_SECS);
-        assert_eq!(request("pool sync"), Request::PoolSync);
-        assert_eq!(request("pool clean"), Request::PoolClean);
+        assert_eq!(request("pool sync"), Request::PoolSync {});
+        assert_eq!(request("pool clean"), Request::PoolClean {});
         // `pool verify` waits for its report unless told not to.
         let Parsed::Run(cmd) = parse(&args("pool verify")).unwrap() else {
             panic!("pool verify runs");
@@ -771,7 +775,7 @@ mod tests {
             request("pool verify --cancel"),
             Request::PoolVerifyCancel {}
         );
-        assert_eq!(request("pool stop"), Request::PoolStop);
+        assert_eq!(request("pool stop"), Request::PoolStop {});
         assert_eq!(
             request("volume create --name data --size 10G"),
             Request::VolumeCreate {
@@ -779,7 +783,7 @@ mod tests {
                 size_bytes: 10 << 30,
             }
         );
-        assert_eq!(request("volume list"), Request::VolumeList);
+        assert_eq!(request("volume list"), Request::VolumeList {});
         assert_eq!(
             request("volume show --name data"),
             Request::VolumeShow {

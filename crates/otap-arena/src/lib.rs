@@ -544,6 +544,24 @@ pub struct DamagedSlot {
     pub damage: Damage,
 }
 
+/// How the arena's writer fills its reservations, which decides what a
+/// `Free` slot under a stale seal found at re-attach can be: a fill killed
+/// between the slot's field stores and its word, or a damaged word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fills {
+    /// Several reservations may be outstanding and filled in any order (the
+    /// arena's general contract, and what its own random walk drives): an
+    /// interrupted fill can lie anywhere in the window, so only a neighbour
+    /// of the same write shows a stale slot to be damage.
+    Interleaved,
+    /// One reservation at a time, filled whole before the next is made (the
+    /// engine's thread): an interrupted fill is the newest reservation's, so
+    /// a stale slot with anything written after it is damage. This is what
+    /// catches a damaged word of a one-block write, which has no neighbour
+    /// of its own write (the Step 6 review's D10).
+    Serial,
+}
+
 /// What [`Arena::attach`] found.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Reattach {
@@ -977,7 +995,16 @@ impl Arena {
         mem: HugeArena,
         agg_id: &Uuid,
     ) -> Result<(Self, Reattach), (ArenaError, HugeArena)> {
-        let (mut arena, report) = Self::attach_deferred(mem, agg_id)?;
+        Self::attach_with(mem, agg_id, Fills::Interleaved)
+    }
+
+    /// [`attach`](Self::attach) for a writer that fills as `fills` says.
+    pub fn attach_with(
+        mem: HugeArena,
+        agg_id: &Uuid,
+        fills: Fills,
+    ) -> Result<(Self, Reattach), (ArenaError, HugeArena)> {
+        let (mut arena, report) = Self::attach_deferred_with(mem, agg_id, fills)?;
         arena.apply_pending_writes();
         Ok((arena, report))
     }
@@ -991,6 +1018,16 @@ impl Arena {
     pub fn attach_deferred(
         mem: HugeArena,
         agg_id: &Uuid,
+    ) -> Result<(Self, Reattach), (ArenaError, HugeArena)> {
+        Self::attach_deferred_with(mem, agg_id, Fills::Interleaved)
+    }
+
+    /// [`attach_deferred`](Self::attach_deferred) for a writer that fills as
+    /// `fills` says (the engine fills serially, [`Fills::Serial`]).
+    pub fn attach_deferred_with(
+        mem: HugeArena,
+        agg_id: &Uuid,
+        fills: Fills,
     ) -> Result<(Self, Reattach), (ArenaError, HugeArena)> {
         if let Err(e) = Self::can_attach(&mem, agg_id) {
             return Err((e, mem));
@@ -1014,7 +1051,7 @@ impl Arena {
             next_seq: 1,
             pending: None,
         };
-        match arena.scan_on_attach(&hdr) {
+        match arena.scan_on_attach(&hdr, fills) {
             Ok(report) => Ok((arena, report)),
             Err(e) => Err((e, arena.mem)),
         }
@@ -1025,7 +1062,7 @@ impl Arena {
     /// from the table as it was found, and the writes it calls for left
     /// pending.
     #[allow(clippy::too_many_lines)]
-    fn scan_on_attach(&mut self, hdr: &ArenaHeader) -> Result<Reattach, ArenaError> {
+    fn scan_on_attach(&mut self, hdr: &ArenaHeader, fills: Fills) -> Result<Reattach, ArenaError> {
         let arena = self;
         let mut report = Reattach::default();
         let slots = u64::from(arena.slots);
@@ -1042,12 +1079,24 @@ impl Arena {
         let mut filling: HashSet<(u64, u32)> = HashSet::new();
         // `Free` slots under a stale seal, judged once the head is known.
         let mut stale: Vec<(u32, SlotDesc)> = Vec::new();
+        // The highest position of a slot that verifies as written (filled,
+        // placed or committed): an interrupted fill is the newest
+        // reservation's, so nothing written lies after it.
+        let mut max_written: Option<u64> = None;
+        // Slots whose word does not verify, rewritten once the head is known
+        // under the lap their position implies, never the lap the damaged
+        // word claims (sealed, a wrong lap would move the next attach's head
+        // by laps: the Step 6 review's R5).
+        let mut unverified: Vec<u32> = Vec::new();
         for slot in 0..arena.slots {
             let desc = *arena.desc(slot);
             max_seq = max_seq.max(desc.seq);
             let valid = desc.verify();
             let lap = desc.lap();
             let pos = u64::from(lap) * slots + u64::from(slot);
+            if valid && desc.state() != SlotState::Free {
+                max_written = Some(max_written.map_or(pos, |m| m.max(pos)));
+            }
             let mut note_pos = || max_pos = Some(max_pos.map_or(pos, |m| m.max(pos)));
             match desc.state() {
                 SlotState::Free => {
@@ -1081,6 +1130,7 @@ impl Arena {
                         report.dropped_filled += 1;
                         filling.insert((desc.seq, lap));
                         note_pos();
+                        rewrite.push((slot, SlotState::Committed, lap));
                     } else {
                         // A fill seals its word in one store: an unsealed
                         // `Filled` slot was something else before.
@@ -1089,8 +1139,8 @@ impl Arena {
                             desc,
                             damage: Damage::Descriptor,
                         });
+                        unverified.push(slot);
                     }
-                    rewrite.push((slot, SlotState::Committed, lap));
                 }
                 SlotState::Placed => {
                     if !valid {
@@ -1099,7 +1149,7 @@ impl Arena {
                             desc,
                             damage: Damage::Descriptor,
                         });
-                        rewrite.push((slot, SlotState::Committed, lap));
+                        unverified.push(slot);
                         continue;
                     }
                     note_pos();
@@ -1164,7 +1214,7 @@ impl Arena {
                             desc,
                             damage: Damage::Descriptor,
                         });
-                        rewrite.push((slot, SlotState::Committed, lap));
+                        unverified.push(slot);
                     }
                 }
             }
@@ -1190,11 +1240,30 @@ impl Arena {
                 reason: "the live window is wider than the ring",
             });
         }
+        for slot in unverified {
+            let pos = implied_pos(slot, slots, arena.head, false);
+            rewrite.push((slot, SlotState::Committed, lap_of(pos, slots)));
+        }
         for (slot, desc) in stale {
-            let lap = desc.lap();
-            if arena.fill_went_past(slot, &desc) {
-                // The write this slot belongs to was filled past it, or
-                // placed: its word was damaged, and the block may have
+            // The stale word's lap is not verified: the slot is judged at the
+            // position its index takes in the window, up to the head (the
+            // Step 6 review's D10).
+            let pos = implied_pos(slot, slots, arena.head, true);
+            let lap = lap_of(pos, slots);
+            if pos >= arena.head {
+                // At or beyond the head: outside the window, and the next
+                // reservation re-seals it. (A fill killed on the last slot
+                // of the newest reservation lands here, and so would damage
+                // to the newest write's last word: the two cannot be told
+                // apart, and the second needs damage to that one word.)
+                continue;
+            }
+            let overtaken = fills == Fills::Serial && max_written.is_some_and(|w| w > pos);
+            if arena.fill_went_past(slot, &desc, lap) || overtaken {
+                // The write this slot belongs to was filled past it or
+                // placed, or (for a serial writer, whose interrupted fill is
+                // always its newest reservation's) something was written
+                // after it: its word was damaged, and the block may have
                 // been acknowledged.
                 report.damaged.push(DamagedSlot {
                     slot,
@@ -1202,11 +1271,9 @@ impl Arena {
                     damage: Damage::Descriptor,
                 });
                 rewrite.push((slot, SlotState::Committed, lap));
-            } else if u64::from(lap) * slots + u64::from(slot) < arena.head {
-                // An interrupted fill inside the window (or behind it):
-                // released, so the tail passes it. At or beyond the head it
-                // is outside the window and the next reservation re-seals
-                // it.
+            } else {
+                // An interrupted fill inside the window: released, so the
+                // tail passes it.
                 report.interrupted_fills += 1;
                 rewrite.push((slot, SlotState::Committed, lap));
             }
@@ -1236,13 +1303,15 @@ impl Arena {
     /// before it, or a filled, placed or committed one after it, means the
     /// word was damaged. (A `Committed` slot before it says nothing: an
     /// earlier attach released the `Filled` slots of an interrupted fill.)
-    fn fill_went_past(&self, slot: u32, desc: &SlotDesc) -> bool {
+    /// `lap` is the lap the slot's position implies, never the stale word's
+    /// own, which is not verified.
+    fn fill_went_past(&self, slot: u32, desc: &SlotDesc, lap: u32) -> bool {
         let same_write = |n: &SlotDesc, lba: Option<u64>| {
             n.verify()
                 && n.seq == desc.seq
                 && n.vol() == desc.vol()
                 && n.kind == desc.kind
-                && n.lap() == desc.lap()
+                && n.lap() == lap
                 && Some(n.lba()) == lba
         };
         if slot > 0 {
@@ -1657,6 +1726,30 @@ impl Arena {
 /// too small to hold one.
 pub fn slots_for_len(len: usize) -> Result<u32, ArenaError> {
     Geometry::for_len(len).map(|g| g.slots)
+}
+
+/// The ring position slot `slot` takes in a window that ends at `head`: the
+/// highest position with that slot index at or below `head` (`at_head`) or
+/// below it, so within one ring of it. A slot the first lap has not reached
+/// yet keeps its own index, beyond the head. What the re-attach judges a
+/// slot whose word does not verify by, since the lap such a word claims is
+/// not to be trusted (the Step 6 review's D10 and R6).
+fn implied_pos(slot: u32, slots: u64, head: u64, at_head: bool) -> u64 {
+    let slot = u64::from(slot);
+    let top = if at_head {
+        head
+    } else {
+        head.saturating_sub(1)
+    };
+    if top < slot {
+        return slot;
+    }
+    top - (top - slot) % slots.max(1)
+}
+
+/// The lap of ring position `pos`.
+fn lap_of(pos: u64, slots: u64) -> u32 {
+    u32::try_from(pos / slots.max(1)).map_or(MAX_LAP, |lap| lap.min(MAX_LAP))
 }
 
 const _: () = {

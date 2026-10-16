@@ -35,9 +35,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use otap_cp::IoError;
 use otap_format::BLOCK_SIZE;
 use otap_sys::ublk::{
-    UblksrvIoDesc, UBLK_F_CMD_IOCTL_ENCODE, UBLK_F_URING_CMD_COMP_IN_TASK, UBLK_F_USER_COPY,
-    UBLK_F_USER_RECOVERY, UBLK_F_USER_RECOVERY_REISSUE, UBLK_IO_OP_DISCARD, UBLK_IO_OP_FLUSH,
-    UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_S_DEV_DEAD, UBLK_S_DEV_LIVE, UBLK_S_DEV_QUIESCED,
+    UblksrvIoDesc, UBLK_F_CMD_IOCTL_ENCODE, UBLK_F_UNPRIVILEGED_DEV, UBLK_F_URING_CMD_COMP_IN_TASK,
+    UBLK_F_USER_COPY, UBLK_F_USER_RECOVERY, UBLK_F_USER_RECOVERY_REISSUE, UBLK_IO_OP_DISCARD,
+    UBLK_IO_OP_FLUSH, UBLK_IO_OP_READ, UBLK_IO_OP_WRITE, UBLK_S_DEV_DEAD, UBLK_S_DEV_LIVE,
+    UBLK_S_DEV_QUIESCED,
 };
 
 use crate::frontdoor::{QueueEvent, Transport, TransportError, EINVAL, EIO, ENODEV};
@@ -202,6 +203,18 @@ struct Kernel {
 }
 
 impl Kernel {
+    /// `GET_DEV_INFO` without a character-device path, as `LinuxHost` sends
+    /// it: a device created with `UBLK_F_UNPRIVILEGED_DEV` answers `EINVAL`
+    /// (`ublk_ctrl_uring_cmd_permission` wants the path for every command
+    /// on such a device); a deleted one is gone.
+    fn get_dev_info(&self, dev_id: u32) -> Result<Option<DevInfo>, i32> {
+        match self.devices.get(&dev_id).filter(|d| !d.deleted) {
+            None => Ok(None),
+            Some(d) if d.flags & UBLK_F_UNPRIVILEGED_DEV != 0 => Err(EINVAL),
+            Some(d) => Ok(Some(d.info(dev_id))),
+        }
+    }
+
     fn fail(&mut self, cmd: MockCmd) -> Option<i32> {
         let pos = self.fail_next.iter().position(|(c, _)| *c == cmd)?;
         Some(self.fail_next.remove(pos).1)
@@ -417,6 +430,36 @@ impl MockKernel {
             k.live_pids.insert(pid);
             pid
         };
+        MockHost {
+            kernel: self.clone(),
+            proc: Arc::new(Proc {
+                kernel: self.clone(),
+                pid,
+            }),
+        }
+    }
+
+    /// Marks device `dev_id` as created by unprivileged software
+    /// (`UBLK_F_UNPRIVILEGED_DEV`): `GET_DEV_INFO` without its character
+    /// device's path answers `EINVAL` for it.
+    pub fn set_unprivileged(&self, dev_id: u32) {
+        if let Some(d) = self.lock().devices.get_mut(&dev_id) {
+            d.flags |= UBLK_F_UNPRIVILEGED_DEV;
+        }
+    }
+
+    /// Starts a daemon process that the kernel gave the pid of a dead one
+    /// (`pid` reused, as for `dbladed` running as PID 1 of a container).
+    ///
+    /// # Panics
+    /// `pid` is a live process.
+    #[must_use]
+    pub fn process_with_pid(&self, pid: i32) -> MockHost {
+        {
+            let mut k = self.lock();
+            assert!(!k.live_pids.contains(&pid), "pid {pid} is alive");
+            k.live_pids.insert(pid);
+        }
         MockHost {
             kernel: self.clone(),
             proc: Arc::new(Proc {
@@ -724,11 +767,13 @@ impl UblkHost for MockHost {
 
     fn list(&mut self) -> Result<Vec<DevInfo>, TransportError> {
         let k = self.kernel.lock();
-        Ok(k.devices
+        let ids: Vec<u32> = k
+            .devices
             .iter()
             .filter(|(_, d)| !d.deleted)
-            .map(|(id, d)| d.info(*id))
-            .collect())
+            .map(|(id, _)| *id)
+            .collect();
+        crate::host::listing(&ids, |id| k.get_dev_info(id))
     }
 
     fn info(&mut self, dev_id: u32) -> Result<Option<DevInfo>, TransportError> {
@@ -741,10 +786,10 @@ impl UblkHost for MockHost {
                 errno,
             });
         }
-        Ok(k.devices
-            .get(&dev_id)
-            .filter(|d| !d.deleted)
-            .map(|d| d.info(dev_id)))
+        k.get_dev_info(dev_id).map_err(|errno| TransportError {
+            what: "GET_DEV_INFO",
+            errno,
+        })
     }
 
     fn create(

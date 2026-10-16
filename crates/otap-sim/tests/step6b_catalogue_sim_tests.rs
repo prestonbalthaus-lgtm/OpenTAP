@@ -476,10 +476,14 @@ fn a_damaged_snapshot_record_quarantines_what_it_may_have_changed_and_the_mark_p
     let (head, _) = head_of(&mut s, TableKind::Snapshots);
     // s1 in the base; s2, the pin of s1 and s3 in three deltas.
     assert_eq!((head.base_records(), head.deltas.len()), (1, 3), "{head:?}");
-    // The pin's record (the second delta's only record), in its uuid.
+    // The pin's delta region damaged outside its record, so no record is
+    // lost. (Ported after the Step 6 review's D9: a record lost from the
+    // snapshot table, the damage this test first injected inside the
+    // pin's record, now refuses the boot; see
+    // `review_step6_sim_tests::d9_a_snapshot_table_that_lost_records_refuses_the_boot`.)
     flip(
         &mut s,
-        head.deltas[1].region.pba as usize * BLOCK_SIZE + 64 + 20,
+        head.deltas[1].region.pba as usize * BLOCK_SIZE + 64 + 64 + 10,
     );
     s.crash_daemon().unwrap();
     s.boot().unwrap();
@@ -487,8 +491,9 @@ fn a_damaged_snapshot_record_quarantines_what_it_may_have_changed_and_the_mark_p
         w,
         OperatorWarning::SnapshotTableDamaged { .. }
     )));
-    // s1 and s2 last changed before the damaged region: uncertain,
-    // quarantined; s3 came after it: whole. The lost pin is lost.
+    // s2 last changed before the damaged region: uncertain, quarantined;
+    // s1's pin is in that region and was read whole, and s3 came after it:
+    // both whole.
     let listed = s.engine().snapshots();
     let get = |id: u64| {
         listed
@@ -498,17 +503,18 @@ fn a_damaged_snapshot_record_quarantines_what_it_may_have_changed_and_the_mark_p
             .expect("listed")
     };
     assert!(
-        get(s1).damaged && get(s2).damaged && !get(s3).damaged,
+        !get(s1).damaged && get(s2).damaged && !get(s3).damaged,
         "{listed:?}"
     );
-    assert_eq!(get(s1).flags, 0);
+    assert_eq!(get(s1).flags, PIN_USER);
     let mut buf = vec![0u8; BLOCK_SIZE];
     assert!(matches!(
-        s.engine().snapshot_read(s1, 0, &mut buf),
+        s.engine().snapshot_read(s2, 8, &mut buf),
         Err(EngineError::SnapshotDamaged { .. })
     ));
+    s.engine().snapshot_read(s1, 0, &mut buf).unwrap();
     s.engine().snapshot_read(s3, 0, &mut buf).unwrap();
-    s.snaps.retain(|x| x.snap_id == s3);
+    s.snaps.retain(|x| x.snap_id != s2);
     s.verify_recovery().unwrap();
     // The boot commit repaired the table; the mark stays across reboots.
     assert_eq!(s.engine().pool_status().snapshot_table_deltas, 0);
@@ -520,11 +526,11 @@ fn a_damaged_snapshot_record_quarantines_what_it_may_have_changed_and_the_mark_p
     )));
     let listed = s.engine().snapshots();
     assert!(
-        listed.iter().filter(|x| x.damaged).count() == 2,
+        listed.iter().filter(|x| x.damaged).count() == 1,
         "{listed:?}"
     );
     let records = s.engine().snapshot_records();
-    assert!(records.iter().filter(|r| r.is_uncertain()).count() == 2);
+    assert!(records.iter().filter(|r| r.is_uncertain()).count() == 1);
     // Deleting an uncertain snapshot releases nothing: its blocks may
     // already belong to others. What it held stays counted, a leak the
     // verification reports as warnings, never as damage.
@@ -544,14 +550,19 @@ fn a_damaged_snapshot_record_quarantines_what_it_may_have_changed_and_the_mark_p
         .findings
         .iter()
         .any(|f| f.kind == FindingKind::LiveBlocks));
-    assert!(report
+    // The only quarantined snapshot is gone with its deletion.
+    assert!(!report
         .findings
         .iter()
-        .any(|f| f.kind == FindingKind::SnapshotQuarantined && f.snap_id == Some(s1)));
+        .any(|f| f.kind == FindingKind::SnapshotQuarantined));
 }
 
+/// Ported after the Step 6 review's D9: a lost tombstone used to bring the
+/// deleted snapshot back, quarantined; a record lost from the snapshot
+/// table now refuses the boot, since the lost record could as well have
+/// created a snapshot whose blocks a boot without it would free.
 #[test]
-fn a_damaged_tombstone_brings_back_a_quarantined_snapshot_whose_deletion_frees_nothing() {
+fn a_damaged_tombstone_refuses_the_boot_rather_than_bring_back_a_deleted_snapshot() {
     let mut cfg = small(6350);
     cfg.volumes = vec![(0, 64)];
     let mut s = sim_with(cfg);
@@ -570,39 +581,17 @@ fn a_damaged_tombstone_brings_back_a_quarantined_snapshot_whose_deletion_frees_n
     assert_eq!(tomb.records, 1);
     flip(&mut s, tomb.region.pba as usize * BLOCK_SIZE + 64 + 4);
     s.crash_daemon().unwrap();
-    s.boot().unwrap();
-    assert!(warned(&mut s, |w| matches!(
-        w,
-        OperatorWarning::SnapshotTableDamaged { .. }
-    )));
-    let listed = s.engine().snapshots();
-    let back = listed.iter().find(|x| x.snap_id == s1).expect("s1 is back");
-    assert!(back.damaged, "a resurrected snapshot is quarantined");
-    assert!(listed.iter().find(|x| x.snap_id == s2).unwrap().damaged);
-    let mut buf = vec![0u8; BLOCK_SIZE];
-    assert!(s.engine().snapshot_read(s1, 0, &mut buf).is_err());
-    // Its deletion frees nothing it might share with what reused its space.
-    let seen = s.events.len();
-    s.delete_snapshot(s1).unwrap();
-    for e in &s.events[seen..] {
-        if let Event::Internal { what } = e {
-            assert!(!what.contains("went negative"), "{what}");
-        }
-        if let Event::SnapshotDeleted {
-            snap_id, released, ..
-        } = e
-        {
-            assert_eq!((*snap_id, *released), (s1, 0));
-        }
-    }
-    s.request_cp().unwrap();
-    let report = s.attest_with(otap_cp::VerifyOptions::default()).unwrap();
-    assert_eq!(report.errors, 0, "{:?}", report.findings);
-    s.read(0, 0, 64).unwrap();
+    let e = s.boot().expect_err("a lost record of the snapshot table");
+    assert!(e.contains("snapshot table") && e.contains("lost"), "{e}");
+    let _ = (s1, s2);
 }
 
+/// Ported after the Step 6 review's D9: a pool whose snapshot head (an
+/// older CP's) does not verify used to boot without the table, so every
+/// snapshot was dropped and the blocks only they held were freed by the
+/// next cleaning; the boot is refused instead, as format 2.3 refused it.
 #[test]
-fn a_lost_head_written_by_an_older_cp_boots_without_the_table() {
+fn a_lost_head_written_by_an_older_cp_refuses_the_boot() {
     let mut cfg = small(6360);
     cfg.volumes = vec![(0, 64)];
     let mut s = sim_with(cfg);
@@ -620,23 +609,11 @@ fn a_lost_head_written_by_an_older_cp_boots_without_the_table() {
     );
     flip(&mut s, root.pba as usize * BLOCK_SIZE + 100);
     s.crash_daemon().unwrap();
-    let info = s.boot().unwrap();
+    let e = s.boot().expect_err("an unreadable snapshot head");
     assert!(
-        !info.rewound,
-        "damage that every candidate shares tears none"
+        e.contains("snapshot table") && e.contains("head page"),
+        "{e}"
     );
-    assert!(warned(&mut s, |w| matches!(
-        w,
-        OperatorWarning::SnapshotTableDamaged { .. }
-    )));
-    assert!(s.engine().snapshots().is_empty());
-    // The volume and its data are intact; what the snapshot held stays
-    // counted (a leak, reported as a warning).
-    s.snaps.clear();
-    s.check_disk_prefix().unwrap();
-    assert_eq!(s.read(0, 0, 16).unwrap().0, Status::Ok);
-    let report = s.attest_with(otap_cp::VerifyOptions::default()).unwrap();
-    assert_eq!(report.errors, 0, "{:?}", report.findings);
 }
 
 #[test]

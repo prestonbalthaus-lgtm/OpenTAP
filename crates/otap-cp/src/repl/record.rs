@@ -16,7 +16,9 @@
 //! offset 64    landing_target  16 B  the snapshot the delta in flight ends at
 //! offset 80    landing_from    16 B  its base (nil for a full transfer)
 //! offset 96    pool_cp         u64   the destination pool's CP when this was written
-//! offset 104   reserved        24 B  zero
+//! offset 104   pool_nonce      u64   that CP's nonce (0 in a record written before
+//!                                    the Step 6 review: unknown)
+//! offset 112   reserved        16 B  zero
 //! offset 128   cursor          4096  the stream's CursorPage: the committed base's
 //!                                    CP (source numbering) and the ResumeBitmap of
 //!                                    the delta in flight, keyed by (cp_seq, nonce)
@@ -25,8 +27,13 @@
 //!
 //! A record is written whole after the consistency point that made its
 //! landed chunks durable, so it never claims more than the pool holds;
-//! `pool_cp` lets a boot that rewound below it notice that it does (a
-//! committed CP lost under a lying cache) and distrust the landing.
+//! `pool_cp` and `pool_nonce` let a boot that rewound below that CP notice
+//! that it does (a committed CP lost under a lying cache) and distrust the
+//! landing ([`SinkRecord::outlived_by_rewind`]): a rewind of more than one
+//! CP leaves the pool's CP below `pool_cp`, and a rewind of one commits the
+//! boot under the lost CP's number with another nonce. `pool_nonce` took
+//! reserved bytes, which every reader ignores, so the layout stays version
+//! 1.
 
 use otap_format::checksum::crc32c;
 use otap_format::{IntoBytes, Uuid};
@@ -66,6 +73,8 @@ pub struct SinkRecord {
     pub landing_from: Uuid,
     /// The destination pool's committed CP when the record was written.
     pub pool_cp: u64,
+    /// That CP's nonce; 0 when unknown (a record from before the field).
+    pub pool_nonce: u64,
     /// The stream cursor: `applied_cp_seq` is the base's CP in the
     /// source's numbering, and `landing` the delta in flight.
     pub cursor: Cursor,
@@ -85,8 +94,30 @@ impl SinkRecord {
             landing_target: Uuid::NIL,
             landing_from: Uuid::NIL,
             pool_cp: 0,
+            pool_nonce: 0,
             cursor: Cursor::new(0, 0, 0),
         }
+    }
+
+    /// `true` when the pool, committed at `cp_seq` with `cp_nonce`, no
+    /// longer holds the CP this record was written after: a boot rewound
+    /// below it (the pool's CP is lower), or rewound by one CP and
+    /// committed the boot under the same number (another nonce). What the
+    /// record says landed may then be gone, so its landing is not to be
+    /// trusted (the Step 6 review's D3).
+    #[must_use]
+    pub fn outlived_by_rewind(&self, cp_seq: u64, cp_nonce: u64) -> bool {
+        self.pool_cp > cp_seq
+            || (self.pool_cp == cp_seq && self.pool_nonce != 0 && self.pool_nonce != cp_nonce)
+    }
+
+    /// Forgets the delta in flight: nothing of it counts as landed, and the
+    /// live volume may hold part of it.
+    pub fn forget_landing(&mut self) {
+        self.cursor.abort();
+        self.landing_target = Uuid::NIL;
+        self.landing_from = Uuid::NIL;
+        self.dirty = true;
     }
 
     /// The store key of the record of destination volume `vol`.
@@ -121,6 +152,7 @@ impl SinkRecord {
         out[64..80].copy_from_slice(self.landing_target.as_array());
         out[80..96].copy_from_slice(self.landing_from.as_array());
         out[96..104].copy_from_slice(&self.pool_cp.to_le_bytes());
+        out[104..112].copy_from_slice(&self.pool_nonce.to_le_bytes());
         out[CURSOR_AT..CRC_AT].copy_from_slice(page.as_bytes());
         let crc = crc32c(&out[..CRC_AT]);
         out[CRC_AT..].copy_from_slice(&crc.to_le_bytes());
@@ -170,6 +202,8 @@ impl SinkRecord {
         let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
         let mut pool_cp = [0u8; 8];
         pool_cp.copy_from_slice(&bytes[96..104]);
+        let mut pool_nonce = [0u8; 8];
+        pool_nonce.copy_from_slice(&bytes[104..112]);
         let page = CursorPage::read(&bytes[CURSOR_AT..CRC_AT])
             .map_err(|e| format!("the sink record's cursor page: {e}"))?;
         let cursor =
@@ -184,6 +218,7 @@ impl SinkRecord {
             landing_target: uuid(64),
             landing_from: uuid(80),
             pool_cp: u64::from_le_bytes(pool_cp),
+            pool_nonce: u64::from_le_bytes(pool_nonce),
             cursor,
         };
         if page.pipe_id != record.pipe() {

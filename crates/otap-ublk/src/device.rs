@@ -484,17 +484,12 @@ impl UblkHost for LinuxHost {
             .filter_map(|e| e.file_name().to_str().and_then(parse_char_name))
             .collect();
         ids.sort_unstable();
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            // A device deleted between the listing and the command is gone.
-            if let Some(info) = self
-                .describe(id)
-                .map_err(|e| transport_error("GET_DEV_INFO", &e))?
-            {
-                out.push(info);
-            }
-        }
-        Ok(out)
+        // A device deleted between the listing and the command is gone
+        // (`describe` answers `None`); the rest of the policy is shared with
+        // the in-memory driver.
+        crate::host::listing(&ids, |id| {
+            self.describe(id).map_err(|e| e.raw_os_error().unwrap_or(0))
+        })
     }
 
     fn info(&mut self, dev_id: u32) -> Result<Option<DevInfo>, TransportError> {

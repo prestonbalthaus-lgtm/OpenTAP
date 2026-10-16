@@ -45,8 +45,9 @@ use otap_stream::{
 use super::record::SinkRecord;
 use super::wire::{Handshake, Refusal, RefuseCode, Role, NO_VOLUME};
 use super::{
-    chunk_image_len, find_snapshot_by_uuid, newest_transfer, resolve_volume, Backoff, Conn,
-    Inbound, JobMode, JobReport, JobState, SinkConfig,
+    chunk_image_len, find_snapshot_by_uuid, is_mirror_by_pool, newest_transfer, resolve_volume,
+    snapshot_elsewhere, volume_label, Backoff, Conn, Inbound, JobMode, JobReport, JobState,
+    SinkConfig,
 };
 use crate::engine::{Engine, EngineError, MAX_PUNCH_BLOCKS, MAX_REQUEST_BLOCKS};
 use crate::traits::{Backstore, Clock, Dialer, FrontDoor, Link, SinkStore};
@@ -331,14 +332,13 @@ impl SinkJob {
             }
             Some(mut rec) => {
                 self.stored = true;
-                if rec.pool_cp > eng.cp_seq() {
-                    // The pool is behind the record (a committed CP lost
-                    // under a lying cache): the landing is not to be
-                    // trusted.
-                    rec.cursor.abort();
-                    rec.landing_target = Uuid::NIL;
-                    rec.landing_from = Uuid::NIL;
-                    rec.dirty = true;
+                if rec.outlived_by_rewind(eng.cp_seq(), eng.cp_nonce()) {
+                    // The pool no longer holds the CP the record was written
+                    // after (a committed CP lost under a lying cache): the
+                    // landing is not to be trusted. `Replicator::attach`
+                    // makes the same check at boot, when a one-CP rewind is
+                    // still visible.
+                    rec.forget_landing();
                 }
                 if !rec.landing_target.is_nil() && pool_base_uuid == rec.landing_target {
                     // The destination snapshot was taken and the record did
@@ -369,7 +369,13 @@ impl SinkJob {
                 self.rec = rec;
             }
         }
-        if eng.volume(vol).is_some_and(|v| v.present && v.offline) {
+        // Only a destination the record or the pool names as a mirror is
+        // marked: an offline volume of the operator's that neither names is
+        // refused by `check_source`, never taken over (the Step 6 review's
+        // D5).
+        if (self.stored || is_mirror_by_pool(eng, vol))
+            && eng.volume(vol).is_some_and(|v| v.present && v.offline)
+        {
             let _ = eng.set_replica(vol, true);
         }
     }
@@ -442,7 +448,7 @@ impl SinkJob {
                 ));
             }
             let base = newest_transfer(eng, vol);
-            if !self.stored && base.is_none() && !eng.is_replica(vol) {
+            if !self.stored && !is_mirror_by_pool(eng, vol) && !eng.is_replica(vol) {
                 return Err(Refusal::new(
                     RefuseCode::Conflict,
                     format!(
@@ -475,6 +481,22 @@ impl SinkJob {
                      replication base; a full transfer needs a new destination volume",
                 ));
             }
+        }
+        if let Some(held) = snapshot_elsewhere(eng, h.snapshot, self.dst_vol) {
+            // Snapshot identities are unique per pool: the destination
+            // snapshot could never be taken, and the job would wait for it
+            // forever (the Step 6 review's W1).
+            return Err(Refusal::new(
+                RefuseCode::Conflict,
+                format!(
+                    "snapshot {} is already held by volume {} of this pool; a pool keeps one \
+                     copy of a source snapshot",
+                    h.snapshot,
+                    volume_label(eng, held.vol)
+                ),
+            ));
+        }
+        if let Some(vol) = self.dst_vol {
             if !eng.is_replica(vol) {
                 eng.set_replica(vol, true).map_err(|e| {
                     Refusal::new(RefuseCode::Internal, format!("marking the mirror: {e}"))
@@ -618,6 +640,7 @@ impl SinkJob {
             self.rec.src_vol = self.src_vol;
         }
         self.rec.pool_cp = eng.cp_seq();
+        self.rec.pool_nonce = eng.cp_nonce();
         let bytes = self.rec.encode()?;
         store
             .save(&SinkRecord::key(vol), &bytes)
@@ -1000,6 +1023,17 @@ impl SinkJob {
             return true;
         };
         if !started {
+            // The landing goes first, durably: a record that still claimed
+            // the abandoned delta's chunks after the rollback (or the
+            // deletion) wiped them would let a later push of that delta
+            // resume and skip them (the Step 6 review's D4).
+            if self.rec.cursor.landing.is_some() || !self.rec.landing_target.is_nil() {
+                self.rec.forget_landing();
+                if let Err(e) = self.persist(eng, store) {
+                    self.fail(e);
+                    return true;
+                }
+            }
             let asked = match base {
                 Some(snap_id) => eng.rollback_volume(vol, snap_id),
                 None => eng.delete_volume(vol),
@@ -1146,7 +1180,7 @@ impl SinkJob {
                     );
                     return Ok(true);
                 }
-                self.vol_event(eng, &delta, &ev)
+                self.vol_event(eng, store, &delta, &ev)
             }
             Frame::Holes(holes) => {
                 let Some(vol) = self.dst_vol else {
@@ -1355,6 +1389,7 @@ impl SinkJob {
     fn vol_event<B: Backstore, F: FrontDoor, C: Clock>(
         &mut self,
         eng: &mut Engine<B, F, C>,
+        store: &mut dyn SinkStore,
         delta: &Delta,
         ev: &otap_stream::VolEvent,
     ) -> Result<bool, String> {
@@ -1385,6 +1420,13 @@ impl SinkJob {
                             .map_err(|e| format!("marking the mirror: {e}"))?;
                         self.dst_vol = Some(vol);
                         self.stage = Stage::Create;
+                        // The record names the mirror before its creation can
+                        // become durable: a sink killed in between finds a
+                        // volume its record calls a mirror (not an operator's
+                        // volume, which is refused, D5), and a creation that
+                        // never committed leaves a record of a gone volume,
+                        // which `attach` removes.
+                        self.persist(eng, store)?;
                     }
                 }
                 Ok(true)
@@ -1783,10 +1825,22 @@ impl SinkJob {
         let Some(vol) = self.dst_vol else {
             return false;
         };
-        let target = match &self.target {
+        let mut target = match &self.target {
             Some(t) => t.clone(),
             None => return false,
         };
+        // The snapshot takes the identity of the delta that landed, recorded
+        // when it began, never that of a later handshake: a source that
+        // reconnected with a newer target while this delta's snapshot was
+        // being taken must not get the old content under the new identity
+        // (the Step 6 review's D2). The newer delta waits for this one.
+        if !self.rec.landing_target.is_nil() && self.rec.landing_target != target.uuid {
+            target = Target {
+                uuid: self.rec.landing_target,
+                cp: delta.cp,
+                name: delta.snap_name.clone().unwrap_or_default(),
+            };
+        }
         if self.stage == Stage::Apply {
             let Some(end) = delta.end else {
                 return false;
@@ -1855,6 +1909,16 @@ impl SinkJob {
         ) {
             Ok(()) => self.snap_asked = Some(now),
             Err(EngineError::NameExists { .. }) => self.snap_unnamed = true,
+            Err(EngineError::SnapshotExists { .. })
+                if snapshot_elsewhere(eng, target.uuid, Some(vol)).is_some() =>
+            {
+                // Another volume took the identity since the handshake: the
+                // snapshot can never be taken here (W1).
+                self.fail(format!(
+                    "snapshot {} is already held by another volume of this pool",
+                    target.uuid
+                ));
+            }
             Err(EngineError::SnapshotExists { .. })
             | Err(EngineError::VolumeBusy { .. })
             | Err(EngineError::NvFailed { .. }) => self.snap_asked = Some(now),

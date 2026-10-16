@@ -5,7 +5,7 @@ use core::fmt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use otap_arena::{Arena, ArenaError, ArenaSurvey, PlacedSlot, RingRef};
+use otap_arena::{Arena, ArenaError, ArenaSurvey, Fills, PlacedSlot, RingRef};
 use otap_format::checksum::crc32c;
 use otap_format::{
     boot_write_active, cp_stripes_image, map_roots_image, table_delta_image, validate_name,
@@ -1933,7 +1933,11 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         // the next one the same evidence, so no number of kills during the
         // boot loses the hold.
         let (arena, reattach, arena_lost) = match Arena::can_attach(&memory, &cfg.agg_id) {
-            Ok(()) => match Arena::attach_deferred(memory, &cfg.agg_id) {
+            // The engine fills one reservation at a time, whole, on its own
+            // thread (`serve_write`, `serve_punch`, `apply_write`,
+            // `apply_punch`), so an interrupted fill is its newest
+            // reservation's (the Step 6 review's D10).
+            Ok(()) => match Arena::attach_deferred_with(memory, &cfg.agg_id, Fills::Serial) {
                 Ok((arena, report)) => (arena, Some(report), false),
                 // The table could not be reconciled: the arena is lost.
                 Err((_, memory)) => match Arena::create_deferred(memory, cfg.agg_id, wall) {
@@ -1962,9 +1966,22 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                     fail!(e, memory);
                 }
                 let lost = !survey.is_some_and(|s| s.holds_nothing());
-                match Arena::create_deferred(memory, cfg.agg_id, wall) {
-                    Ok(arena) => (arena, None, lost),
-                    Err((e, memory)) => fail!(e.into(), memory),
+                if !lost && state.is_clean() && !cfg.discard_arena {
+                    // A clean pool's empty arena: there is no hold to record
+                    // first, so the new arena is written now. Deferred, a
+                    // kill after the boot commit's `A` slot (which makes the
+                    // newest CP a running one) left the old header at the
+                    // new size, and every later boot refused the resize as
+                    // unclean (the Step 6 review's W3).
+                    match Arena::create(memory, cfg.agg_id, wall) {
+                        Ok(arena) => (arena, None, false),
+                        Err((e, memory)) => fail!(e.into(), memory),
+                    }
+                } else {
+                    match Arena::create_deferred(memory, cfg.agg_id, wall) {
+                        Ok(arena) => (arena, None, lost),
+                        Err((e, memory)) => fail!(e.into(), memory),
+                    }
                 }
             }
             Err(_) => {
@@ -2491,7 +2508,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         }
         let abort = if self.shutdown_requested || self.stopped {
             Some("the pool is shutting down".to_string())
-        } else if self.pool_full {
+        } else if self.pool_full && self.verify_holds_something(&job) {
+            // Only what it holds can be in the pool's way: a verification of
+            // a full pool that holds nothing goes on, so a full pool can
+            // still be attested (the Step 6 review's R3).
             Some("the pool is full and the verification holds deferred frees".to_string())
         } else if self.pool_tight() && self.verify_holds_something(&job) {
             Some(format!(
@@ -5198,10 +5218,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
 
     /// Builds the next relocation stripe from the blocks `job.clean` lists
     /// at flat position `from` and on: each block is read from its old
-    /// address, copied as it is (a block that no longer matches its CRC
-    /// stays damaged, under the same CRC, so its reads keep answering
-    /// `Corrupt`), and placed under its old birth and CRC at a new address
-    /// recorded in the block. The entries returned are the live map's
+    /// address, verified against its CRC (a block that fails is never
+    /// moved: its segment is skipped, `RelocError::Read`), and placed under
+    /// its old birth and CRC at a new address recorded in the block. The entries returned are the live map's
     /// deltas (snapshot-only blocks have none; their pages are rewritten in
     /// the metadata phase).
     fn build_reloc_stripe(
@@ -5243,6 +5262,24 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 return Err(RelocError::Read {
                     pseg: job.clean[target].pseg,
                     reason: format!("block {vol}/{lba} at {source}: {e}"),
+                });
+            }
+            // A block that no longer matches its CRC is not moved: copied
+            // under its recorded CRC it would make this CP's relocation
+            // stripe fail the unclean boot's data check under a trusted
+            // opaque barrier, and the boot would rewind past a sound CP
+            // (the Step 5 review's hazard 8, the Step 6 review's D1). Its
+            // segment is skipped like one with an unreadable block, so the
+            // damage stays where it is and keeps reading `Corrupt`.
+            let computed = crc32c(&image[at..at + BLOCK_SIZE]);
+            if computed != old.crc32c {
+                return Err(RelocError::Read {
+                    pseg: job.clean[target].pseg,
+                    reason: format!(
+                        "block {vol}/{lba} at {source} fails its CRC \
+                         (computed {computed:#010x}, recorded {:#010x})",
+                        old.crc32c
+                    ),
                 });
             }
             descs.push(
@@ -5804,10 +5841,13 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                     let old_root_page = RootRef::new(record.map_root_pba, 1, 0);
                     record.map_root_pba = page_ref.pba;
                     record.seal();
+                    // A relocation moves blocks, it repairs nothing: a
+                    // quarantined snapshot stays quarantined (the Step 6
+                    // review's D8).
                     let state = SnapState {
                         record,
                         pinned: Some(result.pinned.clone()),
-                        damage: None,
+                        damage: remaining[pos].damage.clone(),
                     };
                     remaining[pos] = state.clone();
                     // The old pages and index are nominated for every
@@ -6629,7 +6669,13 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 .iter_mut()
                 .find(|s| s.record.snap_id == rw.snap_id)
             {
+                // Damage found while the CP was in flight (a read, a diff)
+                // stays with the snapshot, as the rewrite's own does (D8).
+                let found = s.damage.take();
                 *s = rw.state;
+                if s.damage.is_none() {
+                    s.damage = found;
+                }
             }
             self.map.cache_pages(rw.new_pages);
         }

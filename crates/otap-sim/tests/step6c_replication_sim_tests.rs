@@ -723,9 +723,14 @@ fn a_delta_to_another_target_rolls_the_mirror_back_first() {
         p.write(lba, 4);
     }
     let s2 = p.snapshot();
+    // The landings of the new sink job: `sink_landed` alone read the
+    // finished first job's count, so the push was cancelled before it
+    // landed anything and the mirror was never dirty (found by the Step 6
+    // review; the rollback this test names now happens).
+    let shipped = p.dst_repl.jobs().len();
     let id = p.push(s2);
     p.run_until("part of the second delta to land", |p| {
-        p.sink_landed() >= 20
+        p.dst_repl.jobs().len() > shipped && p.sink_landed() >= 20
     });
     p.src_repl.cancel(id).expect("cancelled");
     p.write(7, 3);

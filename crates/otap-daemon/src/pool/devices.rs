@@ -92,13 +92,11 @@ impl Pool {
         }
     }
 
-    /// Writes the record of the pool's devices (when the pool has devices
-    /// at all). A failure is logged, never fatal: the record is a hint the
-    /// stamps back up.
+    /// Writes the record of the pool's devices, with or without ublk (a
+    /// `--no-ublk` daemon keeps the record of the devices a killed daemon
+    /// left, D11). A failure is logged, never fatal: the record is a hint
+    /// the stamps back up.
     pub(super) fn save_bindings(&mut self) {
-        if self.host.is_none() {
-            return;
-        }
         if let Err(e) = bindings::save(&self.state_dir, &self.bindings, std::process::id()) {
             let path = bindings::file_path(&self.state_dir, self.bindings.agg_id());
             self.log(format!(
@@ -184,10 +182,29 @@ impl Pool {
         for &(vol, size_blocks) in &online {
             let stamp = device_stamp(self.pool_fp, vol);
             let bound = self.bindings.bound(vol).map(|(dev_id, _)| dev_id);
-            let stamped = found
+            let claims: Vec<u32> = found
                 .iter()
-                .find(|d| d.stamp == stamp && !self.bindings.is_stale(d.dev_id))
-                .map(|d| d.dev_id);
+                .filter(|d| d.stamp == stamp && !self.bindings.is_stale(d.dev_id))
+                .map(|d| d.dev_id)
+                .collect();
+            if bound.is_none() && claims.len() > 1 {
+                // Two devices carry the volume's stamp and no record says
+                // which one it was serving (an older one may hold writes the
+                // newer one's overtook): neither is re-attached, both are
+                // left stale for the operator, and the volume gets a new
+                // device (the Step 6 review's D11).
+                for &dev_id in &claims {
+                    self.bindings
+                        .mark_stale(dev_id, vol, StaleReason::RecoveryFailed);
+                }
+                self.log(format!(
+                    "volume {vol}: ublk devices {claims:?} all carry its stamp and none is \
+                     recorded; none is re-attached, all are stale, and the volume gets a new \
+                     device"
+                ));
+                continue;
+            }
+            let stamped = claims.first().copied();
             let Some(dev_id) = bound.or(stamped) else {
                 continue;
             };

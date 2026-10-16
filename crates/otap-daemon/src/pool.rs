@@ -384,9 +384,12 @@ impl Pool {
             pool.log(line);
         }
         // The devices a killed daemon left are re-attached before any new
-        // one is made, so a volume keeps its `/dev/ublkbN` (Step 6B).
+        // one is made, so a volume keeps its `/dev/ublkbN` (Step 6B). The
+        // record is loaded on every boot, `--no-ublk` included, so a volume
+        // deleted there marks its device stale and the device can never be
+        // taken for the next volume at its index (the Step 6 review's D11).
+        pool.load_bindings();
         if pool.host.is_some() {
-            pool.load_bindings();
             if let Err(e) = pool.reconcile_devices(reattach_began) {
                 let _ = pool.stop();
                 return Err(e);
@@ -1026,11 +1029,11 @@ impl Pool {
     /// daemon and are refused here.
     pub fn handle(&mut self, req: &Request) -> Reply {
         match req {
-            Request::PoolStatus => self.status(),
-            Request::PoolSync => self.sync(),
-            Request::PoolClean => self.clean(),
+            Request::PoolStatus {} => self.status(),
+            Request::PoolSync {} => self.sync(),
+            Request::PoolClean {} => self.clean(),
             Request::VolumeCreate { name, size_bytes } => self.volume_create(name, *size_bytes),
-            Request::VolumeList => Ok(Response::Volumes {
+            Request::VolumeList {} => Ok(Response::Volumes {
                 volumes: self
                     .engine
                     .volumes()
@@ -1150,11 +1153,11 @@ impl Pool {
                 Ok(Response::Replication(replication_report(&report)))
             }
             Request::ReplicateRelease { volume } => self.replicate_release(volume),
-            Request::Ping
+            Request::Ping {}
             | Request::PoolFormat { .. }
             | Request::PoolBoot { .. }
-            | Request::PoolStop
-            | Request::DaemonStop => Err(bad_request("not a request for a booted pool")),
+            | Request::PoolStop {}
+            | Request::DaemonStop {} => Err(bad_request("not a request for a booted pool")),
         }
     }
 
@@ -1301,7 +1304,43 @@ impl Pool {
             _ => None,
         })?;
         self.devices.remove(&vol);
-        Ok(Response::Ok)
+        // A device still bound to the volume (left by a killed daemon and
+        // found by a `--no-ublk` boot, which re-attaches nothing) is stale
+        // from now on: the next volume at this index is another volume,
+        // whose stamp it would carry (the Step 6 review's D11).
+        if let Some((dev_id, _)) = self.bindings.bound(vol) {
+            self.bindings
+                .mark_stale(dev_id, vol, StaleReason::VolumeGone);
+            self.save_bindings();
+            self.log(format!(
+                "volume {name:?} deleted; its ublk device {dev_id} is stale (`otapctl device reap \
+                 {dev_id}` deletes it)"
+            ));
+        }
+        // A sink record is keyed by the volume's index: it goes with the
+        // volume, or the next volume at that index would be taken for the
+        // mirror at the next boot (the Step 6 review's D7).
+        if let Err(e) = self.repl.forget(vol) {
+            self.log(format!("volume {name:?} deleted, but {e}"));
+        }
+        Ok(Response::Ok {})
+    }
+
+    /// Refuses an operator's rollback or resize of a replication mirror:
+    /// its content belongs to the sink, which rolls it back and resizes it
+    /// itself, and a change under it would wipe chunks its record calls
+    /// landed (the Step 6 review's D4).
+    fn refuse_mirror(&self, vol: u32, name: &str, what: &str) -> Result<(), ControlError> {
+        if self.engine.is_replica(vol) {
+            return Err(ControlError::new(
+                ErrorCode::BadRequest,
+                format!(
+                    "volume {name:?} is a replication mirror and cannot be {what}; \
+                     `otapctl replicate release` ends the relationship first"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Brings a volume online (and exposes its device) or takes it offline
@@ -1329,6 +1368,7 @@ impl Pool {
     /// exposes is recreated at the new size.
     pub fn volume_resize(&mut self, name: &str, size_bytes: u64) -> Reply {
         let vol = self.vol_index(name)?;
+        self.refuse_mirror(vol, name, "resized")?;
         let blocks = blocks_for(size_bytes)?;
         let current = self.engine.volume(vol).map_or(0, |v| v.size_blocks);
         if blocks == current {
@@ -1415,7 +1455,7 @@ impl Pool {
         let vol = self.vol_index(volume)?;
         let snap_id = self.snap_index(vol, name)?;
         self.delete_snapshot_by_id(snap_id)?;
-        Ok(Response::Ok)
+        Ok(Response::Ok {})
     }
 
     fn delete_snapshot_by_id(&mut self, snap_id: u64) -> Result<(), ControlError> {
@@ -1433,6 +1473,7 @@ impl Pool {
     /// was online).
     pub fn snapshot_rollback(&mut self, volume: &str, name: &str, delete_newer: bool) -> Reply {
         let vol = self.vol_index(volume)?;
+        self.refuse_mirror(vol, volume, "rolled back")?;
         let snap_id = self.snap_index(vol, name)?;
         let snapshots = self.engine.snapshots();
         let target = snapshots
@@ -1570,7 +1611,7 @@ impl Pool {
         self.sync_now()?;
         match snap_id {
             Some(id) => self.report_snapshot(id),
-            None => Ok(Response::Ok),
+            None => Ok(Response::Ok {}),
         }
     }
 

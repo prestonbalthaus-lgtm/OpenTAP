@@ -226,7 +226,7 @@ impl Daemon {
     /// Answers one request.
     pub fn handle(&mut self, req: &Request) -> Reply {
         match req {
-            Request::Ping => Ok(Response::Pong {
+            Request::Ping {} => Ok(Response::Pong {
                 protocol: PROTOCOL_VERSION,
                 version: crate::VERSION.to_string(),
                 pool_booted: self.pool.is_some(),
@@ -300,18 +300,18 @@ impl Daemon {
                 self.lend_listener();
                 reply
             }
-            Request::PoolStop => {
+            Request::PoolStop {} => {
                 let mut pool = self.pool.take().ok_or_else(no_pool)?;
                 self.reclaim_listener(&mut pool);
                 pool.stop()
             }
-            Request::DaemonStop => {
+            Request::DaemonStop {} => {
                 let reply = match self.pool.take() {
                     Some(mut pool) => {
                         self.reclaim_listener(&mut pool);
-                        pool.stop().map(|_| Response::Ok)
+                        pool.stop().map(|_| Response::Ok {})
                     }
-                    None => Ok(Response::Ok),
+                    None => Ok(Response::Ok {}),
                 };
                 self.exit = true;
                 reply

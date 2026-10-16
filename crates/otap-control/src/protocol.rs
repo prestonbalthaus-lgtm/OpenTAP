@@ -53,7 +53,12 @@ pub enum ArenaKind {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     /// Is anyone there, and which protocol.
-    Ping,
+    ///
+    /// Every request without fields is an empty struct variant, never a
+    /// unit one: serde lets an internally tagged unit variant ignore the
+    /// fields it does not know, which `deny_unknown_fields` is meant to
+    /// refuse (the Step 6 review's R1). The JSON is the same, `{"op":"ping"}`.
+    Ping {},
     /// Formats `device` as a new pool. Refused while a pool is booted.
     PoolFormat {
         /// A block device or a file (created at `size_bytes` when it does
@@ -96,16 +101,16 @@ pub enum Request {
         cp_interval_secs: u32,
     },
     /// The pool as the engine sees it.
-    PoolStatus,
+    PoolStatus {},
     /// A consistency point now; returns when it is durable.
-    PoolSync,
+    PoolSync {},
     /// A cleaning consistency point now; returns when it is durable.
-    PoolClean,
+    PoolClean {},
     /// A clean shutdown of the pool; the daemon keeps running.
-    PoolStop,
+    PoolStop {},
     /// A clean shutdown of the pool (when one is booted) and the daemon's
     /// exit.
-    DaemonStop,
+    DaemonStop {},
     /// Creates a named, thin volume of `size_bytes` (rounded up to whole
     /// 4 KiB blocks); online once durable.
     VolumeCreate {
@@ -115,7 +120,7 @@ pub enum Request {
         size_bytes: u64,
     },
     /// Every volume.
-    VolumeList,
+    VolumeList {},
     /// One volume.
     VolumeShow {
         /// The name.
@@ -725,8 +730,9 @@ pub struct IoResultReport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
-    /// Done, nothing to say.
-    Ok,
+    /// Done, nothing to say. An empty struct variant, so an unknown field
+    /// is refused (see [`Request::Ping`]); the JSON is `{"kind":"ok"}`.
+    Ok {},
     /// The answer to `Ping`.
     Pong {
         /// The daemon's protocol version.

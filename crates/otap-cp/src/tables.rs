@@ -298,6 +298,17 @@ fn torn(table: TableKind, why: String) -> TornReason {
     TornReason::Table(format!("{}: {why}", table_name(table)))
 }
 
+/// Why a snapshot table region of an older CP that lost records tears the
+/// commit (the Step 6 review's D9): a snapshot whose record is lost would
+/// be dropped at the boot, and the blocks only it pins counted dead and
+/// freed by the cleaner. The catalogue loses only names, so it boots on.
+fn lost_snapshots(what: &str) -> String {
+    format!(
+        "{what}; records of the snapshot table are lost, and booting without them would free \
+         the blocks their snapshots pin"
+    )
+}
+
 /// Applies `records` of region `idx` to the replay state.
 fn apply<R: TableRecord>(state: &mut BTreeMap<R::Key, (R, usize)>, records: &[R], idx: usize) {
     for rec in records {
@@ -346,6 +357,9 @@ pub fn load_table<R: TableRecord, B: Backstore>(
             if head_cp == cp_seq {
                 return Err(torn(table, format!("head page: {why}")));
             }
+            if table == TableKind::Snapshots {
+                return Err(torn(table, lost_snapshots(&format!("head page: {why}"))));
+            }
             load.note(format!(
                 "the {} head page written by CP {head_cp} does not verify ({why}): every \
                  record is unknown",
@@ -393,6 +407,19 @@ pub fn load_table<R: TableRecord, B: Backstore>(
                 return Err(torn(table, format!("base region: {why}")));
             }
             let scan = scan_table_base::<R>(&bytes);
+            if table == TableKind::Snapshots
+                && (scan.records.len() as u64) < u64::from(base.records)
+            {
+                return Err(torn(
+                    table,
+                    lost_snapshots(&format!(
+                        "the base region written by CP {} ({why}): {} of its {} records read",
+                        base.cp_seq,
+                        scan.records.len(),
+                        base.records
+                    )),
+                ));
+            }
             apply(&mut state, &scan.records, 0);
             damaged_last = Some(0);
             load.note(format!(
@@ -437,6 +464,19 @@ pub fn load_table<R: TableRecord, B: Backstore>(
                 return Err(torn(table, format!("delta region: {why}")));
             }
             let scan = scan_table_delta::<R>(&bytes, agg_id, delta.cp_seq);
+            if table == TableKind::Snapshots
+                && (scan.records.len() as u64) < u64::from(delta.records)
+            {
+                return Err(torn(
+                    table,
+                    lost_snapshots(&format!(
+                        "the delta region written by CP {} ({why}): {} of its {} records read",
+                        delta.cp_seq,
+                        scan.records.len(),
+                        delta.records
+                    )),
+                ));
+            }
             apply(&mut state, &scan.records, idx);
             damaged_last = Some(idx);
             load.note(format!(

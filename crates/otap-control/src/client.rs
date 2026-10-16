@@ -196,7 +196,7 @@ impl Client {
 
     /// Pings and checks the protocol version.
     pub fn hello(&mut self) -> Result<Response, ClientError> {
-        let pong = self.call(&Request::Ping)?;
+        let pong = self.call(&Request::Ping {})?;
         if let Response::Pong { protocol, .. } = &pong {
             if *protocol != PROTOCOL_VERSION {
                 return Err(ClientError::Daemon(ControlError::new(

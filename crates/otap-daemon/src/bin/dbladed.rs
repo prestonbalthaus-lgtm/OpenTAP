@@ -48,7 +48,9 @@ OPTIONS
     --recovery-timeout <secs>
                             how long a restarted daemon waits for the kernel to
                             quiesce a dead daemon's device before the volume gets a
-                            new one, 1 to 300 [default: 5]
+                            new one, 1 to 300 [default: 35, past the block layer's
+                            30 s request timeout, which is what quiesces a device
+                            whose daemon died holding every request]
     --allow-remote-control  accept a TCP control address that is not loopback (the
                             control plane is unauthenticated: it can format any device)
     --replication-listen <host:port>
@@ -98,6 +100,20 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 None => value(i, flag),
             }
         };
+        // A switch has no value: `--discard-arena=false` must not read as
+        // `--discard-arena` (the Step 6 review's R2).
+        const SWITCHES: &[&str] = &[
+            "--heap-arena",
+            "--discard-arena",
+            "--flush-opaque",
+            "--strict-flush",
+            "--no-ublk",
+            "--allow-remote-control",
+            "--allow-remote-replication",
+        ];
+        if inline.is_some() && SWITCHES.contains(&flag) {
+            return Err(format!("{flag} is a switch and takes no value ({arg:?})"));
+        }
         match flag {
             "-h" | "--help" => return Ok(Parsed::Help),
             "-V" | "--version" => return Ok(Parsed::Version),

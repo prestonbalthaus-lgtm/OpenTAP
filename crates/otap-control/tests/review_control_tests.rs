@@ -56,7 +56,7 @@ fn a_misspelled_optional_field_is_refused() {
 #[test]
 fn frames_survive_a_stream_that_splits_every_byte() {
     let mut bytes = Vec::new();
-    write_frame(&mut bytes, &Request::Ping).unwrap();
+    write_frame(&mut bytes, &Request::Ping {}).unwrap();
     write_frame(
         &mut bytes,
         &Request::IoRead {
@@ -71,7 +71,7 @@ fn frames_survive_a_stream_that_splits_every_byte() {
     let mut r = Trickle { bytes, at: 0 };
     assert_eq!(
         read_frame::<Request, _>(&mut r).unwrap(),
-        Some(Request::Ping)
+        Some(Request::Ping {})
     );
     assert_eq!(
         read_frame::<Request, _>(&mut r).unwrap(),
@@ -144,7 +144,7 @@ fn the_frame_bound_holds_and_the_largest_write_fits() {
     assert!(out.len() < MAX_FRAME_BYTES as usize);
     let back: Request = read_frame(&mut io::Cursor::new(out)).unwrap().unwrap();
     assert_eq!(back, big);
-    let ok: Reply = Ok(Response::Ok);
+    let ok: Reply = Ok(Response::Ok {});
     let mut out = Vec::new();
     write_frame(&mut out, &ok).unwrap();
     assert_eq!(

@@ -314,7 +314,7 @@ wait "$DBLADED_PID" || die "dbladed exited with an error on SIGTERM"
 DBLADED_PID=""
 grep -q "stopped cleanly" "$LOG" || die "the log does not record a clean stop"
 start_daemon
-ctl pool status | grep -q "last boot:    clean boot" || die "the restart was not a clean boot"
+grep -q "last boot:    clean boot" <<<"$(ctl pool status)" || die "the restart was not a clean boot"
 BLK="$(wait_device smoke)"
 dd if="$BLK" of="$WORK/after-term" bs=1M count=64 iflag=direct status=none
 cmp "$WORK/pattern" "$WORK/after-term" || die "the data changed across the clean restart"
@@ -332,9 +332,9 @@ if [ "$HEAP" -eq 1 ]; then
     STATUS="$(ctl pool status)"
     echo "$STATUS" | grep "last boot:"
     echo "$STATUS" | grep -q "last boot:    dirty boot" || die "a heap-arena crash must be a dirty boot"
-    ctl volume show --name smoke | grep -q "nvfail" || die "the volume should be held by nvfail"
+    grep -q "nvfail" <<<"$(ctl volume show --name smoke)" || die "the volume should be held by nvfail"
     ctl volume nvfail-clear --name smoke
-    ctl volume show --name smoke | grep -q "state:      online" || die "the clear did not bring the volume back"
+    grep -q "state:      online" <<<"$(ctl volume show --name smoke)" || die "the clear did not bring the volume back"
     BLK="$(wait_device smoke)"
     echo "the re-attach under I/O and the orphaned device need a hugetlbfs arena: skipped"
 else
@@ -344,6 +344,16 @@ else
     dd if="$WORK/pattern2" of="$BLK" bs=256k seek=256 oflag=direct conv=fsync status=none &
     DD_PID=$!
     sleep 0.5
+    # A writer that already finished means no request was in flight at the
+    # kill, and the step below proves nothing about the re-attach under I/O.
+    # (dd keeps one request in flight; the every-tag-held path, which waits
+    # for the block layer's 30 s timeout, needs fio with a deep queue.)
+    if kill -0 "$DD_PID" 2>/dev/null; then
+        echo "the writer is still running: the kill lands under I/O"
+    else
+        echo "WARNING: dd finished within 0.5 s, before the kill: no I/O was in flight;" \
+            "this step checks only the re-attach (record it in docs/08)"
+    fi
     kill -KILL "$DBLADED_PID"
     wait "$DBLADED_PID" 2>/dev/null || true
     DBLADED_PID=""
@@ -351,7 +361,7 @@ else
     STATUS="$(ctl pool status)"
     echo "$STATUS" | grep "last boot:"
     echo "$STATUS" | grep -q "arena re-attached" || die "the hugetlbfs arena did not re-attach"
-    ctl volume show --name smoke | grep -q "state:      online" || die "a re-attached arena must not trip nvfail"
+    grep -q "state:      online" <<<"$(ctl volume show --name smoke)" || die "a re-attached arena must not trip nvfail"
     BLK="$(wait_device smoke)"
     [ "$BLK" = "$OLD_BLK" ] || die "the restarted daemon exposes $BLK, not the re-attached $OLD_BLK"
     wait "$DD_PID" || die "the writer saw an error across the crash (requests the dead daemon held must be redelivered: UBLK_F_USER_RECOVERY_REISSUE)"
@@ -412,14 +422,14 @@ ctl snapshot create --volume smoke --name r1
 ctl replicate push smoke r1 --to "127.0.0.1:$REPL_PORT/mirror" || die "the first push did not complete"
 ctl2 replicate status
 ctl2 replicate cursor mirror
-ctl2 volume show --name mirror | grep -q "offline" || die "the mirror must stay offline"
+grep -q "offline" <<<"$(ctl2 volume show --name mirror)" || die "the mirror must stay offline"
 dd if=/dev/urandom of="$WORK/pattern3" bs=1M count=16 status=none
 dd if="$WORK/pattern3" of="$BLK" bs=1M seek=400 oflag=direct conv=fsync status=none
 blkdiscard -o $((8 * 1024 * 1024)) -l $((4 * 1024 * 1024)) "$BLK"
 ctl snapshot create --volume smoke --name r2
 ctl replicate push smoke r2 --to "127.0.0.1:$REPL_PORT/mirror" || die "the incremental push did not complete"
 ctl replicate status
-ctl replicate cursor smoke | grep -q "r2" || die "the source's replication base did not move to r2"
+grep -q "r2" <<<"$(ctl replicate cursor smoke)" || die "the source's replication base did not move to r2"
 ctl2 replicate release mirror
 ctl2 volume online --name mirror
 MIRROR_BLK="$(wait_device_on ctl2 mirror)"

@@ -75,8 +75,16 @@ use crate::host::{DevInfo, DevState, HostDevice, UblkHost, EBUSY};
 pub const RECOVERY_TARGET_NS: u64 = 2_000_000_000;
 
 /// How long a recovery waits, by default, for the driver to quiesce a dead
-/// server's device before the daemon gives up on it and creates a new one.
-pub const DEFAULT_RECOVERY_BUDGET_NS: u64 = 5_000_000_000;
+/// server's device before the daemon gives up on it and creates a new one:
+/// 35 s. A server that died with a fetch pending is quiesced at once, so
+/// only a server that died holding every tag is waited for, and for that
+/// one only the block layer's request timeout starts the quiesce
+/// (`ublk_timeout`; the 6.12 driver sets no timeout of its own, so blk-mq's
+/// default of 30 s applies). A budget below 30 s gives such a volume a new
+/// device number every time, which breaks every mount and open file of the
+/// old one; 35 s covers the timeout, its timer's rounding and the quiesce
+/// (the Step 6 review raised it from 5 s; unmeasured until a Linux run).
+pub const DEFAULT_RECOVERY_BUDGET_NS: u64 = 35_000_000_000;
 
 /// The least time between two attempts of one recovery while the driver
 /// answers `EBUSY` or has not quiesced the device: the serving loop turns
@@ -315,9 +323,11 @@ impl Recovery {
         match info.state {
             DevState::Dead => refuse("it was never started, or was stopped".to_string()),
             DevState::Other(v) => refuse(format!("its state {v} is unknown")),
-            DevState::Live if info.pid > 0 && info.pid as u32 == host.pid() => {
-                refuse("this process serves it already".to_string())
-            }
+            // A device naming this process's pid, which this process is only
+            // now recovering, was served by an earlier process that had the
+            // same pid (a container's PID 1): its server is dead, and it is
+            // waited for like any other (the Step 6 review's W2).
+            DevState::Live if info.pid > 0 && info.pid as u32 == host.pid() => Ok(()),
             DevState::Live if info.pid > 0 && host.pid_alive(info.pid) => {
                 refuse(format!("process {} serves it", info.pid))
             }
@@ -413,6 +423,23 @@ impl Probed {
 #[must_use]
 pub fn classify(info: &DevInfo, server_alive: bool, pid: u32, owner: &Owner<'_>) -> Probed {
     let stamp = info.opentap();
+    let stamped_vol = stamp.map(|s| u32::from(s.vol));
+    if let Some((_, vol)) = owner.serving.iter().find(|(d, _)| *d == info.dev_id) {
+        return Probed {
+            info: *info,
+            server_alive,
+            standing: Standing::Serving,
+            reason: format!("served by this daemon for volume {vol}"),
+            vol: Some(*vol),
+        };
+    }
+    // A device naming this daemon's pid that this daemon does not serve was
+    // served by an earlier process with the same pid (a container's PID 1),
+    // which is dead: so it counts as quiescing while `LIVE`, and is never
+    // handed to `STOP_DEV`, which would wait on the engine thread for the
+    // requests the dead server held (the Step 6 review's W2).
+    let ours = info.pid > 0 && info.pid as u32 == pid;
+    let server_alive = server_alive && !ours;
     let probed = |standing: Standing, reason: String, vol: Option<u32>| Probed {
         info: *info,
         server_alive,
@@ -420,18 +447,9 @@ pub fn classify(info: &DevInfo, server_alive: bool, pid: u32, owner: &Owner<'_>)
         reason,
         vol,
     };
-    let stamped_vol = stamp.map(|s| u32::from(s.vol));
-    if let Some((_, vol)) = owner.serving.iter().find(|(d, _)| *d == info.dev_id) {
-        return probed(
-            Standing::Serving,
-            format!("served by this daemon for volume {vol}"),
-            Some(*vol),
-        );
-    }
     // A live server that is not this daemon wins over any record: what
     // another process serves is never this daemon's to delete.
-    let ours = info.pid > 0 && info.pid as u32 == pid;
-    if info.state == DevState::Live && server_alive && !ours {
+    if info.state == DevState::Live && server_alive {
         return probed(
             Standing::Foreign,
             format!("served by process {}", info.pid),
@@ -447,10 +465,12 @@ pub fn classify(info: &DevInfo, server_alive: bool, pid: u32, owner: &Owner<'_>)
             return probed(Standing::Stale, why.clone(), stamped_vol);
         }
     }
-    if info.state == DevState::Live && ours {
+    if info.state == DevState::Live && ours && stamp.is_none() {
         return probed(
             Standing::Stale,
-            "live under this daemon's pid, which does not serve it".to_string(),
+            "live under this daemon's pid, which does not serve it: an earlier process with \
+             that pid died serving it"
+                .to_string(),
             stamped_vol,
         );
     }

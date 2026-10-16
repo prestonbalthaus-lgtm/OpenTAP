@@ -328,7 +328,7 @@ fn a_push_between_two_daemons_lands_a_mirror_and_a_delta_follows() {
         .filter(|n| n.starts_with("repl-"))
         .collect();
     assert_eq!(records.len(), 1, "one cursor record: {records:?}");
-    ok(&mut dst, &Request::PoolStop);
+    ok(&mut dst, &Request::PoolStop {});
     boot(&mut dst, &dst_device);
     let second = wait_done(&mut src, &mut dst, second.id);
     assert!(second.retries >= 1, "the restart was met: {second:#?}");

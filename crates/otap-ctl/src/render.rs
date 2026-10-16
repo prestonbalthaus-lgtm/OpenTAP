@@ -21,7 +21,7 @@ pub fn render_json(response: &Response) -> String {
 /// file instead of the terminal.
 pub fn render(response: &Response, cmd: &Command, out: &mut dyn Write) -> io::Result<()> {
     match response {
-        Response::Ok => writeln!(out, "ok"),
+        Response::Ok {} => writeln!(out, "ok"),
         Response::Pong {
             protocol,
             version,
@@ -182,21 +182,42 @@ pub fn render(response: &Response, cmd: &Command, out: &mut dyn Write) -> io::Re
                     j.id.to_string(),
                     j.mode.clone(),
                     replication_state(j.state).to_string(),
-                    j.volume.clone(),
-                    j.peer.clone(),
-                    j.snapshot
-                        .clone()
-                        .or_else(|| j.snapshot_uuid.clone())
-                        .unwrap_or_else(|| "-".to_string()),
+                    printable(&j.volume),
+                    printable(&j.peer),
+                    printable(
+                        &j.snapshot
+                            .clone()
+                            .or_else(|| j.snapshot_uuid.clone())
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
                     format!("{}/{}", j.chunks_landed, j.chunks),
                     j.retries.to_string(),
-                    j.phase.clone(),
+                    printable(&j.phase),
                 ]);
             }
             write_table(&rows, out)
         }
         Response::ReplicationCursor(c) => render_cursor(c, out),
     }
+}
+
+/// `text` with every control character escaped: a replication report
+/// carries text from the peer (a refusal's message, the names in its
+/// handshake), and an unauthenticated peer must not write terminal escape
+/// sequences to the operator's screen (the Step 6 review's R6).
+fn printable(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_string();
+    }
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 fn replication_state(state: ReplicationState) -> &'static str {
@@ -215,19 +236,24 @@ fn render_replication(j: &ReplicationReport, out: &mut dyn Write) -> io::Result<
         "replication job {}: {} of {} ({}), {}",
         j.id,
         j.mode,
-        j.volume,
+        printable(&j.volume),
         j.role,
         replication_state(j.state)
     )?;
-    writeln!(out, "  phase:      {}", j.phase)?;
-    writeln!(out, "  peer:       {} (volume {})", j.peer, j.remote_volume)?;
+    writeln!(out, "  phase:      {}", printable(&j.phase))?;
+    writeln!(
+        out,
+        "  peer:       {} (volume {})",
+        printable(&j.peer),
+        printable(&j.remote_volume)
+    )?;
     let snap = match (&j.snapshot, &j.snapshot_uuid) {
         (Some(name), Some(uuid)) => format!("{name} ({uuid})"),
         (None, Some(uuid)) => uuid.clone(),
         (Some(name), None) => name.clone(),
         (None, None) => "-".to_string(),
     };
-    writeln!(out, "  snapshot:   {snap}")?;
+    writeln!(out, "  snapshot:   {}", printable(&snap))?;
     writeln!(
         out,
         "  base:       {}",
@@ -266,7 +292,7 @@ fn render_replication(j: &ReplicationReport, out: &mut dyn Write) -> io::Result<
         j.frames_sent, j.frames_received, j.connections, j.retries
     )?;
     if let Some(e) = &j.last_error {
-        writeln!(out, "  last error: {e}")?;
+        writeln!(out, "  last error: {}", printable(e))?;
     }
     Ok(())
 }
