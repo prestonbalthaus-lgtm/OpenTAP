@@ -104,6 +104,7 @@ impl Daemon {
             cp_interval_secs: self.cfg.cp_interval_secs,
             ublk: self.cfg.ublk,
             op_timeout: self.cfg.op_timeout,
+            discard_arena: self.cfg.discard_arena,
         };
         self.pool = Some(Pool::boot(&spec, &self.clock, self.stop.clone())?);
         Ok(())
@@ -187,6 +188,9 @@ impl Daemon {
                     cp_interval_secs: *cp_interval_secs,
                     ublk: self.cfg.ublk,
                     op_timeout: self.cfg.op_timeout,
+                    // Destroying an arena is asked for on dbladed's command
+                    // line only, for the pool it boots at start.
+                    discard_arena: false,
                 };
                 let pool = Pool::boot(&spec, &self.clock, self.stop.clone())?;
                 let reply = pool.status();

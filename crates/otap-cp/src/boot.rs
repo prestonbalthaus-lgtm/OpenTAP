@@ -251,6 +251,14 @@ impl BootState {
     pub fn rewound(&self) -> bool {
         !self.torn.is_empty()
     }
+
+    /// `true` when the selected CP is a clean shutdown's and nothing was
+    /// rewound: the engine stopped there, so nothing it acknowledged is
+    /// outside that CP. The boot of such a state is a clean one.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.slot.sb.is_clean_shutdown() && !self.rewound()
+    }
 }
 
 /// Selects and loads the boot's consistency point.

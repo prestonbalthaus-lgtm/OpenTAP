@@ -46,7 +46,7 @@ pub mod pool;
 pub mod report;
 pub mod server;
 
-pub use arena::open_arena;
+pub use arena::{check_resize, open_arena, open_pool_arena};
 pub use backstore::{open_backstore, probe_superblock, Opened};
 pub use clock::SystemClock;
 pub use config::{DaemonConfig, Overrides};

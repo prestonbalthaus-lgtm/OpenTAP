@@ -1,6 +1,8 @@
-//! A ublk queue in memory: the tests' transport, on any host.
+//! A ublk queue in memory: the tests' transport, on any host; and the
+//! driver's side of `START_DEV` over it ([`MockStart`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use otap_cp::IoError;
 use otap_format::BLOCK_SIZE;
@@ -10,12 +12,141 @@ use otap_sys::ublk::{
 };
 
 use crate::frontdoor::{QueueEvent, Transport, TransportError};
+use crate::start::DeviceControl;
+
+/// `EEXIST`, `START_DEV` on a live device.
+const EEXIST: i32 = 17;
+/// `EINVAL`.
+const EINVAL: i32 = 22;
+
+/// What the driver's `START_DEV` waits for, shared by a [`MockStart`] (the
+/// control half) and the [`MockTransport`] linked to it (the queue).
+#[derive(Debug, Default)]
+struct StartModel {
+    /// A queue is linked: its fetches were submitted (the
+    /// `nr_queues_ready` wait is met).
+    linked: bool,
+    /// `START_DEV` is in flight.
+    begun: bool,
+    /// The partition scan's read is to be delivered at the queue's next
+    /// poll (`add_disk` has been reached).
+    scan_due: bool,
+    /// The tag the scan's read was delivered on, until it is answered.
+    scan_tag: Option<u16>,
+    /// What the scan's read was answered with.
+    scan_result: Option<i32>,
+    /// The device is live.
+    live: bool,
+    /// Fail the start with this errno at its next poll.
+    fail: Option<i32>,
+}
+
+/// The driver's side of `START_DEV` (6.12, `ublk_ctrl_start_dev`), in
+/// memory: begun, it waits until a queue is linked (every tag fetched),
+/// then delivers the partition scan's read of LBA 0 through that queue and
+/// completes only once the read has been answered, exactly the reads a
+/// privileged server's start does through the queue it is starting. A
+/// server that waits for the start on the thread that serves the queue
+/// never sees it complete; one that serves while it polls does
+/// ([`crate::start::start_while_serving`]).
+#[derive(Debug, Clone, Default)]
+pub struct MockStart {
+    model: Arc<Mutex<StartModel>>,
+}
+
+impl MockStart {
+    /// A device not yet started, with no queue linked.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn model(&self) -> MutexGuard<'_, StartModel> {
+        // A test that panicked while holding the lock has failed already.
+        self.model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Links the queue the start reads through; its fetches count as
+    /// submitted, as `UblkDevice::create` submits them before the start.
+    pub fn link(&self, transport: &mut MockTransport) {
+        self.model().linked = true;
+        transport.start = Some(Arc::clone(&self.model));
+    }
+
+    /// Makes the start in flight fail with `errno` at its next poll.
+    pub fn fail_with(&self, errno: i32) {
+        self.model().fail = Some(errno);
+    }
+
+    /// `true` once the device is live.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.model().live
+    }
+
+    /// `true` while `START_DEV` is in flight.
+    #[must_use]
+    pub fn in_flight(&self) -> bool {
+        self.model().begun
+    }
+
+    /// What the partition scan's read was answered with, once it was.
+    #[must_use]
+    pub fn scan_result(&self) -> Option<i32> {
+        self.model().scan_result
+    }
+}
+
+impl DeviceControl for MockStart {
+    fn begin_start(&mut self) -> Result<(), TransportError> {
+        let mut m = self.model();
+        if m.live || m.begun {
+            return Err(TransportError {
+                what: "START_DEV of a started device",
+                errno: EEXIST,
+            });
+        }
+        m.begun = true;
+        m.scan_due = true;
+        Ok(())
+    }
+
+    fn poll_start(&mut self) -> Result<bool, TransportError> {
+        let mut m = self.model();
+        if m.live {
+            return Ok(true);
+        }
+        if !m.begun {
+            return Err(TransportError {
+                what: "no START_DEV in flight",
+                errno: EINVAL,
+            });
+        }
+        if let Some(errno) = m.fail.take() {
+            m.begun = false;
+            return Err(TransportError {
+                what: "START_DEV",
+                errno,
+            });
+        }
+        if m.scan_result.is_some() {
+            m.begun = false;
+            m.live = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
 
 /// A queue whose requests the test writes and whose completions the test
 /// reads.
 #[derive(Debug, Default)]
 pub struct MockTransport {
     depth: u16,
+    /// The start this queue serves the partition scan of, if linked.
+    start: Option<Arc<Mutex<StartModel>>>,
     events: VecDeque<QueueEvent>,
     /// Write payloads the driver holds, by tag.
     payloads: HashMap<u16, Vec<u8>>,
@@ -161,6 +292,32 @@ impl MockTransport {
     }
 }
 
+impl MockTransport {
+    /// The linked start's partition scan, when `add_disk` has been reached:
+    /// a read of LBA 0 on the lowest tag with a fetch pending.
+    fn deliver_scan(&mut self) {
+        let Some(model) = self.start.clone() else {
+            return;
+        };
+        let mut m = model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !(m.begun && m.scan_due) {
+            return;
+        }
+        let Some(tag) =
+            (0..self.depth).find(|t| !self.busy.contains(t) && !self.aborted.contains(t))
+        else {
+            // Every tag holds a request: the scan waits for one to free.
+            return;
+        };
+        m.scan_due = false;
+        m.scan_tag = Some(tag);
+        drop(m);
+        self.deliver(tag, Self::desc(UBLK_IO_OP_READ, 0, 1, 0));
+    }
+}
+
 impl Transport for MockTransport {
     fn poll(&mut self, out: &mut Vec<QueueEvent>) -> Result<usize, TransportError> {
         self.polls += 1;
@@ -171,6 +328,7 @@ impl Transport for MockTransport {
                 errno: 5,
             });
         }
+        self.deliver_scan();
         let n = self.events.len();
         out.extend(self.events.drain(..));
         Ok(n)
@@ -219,6 +377,18 @@ impl Transport for MockTransport {
             });
         }
         self.payloads.remove(&tag);
+        if let Some(model) = &self.start {
+            let mut m = model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if m.scan_tag == Some(tag) {
+                // The partition scan's read is answered: `add_disk`, and
+                // with it `START_DEV`, can finish.
+                m.scan_tag = None;
+                m.scan_result = Some(result);
+                return Ok(());
+            }
+        }
         self.commits.push((tag, result));
         Ok(())
     }

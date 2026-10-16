@@ -76,29 +76,49 @@ pub struct HugeArena {
 }
 
 impl HugeArena {
-    /// Maps the arena file at `path`, creating it (mode 0600) if it does not
-    /// exist and growing it to `len` bytes if it is shorter, `MAP_SHARED` and
+    /// Maps the arena file at `path`, creating it (mode 0600) and sizing it
+    /// to `len` bytes if it does not exist or is empty, `MAP_SHARED` and
     /// read-write. Linux only.
     ///
     /// This is the arena that survives the daemon: an existing file is mapped
-    /// with its contents. The file and its directory must be on a hugetlbfs
-    /// mount whose page size is `page_size` (checked with `statfs(2)` before
-    /// anything is created and with `fstatfs(2)` on the file), and the arena
-    /// holds an exclusive `flock(2)` on the file for its lifetime, so a
-    /// second arena, in this process or another, cannot map it concurrently.
+    /// with its contents, and only at its own length. A file of another
+    /// length is refused, never grown or truncated: either changes the
+    /// arena's geometry and so discards what it holds (Step 6A); a caller
+    /// that has established that the contents may go uses
+    /// [`HugeArena::map_file_resizing`]. The file and its directory must be
+    /// on a hugetlbfs mount whose page size is `page_size` (checked with
+    /// `statfs(2)` before anything is created and with `fstatfs(2)` on the
+    /// file), and the arena holds an exclusive `flock(2)` on the file for
+    /// its lifetime, so a second arena, in this process or another, cannot
+    /// map it concurrently.
     ///
     /// # Errors
     /// - [`io::ErrorKind::InvalidInput`]: `len` is not a positive multiple of
     ///   the page size, the path is not on a hugetlbfs mount of that page
-    ///   size, or the existing file is longer than `len` (it is never
-    ///   truncated: that would discard arena contents).
+    ///   size, or the existing file holds a length other than `len` (the
+    ///   message names it).
     /// - [`io::ErrorKind::WouldBlock`]: another arena holds the file's lock.
     /// - The `open`, `ftruncate` or `mmap` error otherwise; `ENOMEM` from
     ///   `mmap` means the hugetlb pool cannot back the whole mapping.
     /// - [`io::ErrorKind::Unsupported`] on hosts other than Linux.
     pub fn map_file(path: &Path, len: usize, page_size: HugePageSize) -> io::Result<Self> {
         check_len(len, page_size)?;
-        let map = imp::Mapping::map_file(path, len, page_size)?;
+        let map = imp::Mapping::map_file(path, len, page_size, false)?;
+        Ok(Self::from_mapping(map, len, page_size))
+    }
+
+    /// [`HugeArena::map_file`] that first sets an existing file of another
+    /// length to `len` bytes (grown, or truncated), under the file's lock.
+    /// The arena's geometry changes with the length, so whatever the file
+    /// held is lost to the arena: only for a caller that has read the old
+    /// arena at its own length and found nothing in it to keep, or that was
+    /// told to discard it. Linux only.
+    ///
+    /// # Errors
+    /// As [`HugeArena::map_file`], except that a length mismatch is not one.
+    pub fn map_file_resizing(path: &Path, len: usize, page_size: HugePageSize) -> io::Result<Self> {
+        check_len(len, page_size)?;
+        let map = imp::Mapping::map_file(path, len, page_size, true)?;
         Ok(Self::from_mapping(map, len, page_size))
     }
 
@@ -325,6 +345,7 @@ mod imp {
             path: &Path,
             len: usize,
             page_size: HugePageSize,
+            resize: bool,
         ) -> io::Result<Self> {
             // Refuse a directory on the wrong filesystem before creating
             // anything in it; the file itself is checked again once open.
@@ -355,17 +376,21 @@ mod imp {
             })?;
             let want = len as u64;
             let have = file.metadata()?.len();
-            if have > want {
+            // A new (empty) file is sized; an existing arena is mapped at
+            // its own length unless the caller asked for the change: a
+            // longer or shorter file is another geometry, and the arena it
+            // holds would be recreated, its unflushed writes with it.
+            if have != want && have != 0 && !resize {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "{} holds {have} bytes, more than the {len}-byte arena; refusing to \
-                         truncate arena contents",
+                        "{} holds a {have}-byte arena, not the {len}-byte arena asked for; \
+                         refusing to resize arena contents",
                         path.display()
                     ),
                 ));
             }
-            if have < want {
+            if have != want {
                 file.set_len(want)?;
             }
             // SAFETY: memmap2 requires that the file not be modified, in or
@@ -481,6 +506,7 @@ mod imp {
             path: &Path,
             _len: usize,
             _page_size: HugePageSize,
+            _resize: bool,
         ) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,

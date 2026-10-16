@@ -5,7 +5,7 @@ use core::fmt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use otap_arena::{Arena, ArenaError, PlacedSlot, RingRef};
+use otap_arena::{Arena, ArenaError, ArenaSurvey, PlacedSlot, RingRef};
 use otap_format::checksum::crc32c;
 use otap_format::{
     boot_write_active, catalog_image, cp_stripes_image, map_roots_image, snap_table_image,
@@ -171,6 +171,13 @@ pub struct EngineConfig {
     pub cleaner: CleanerPolicy,
     /// How writes are paced by arena fullness.
     pub pacing: Pacing,
+    /// Recreate an arena of this pool that was made for another size even
+    /// when it may hold acknowledged writes or the pool did not shut down
+    /// cleanly ([`check_arena_resize`]): the operator's explicit choice to
+    /// lose them, which a dirty boot answers by holding the write-active
+    /// volumes. `false` by default: such a boot is refused
+    /// ([`EngineError::ArenaResize`]).
+    pub discard_arena: bool,
 }
 
 impl EngineConfig {
@@ -188,6 +195,7 @@ impl EngineConfig {
             reserve_segments: None,
             cleaner: CleanerPolicy::default(),
             pacing: Pacing::default(),
+            discard_arena: false,
         }
     }
 
@@ -220,6 +228,34 @@ fn check_size(vol: u32, size_blocks: u64) -> Result<(), EngineError> {
         return Err(EngineError::BadSize { vol, size_blocks });
     }
     Ok(())
+}
+
+/// The rule for this pool's arena found made for another size (a changed
+/// arena size over an arena file, Step 6A): it may be recreated at the new
+/// size only when nothing in it can be an acknowledged write the pool
+/// lacks, that is when `survey` read it under its recorded geometry and
+/// found no placed slot, and the pool's selected CP is a clean shutdown
+/// with nothing rewound (`clean`). `discard` is the operator's explicit
+/// choice to recreate it regardless. The boot applies it, and so does a
+/// daemon before it resizes an arena file, which cannot be undone.
+///
+/// # Errors
+/// [`EngineError::ArenaResize`] naming what may be lost.
+pub fn check_arena_resize(
+    survey: Option<&ArenaSurvey>,
+    clean: bool,
+    offered_bytes: u64,
+    discard: bool,
+) -> Result<(), EngineError> {
+    if discard || (clean && survey.is_some_and(ArenaSurvey::holds_nothing)) {
+        return Ok(());
+    }
+    Err(EngineError::ArenaResize {
+        recorded_bytes: survey.map(|s| s.recorded_bytes),
+        offered_bytes,
+        placed: survey.map_or(0, |s| s.placed),
+        clean,
+    })
 }
 
 /// The page index a volume needs must fit the pool's metadata budget: a
@@ -276,8 +312,11 @@ pub enum OperatorWarning {
         /// The map page (1,024 blocks each).
         page_no: u64,
     },
-    /// A snapshot's root page or pinned index did not verify at boot: it
-    /// is listed, cannot be read or diffed, and still pins its data.
+    /// A snapshot's root page or pinned index did not verify at boot, or a
+    /// walk found one of its map pages damaged since (Step 6A: it is
+    /// quarantined): it is listed, cannot be read, diffed or rolled back
+    /// to, still pins its data, and can be deleted; the pool's consistency
+    /// points go on. The warning leaves with the snapshot.
     SnapshotDamaged {
         /// The snapshot.
         snap_id: u64,
@@ -689,6 +728,21 @@ pub enum EngineError {
     },
     /// The engine is not serving (booting or stopped).
     NotServing,
+    /// The memory holds this pool's arena made for another size (a changed
+    /// arena size over an arena file), and recreating it at the new size
+    /// could destroy acknowledged writes: it may hold placed writes, or the
+    /// pool did not shut down cleanly (Step 6A; [`check_arena_resize`]).
+    ArenaResize {
+        /// The length the arena was made for, when its geometry could be
+        /// read.
+        recorded_bytes: Option<u64>,
+        /// The length of the memory offered.
+        offered_bytes: u64,
+        /// Its slots that may hold acknowledged writes (0 when unread).
+        placed: u32,
+        /// The pool's selected CP is a clean shutdown and nothing rewound.
+        clean: bool,
+    },
     /// Something this step does not support.
     Unsupported(&'static str),
     /// An invariant the engine relies on did not hold.
@@ -778,6 +832,44 @@ impl fmt::Display for EngineError {
             Self::NameExists { name } => write!(f, "the name {name:?} is already in use"),
             Self::NoSuchName { name } => write!(f, "no volume or snapshot named {name:?}"),
             Self::NotServing => f.write_str("the engine is not serving"),
+            Self::ArenaResize {
+                recorded_bytes,
+                offered_bytes,
+                placed,
+                clean,
+            } => {
+                match recorded_bytes {
+                    Some(bytes) => write!(
+                        f,
+                        "the arena memory of {offered_bytes} bytes holds this pool's arena made \
+                         for {bytes} bytes"
+                    )?,
+                    None => write!(
+                        f,
+                        "the arena memory of {offered_bytes} bytes holds this pool's arena made \
+                         for another size, whose slots cannot be read"
+                    )?,
+                }
+                let mut why = Vec::new();
+                if *placed > 0 {
+                    why.push(format!(
+                        "{placed} of its blocks are not yet in a consistency point"
+                    ));
+                }
+                if recorded_bytes.is_none() {
+                    why.push("what it holds cannot be told".to_string());
+                }
+                if !clean {
+                    why.push("the pool did not shut down cleanly".to_string());
+                }
+                write!(
+                    f,
+                    ", and {}: recreating it at the new size could destroy acknowledged writes. \
+                     Boot with the arena's own size so they are replayed, stop the pool cleanly, \
+                     then change the size; or boot discarding the arena",
+                    why.join(" and ")
+                )
+            }
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Internal(s) => write!(f, "internal: {s}"),
         }
@@ -907,8 +999,10 @@ pub struct SnapshotInfo {
     pub origin: SnapOrigin,
     /// When it was taken.
     pub created_wall_ns: u64,
-    /// The boot could not read its root page or pinned index: reads and
-    /// diffs of it are refused ([`OperatorWarning::SnapshotDamaged`]).
+    /// The boot could not read its root page or pinned index, or a walk
+    /// found one of its map pages damaged since (it is quarantined): reads,
+    /// diffs and rollbacks of it are refused
+    /// ([`OperatorWarning::SnapshotDamaged`]).
     pub damaged: bool,
     /// The `PIN_*` bits in force.
     pub flags: u8,
@@ -1130,6 +1224,20 @@ impl fmt::Display for VolOp {
 /// One rewrite of a shared tree: the tree (its index region), the snapshots
 /// that pin it, and the address changes they all take.
 type RewriteGroup = (RootRef, Vec<u64>, Vec<(u64, MapEntry, MapEntry)>);
+
+/// What a snapshot deletion found walking the snapshot's tree (E36;
+/// Step 6A for the damaged pages).
+#[derive(Debug, Default)]
+struct DeletionWalk {
+    /// The data blocks only the snapshot named, released by the deletion.
+    released: Vec<MapEntry>,
+    /// The snapshot's map pages that did not verify: the blocks they name
+    /// cannot be known and stay counted, the safe direction.
+    damaged_pages: Vec<u64>,
+    /// A page of the next newer snapshot did not verify while it was asked
+    /// whether it still names a block (it was assumed to).
+    newer_damaged: bool,
+}
 
 /// A snapshot the cleaner rewrote in this CP: its new state and the regions
 /// the old root stops referencing.
@@ -1684,11 +1792,18 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             }
         }
         let wall = clock.wall_ns();
+        // The arena is attached or created without writing it (Step 6A):
+        // the damage, the blank or the lost arena that make this boot hold
+        // the write-active volumes stay in the memory until the boot
+        // commit's `A` slot, which records the hold in its volume table,
+        // has landed (`step_commit`). A boot that stops before then leaves
+        // the next one the same evidence, so no number of kills during the
+        // boot loses the hold.
         let (arena, reattach, arena_lost) = match Arena::can_attach(&memory, &cfg.agg_id) {
-            Ok(()) => match Arena::attach(memory, &cfg.agg_id) {
+            Ok(()) => match Arena::attach_deferred(memory, &cfg.agg_id) {
                 Ok((arena, report)) => (arena, Some(report), false),
                 // The table could not be reconciled: the arena is lost.
-                Err((_, memory)) => match Arena::create(memory, cfg.agg_id, wall) {
+                Err((_, memory)) => match Arena::create_deferred(memory, cfg.agg_id, wall) {
                     Ok(arena) => (arena, None, true),
                     Err((e, memory)) => fail!(e.into(), memory),
                 },
@@ -1699,9 +1814,29 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                     memory
                 )
             }
+            Err(ArenaError::BadGeometry) => {
+                // This pool's arena, made for another size: an arena file a
+                // larger size grew keeps it whole at its start. Recreating
+                // it destroys whatever it holds, so the resize must be safe
+                // or asked for (Step 6A).
+                let survey = Arena::survey(&memory, &cfg.agg_id).ok();
+                if let Err(e) = check_arena_resize(
+                    survey.as_ref(),
+                    state.is_clean(),
+                    memory.len() as u64,
+                    cfg.discard_arena,
+                ) {
+                    fail!(e, memory);
+                }
+                let lost = !survey.is_some_and(|s| s.holds_nothing());
+                match Arena::create_deferred(memory, cfg.agg_id, wall) {
+                    Ok(arena) => (arena, None, lost),
+                    Err((e, memory)) => fail!(e.into(), memory),
+                }
+            }
             Err(_) => {
                 let lost = !Arena::is_blank(&memory);
-                match Arena::create(memory, cfg.agg_id, wall) {
+                match Arena::create_deferred(memory, cfg.agg_id, wall) {
                     Ok(arena) => (arena, None, lost),
                     Err((e, memory)) => fail!(e.into(), memory),
                 }
@@ -1822,9 +1957,11 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             for (vol, lba, extent) in runs_of(&report.placed) {
                 let known = vols.get(vol as usize).is_some_and(|v| v.present);
                 let slots = if extent.hole { 1 } else { extent.blocks };
+                // Every release here waits with the attach's own writes for
+                // the boot commit's `A` slot: an orphan is a cause to hold.
                 if !known {
                     orphaned_blocks += u64::from(extent.blocks);
-                    if let Err(e) = arena.commit(extent.ring, slots) {
+                    if let Err(e) = arena.release_after_attach(extent.ring, slots) {
                         events.push(Event::Internal {
                             what: format!("releasing an orphaned run: {e}"),
                         });
@@ -1837,7 +1974,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                             v.windows = 2;
                         }
                         for (ring, blocks) in superseded {
-                            if let Err(e) = arena.commit(ring, blocks) {
+                            if let Err(e) = arena.release_after_attach(ring, blocks) {
                                 events.push(Event::Internal {
                                     what: format!("releasing a superseded run at replay: {e}"),
                                 });
@@ -1853,7 +1990,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                         events.push(Event::Internal {
                             what: format!("replaying volume {vol} LBA {lba}: {e}"),
                         });
-                        if let Err(e) = arena.commit(extent.ring, slots) {
+                        if let Err(e) = arena.release_after_attach(extent.ring, slots) {
                             events.push(Event::Internal {
                                 what: format!("releasing an unreplayable run: {e}"),
                             });
@@ -2633,7 +2770,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         if snap.record.vol != vol || self.snap_deletes.contains(&snap_id) {
             return Err(EngineError::NoSuchSnapshot { snap_id });
         }
-        if snap.pinned.is_none() {
+        // A damaged snapshot (at boot, or quarantined since) is never
+        // rolled back to: its damage would become the volume's.
+        if snap.pinned.is_none() || snap.damage.is_some() {
             return Err(EngineError::SnapshotDamaged { snap_id });
         }
         let birth = snap.birth();
@@ -2835,18 +2974,23 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 }
             }
         }
-        let pinned: Vec<PinnedRoot> = self
+        let pinned: Vec<(u64, PinnedRoot)> = self
             .snapshots
             .iter()
-            .filter_map(|s| s.pinned.clone())
+            .filter_map(|s| s.pinned.clone().map(|p| (s.record.snap_id, p)))
             .collect();
-        for root in pinned {
+        for (snap_id, root) in pinned {
             let mut entries = Vec::new();
-            {
+            let damaged = {
                 let Engine { map, backstore, .. } = self;
-                map.pinned_diff(&mut BackstoreReader(backstore), &root, 0, |_, e| {
+                map.pinned_diff_tolerant(&mut BackstoreReader(backstore), &root, 0, |_, e| {
                     entries.push(e)
-                })?;
+                })?
+            };
+            // A damaged page's blocks cannot be found: the audit reports
+            // the drift, and the snapshot is quarantined.
+            if !damaged.is_empty() {
+                self.quarantine_snapshot(snap_id, format!("map pages {damaged:?} do not verify"));
             }
             for e in entries {
                 if e.is_data() && seen.insert((e.lseg(), e.off())) {
@@ -2890,6 +3034,37 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         job.is_some_and(|j| j.snaps.iter().any(|r| r.uuid == uuid))
     }
 
+    /// Quarantines snapshot `snap_id` (Step 6A): a walk found one of its
+    /// map pages damaged. It stays listed and keeps pinning its data, can
+    /// be deleted, and is no longer read, diffed or rolled back to; the
+    /// pool status warns ([`OperatorWarning::SnapshotDamaged`]). The
+    /// consistency points of the pool go on. The mark lives in memory: the
+    /// boot checks a snapshot's root page and index only, and the next walk
+    /// that meets the page quarantines the snapshot again.
+    fn quarantine_snapshot(&mut self, snap_id: u64, reason: String) {
+        quarantine(
+            &mut self.snapshots,
+            &mut self.events,
+            &mut self.warnings,
+            snap_id,
+            reason,
+        );
+    }
+
+    /// The snapshot `snap_id` if it may be read: present, its tree loaded
+    /// at boot and not quarantined since.
+    fn readable_snapshot(&self, snap_id: u64) -> Result<(&SnapState, PinnedRoot), EngineError> {
+        let snap = self
+            .snapshots
+            .iter()
+            .find(|s| s.record.snap_id == snap_id)
+            .ok_or(EngineError::NoSuchSnapshot { snap_id })?;
+        match (&snap.pinned, &snap.damage) {
+            (Some(pinned), None) => Ok((snap, pinned.clone())),
+            _ => Err(EngineError::SnapshotDamaged { snap_id }),
+        }
+    }
+
     /// The snapshots on disk, in id order.
     #[must_use]
     pub fn snapshots(&self) -> Vec<SnapshotInfo> {
@@ -2912,7 +3087,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     }
 
     /// Reads `dst.len() / 4096` blocks at `lba` of snapshot `snap_id`: the
-    /// volume as it was at the snapshot's CP, whatever happened since.
+    /// volume as it was at the snapshot's CP, whatever happened since. A
+    /// damaged snapshot is refused ([`EngineError::SnapshotDamaged`]), and
+    /// a map page found damaged here quarantines it.
     pub fn snapshot_read(
         &mut self,
         snap_id: u64,
@@ -2922,16 +3099,8 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         if !dst.len().is_multiple_of(BLOCK_SIZE) {
             return Err(EngineError::Io(IoError::BadLength { bytes: dst.len() }));
         }
-        let snap = self
-            .snapshots
-            .iter()
-            .position(|s| s.record.snap_id == snap_id)
-            .ok_or(EngineError::NoSuchSnapshot { snap_id })?;
         let blocks = (dst.len() / BLOCK_SIZE) as u64;
-        let pinned = self.snapshots[snap]
-            .pinned
-            .clone()
-            .ok_or(EngineError::SnapshotDamaged { snap_id })?;
+        let pinned = self.readable_snapshot(snap_id)?.1;
         if lba
             .checked_add(blocks)
             .is_none_or(|end| end > pinned.root.lba_count)
@@ -2944,9 +3113,17 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         let mut sources = Vec::with_capacity(blocks as usize);
         for k in 0..blocks {
             let out = &mut dst[(k as usize) * BLOCK_SIZE..(k as usize + 1) * BLOCK_SIZE];
-            let entry = {
+            let got = {
                 let Engine { map, backstore, .. } = self;
-                map.pinned_get(&mut BackstoreReader(backstore), &pinned, lba + k)?
+                map.pinned_get(&mut BackstoreReader(backstore), &pinned, lba + k)
+            };
+            let entry = match got {
+                Ok(entry) => entry,
+                Err(MapError::Format(e)) => {
+                    self.quarantine_snapshot(snap_id, format!("a map page does not verify: {e}"));
+                    return Err(EngineError::SnapshotDamaged { snap_id });
+                }
+                Err(e) => return Err(e.into()),
             };
             sources.push(self.read_entry(pinned.vol, lba + k, entry, out)?);
         }
@@ -2954,22 +3131,17 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     }
 
     /// Every block of snapshot `snap_id` born after `base` (another
-    /// snapshot of the same volume, older, or none): what a delta ships.
+    /// snapshot of the same volume, older, or none): what a delta ships. A
+    /// damaged snapshot is refused ([`EngineError::SnapshotDamaged`]), and
+    /// a map page found damaged here quarantines it: a delta that leaves
+    /// out a page's blocks is never returned.
     pub fn snapshot_diff(
         &mut self,
         snap_id: u64,
         base: Option<u64>,
     ) -> Result<Vec<(u64, MapEntry)>, EngineError> {
-        let snap = self
-            .snapshots
-            .iter()
-            .find(|s| s.record.snap_id == snap_id)
-            .ok_or(EngineError::NoSuchSnapshot { snap_id })?;
+        let (snap, pinned) = self.readable_snapshot(snap_id)?;
         let birth = u64::from(snap.record.birth_cp);
-        let pinned = snap
-            .pinned
-            .clone()
-            .ok_or(EngineError::SnapshotDamaged { snap_id })?;
         let base_cp = self.base_cp(pinned.vol, base)?;
         if let Some(base_id) = base {
             if base_cp >= birth {
@@ -2980,14 +3152,23 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             }
         }
         let mut out = Vec::new();
-        let Engine { map, backstore, .. } = self;
-        map.pinned_diff(
-            &mut BackstoreReader(backstore),
-            &pinned,
-            base_cp,
-            |lba, e| out.push((lba, e)),
-        )?;
-        Ok(out)
+        let walked = {
+            let Engine { map, backstore, .. } = self;
+            map.pinned_diff(
+                &mut BackstoreReader(backstore),
+                &pinned,
+                base_cp,
+                |lba, e| out.push((lba, e)),
+            )
+        };
+        match walked {
+            Ok(()) => Ok(out),
+            Err(MapError::Format(e)) => {
+                self.quarantine_snapshot(snap_id, format!("a map page does not verify: {e}"));
+                Err(EngineError::SnapshotDamaged { snap_id })
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Every committed block of `vol` born after `base` (a snapshot of the
@@ -4136,6 +4317,14 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 }
                 Err(reason) => {
                     self.cleaner_skip.insert(pseg);
+                    // A snapshot page the scan could not read: the snapshot
+                    // is quarantined (Step 6A); the segment waits.
+                    if let SkipReason::DamagedSnapshot { snap_id } = &reason {
+                        self.quarantine_snapshot(
+                            *snap_id,
+                            "a map page does not verify (found by the cleaner)".to_string(),
+                        );
+                    }
                     self.events.push(Event::CleanSkipped {
                         pseg,
                         reason: reason.to_string(),
@@ -4816,6 +5005,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                             .snapshots
                             .iter()
                             .find(|s| s.record.snap_id == *snap_id && s.record.vol == vol);
+                        // A rollback accepted before its snapshot was
+                        // quarantined goes ahead: the volume takes the tree
+                        // with its damaged page, which reads `Corrupt` (E32);
+                        // a new request is refused (`rollback_volume`).
                         let Some(pinned) = snap.and_then(|s| s.pinned.clone()) else {
                             // The snapshot went (deleted, or lost to a
                             // rewind): the rollback cannot happen and is
@@ -4916,6 +5109,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             Vec::new()
         };
         deletes_sorted.sort_unstable();
+        // Snapshots a walk found damaged (Step 6A): quarantined once the
+        // deletions are laid out.
+        let mut quarantined: Vec<(u64, String)> = Vec::new();
         for snap_id in deletes_sorted {
             let Some(pos) = remaining.iter().position(|s| s.record.snap_id == snap_id) else {
                 continue;
@@ -4937,69 +5133,66 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             // still name any of these blocks: nothing is released, the
             // safe direction, and the drift is recorded.
             let newer_damaged = newer_state.is_some_and(|s| s.pinned.is_none());
+            let newer_id = newer_state.map(|s| s.record.snap_id);
             let newer = newer_state.and_then(|s| s.pinned.clone());
-            let mut released = 0u64;
-            freed_other.push(RootRef::new(snap.record.map_root_pba, 1, 0));
-            if let Some(pinned) = &snap.pinned {
-                let mut mine = Vec::new();
-                if newer_damaged {
-                    self.events.push(Event::Internal {
-                        what: format!(
-                            "snapshot {snap_id} is deleted next to a damaged newer snapshot: its \
-                             blocks stay counted"
-                        ),
-                    });
-                } else {
+            let walk = if snap.pinned.is_some() && newer_damaged {
+                self.events.push(Event::Internal {
+                    what: format!(
+                        "snapshot {snap_id} is deleted next to a damaged newer snapshot: its \
+                         blocks stay counted"
+                    ),
+                });
+                DeletionWalk::default()
+            } else {
+                let walked = {
                     let Engine { map, backstore, .. } = self;
-                    map.pinned_diff(&mut BackstoreReader(backstore), pinned, older, |lba, e| {
-                        mine.push((lba, e))
-                    })?;
-                }
-                for (lba, e) in mine {
-                    if !e.is_data() {
+                    Self::deletion_walk(
+                        map,
+                        backstore,
+                        &snap,
+                        older,
+                        newer.as_ref(),
+                        deletes.contains(&vol),
+                    )
+                };
+                match walked {
+                    Ok(walk) => walk,
+                    Err(e) => {
+                        // A read error, which may be transient: this
+                        // deletion waits for the next CP, and this CP goes
+                        // on without it (the pool's other work is not held
+                        // hostage by one snapshot's tree).
+                        self.events.push(Event::Internal {
+                            what: format!(
+                                "the deletion of snapshot {snap_id} waits for the next \
+                                 consistency point: {e}"
+                            ),
+                        });
+                        remaining.insert(pos, snap);
                         continue;
                     }
-                    let still = match &newer {
-                        Some(n) => {
-                            let Engine { map, backstore, .. } = self;
-                            match map.pinned_get(&mut BackstoreReader(backstore), n, lba) {
-                                Ok(ne) => ne == e,
-                                // An unreadable page: the safe answer is
-                                // that it may still name the block.
-                                Err(MapError::Format(_)) => true,
-                                // Beyond the newer snapshot's end (the
-                                // volume shrank between them): the block
-                                // is this snapshot's alone.
-                                Err(MapError::OutOfRange { .. }) => false,
-                                Err(err) => return Err(err.into()),
-                            }
-                        }
-                        None => {
-                            // The live map, as committed (this CP's own
-                            // replacements are counted by the replaced
-                            // loop below, against the remaining set).
-                            if deletes.contains(&vol) {
-                                false
-                            } else {
-                                let Engine { map, backstore, .. } = self;
-                                match map.get(&mut BackstoreReader(backstore), vol, lba) {
-                                    Ok(le) => le == e,
-                                    Err(MapError::NoSuchVolume { .. }) => false,
-                                    Err(MapError::Format(_)) => true,
-                                    // Beyond the volume's current end (it
-                                    // shrank since the snapshot): the
-                                    // snapshot's alone.
-                                    Err(MapError::OutOfRange { .. }) => false,
-                                    Err(err) => return Err(err.into()),
-                                }
-                            }
-                        }
-                    };
-                    if !still {
-                        released_blocks.push(e);
-                        released += 1;
-                    }
                 }
+            };
+            if !walk.damaged_pages.is_empty() {
+                self.events.push(Event::Internal {
+                    what: format!(
+                        "snapshot {snap_id} is deleted with damaged map pages {:?}: the blocks \
+                         they name stay counted",
+                        walk.damaged_pages
+                    ),
+                });
+                quarantined.push((
+                    snap_id,
+                    format!("map pages {:?} do not verify", walk.damaged_pages),
+                ));
+            }
+            if let Some(id) = newer_id.filter(|_| walk.newer_damaged) {
+                quarantined.push((id, "a map page does not verify".to_string()));
+            }
+            let released = walk.released.len() as u64;
+            released_blocks.extend(walk.released);
+            freed_other.push(RootRef::new(snap.record.map_root_pba, 1, 0));
+            if let Some(pinned) = &snap.pinned {
                 for (page_no, entry) in pinned.index.iter().enumerate() {
                     if !entry.is_none() {
                         freed_candidates.push((
@@ -5018,6 +5211,17 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 });
             }
             deleted_snapshots.push((snap_id, vol, released));
+        }
+        {
+            let Engine {
+                snapshots,
+                events,
+                warnings,
+                ..
+            } = self;
+            for (snap_id, reason) in quarantined {
+                quarantine(snapshots, events, warnings, snap_id, reason);
+            }
         }
 
         // The cleaner's rewrites of snapshot trees (E37): every snapshot
@@ -5448,6 +5652,77 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         Ok((prep, stripes.into_iter().collect()))
     }
 
+    /// The blocks snapshot `snap` alone references (E36): its entries born
+    /// after `older` (what the next older snapshot shares, it keeps) that
+    /// the next newer snapshot `newer`, or the live map as committed when
+    /// there is none (nothing, when the volume is deleted in this CP), does
+    /// not name. A page of the snapshot that does not verify is walked past
+    /// and reported, never a reason to fail the CP (Step 6A); an answer the
+    /// newer snapshot or the live map cannot give is "still named".
+    ///
+    /// # Errors
+    /// A read error, which may be transient: the caller lets the deletion
+    /// wait for the next CP.
+    fn deletion_walk(
+        map: &mut MapSet,
+        backstore: &mut B,
+        snap: &SnapState,
+        older: u64,
+        newer: Option<&PinnedRoot>,
+        vol_deleted: bool,
+    ) -> Result<DeletionWalk, MapError> {
+        let mut walk = DeletionWalk::default();
+        let Some(pinned) = &snap.pinned else {
+            return Ok(walk);
+        };
+        let vol = snap.record.vol;
+        let mut mine = Vec::new();
+        walk.damaged_pages = map.pinned_diff_tolerant(
+            &mut BackstoreReader(&mut *backstore),
+            pinned,
+            older,
+            |lba, e| mine.push((lba, e)),
+        )?;
+        for (lba, e) in mine {
+            if !e.is_data() {
+                continue;
+            }
+            let backstore = &mut *backstore;
+            let still = match newer {
+                Some(n) => match map.pinned_get(&mut BackstoreReader(backstore), n, lba) {
+                    Ok(ne) => ne == e,
+                    // An unreadable page: the safe answer is that it may
+                    // still name the block (and that snapshot is damaged).
+                    Err(MapError::Format(_)) => {
+                        walk.newer_damaged = true;
+                        true
+                    }
+                    // Beyond the newer snapshot's end (the volume shrank
+                    // between them): the block is this snapshot's alone.
+                    Err(MapError::OutOfRange { .. }) => false,
+                    Err(err) => return Err(err),
+                },
+                // The live map, as committed (this CP's own replacements
+                // are counted by the replaced loop, against the remaining
+                // set).
+                None if vol_deleted => false,
+                None => match map.get(&mut BackstoreReader(backstore), vol, lba) {
+                    Ok(le) => le == e,
+                    Err(MapError::NoSuchVolume { .. }) => false,
+                    Err(MapError::Format(_)) => true,
+                    // Beyond the volume's current end (it shrank since the
+                    // snapshot): the snapshot's alone.
+                    Err(MapError::OutOfRange { .. }) => false,
+                    Err(err) => return Err(err),
+                },
+            };
+            if !still {
+                walk.released.push(e);
+            }
+        }
+        Ok(walk)
+    }
+
     fn step_meta(
         &mut self,
         mut mw: Box<MetaWrite>,
@@ -5574,6 +5849,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                         // landed since the slot was built).
                         if let Some(slot) = &prep.slot {
                             self.durable_active.union_with(&slot.sb.write_active);
+                        }
+                        // The boot's hold is durable in this slot's volume
+                        // table: the arena may now forget what caused it
+                        // (the attach's rewrites, a creation's format).
+                        if prep.job.trigger == CpTrigger::Boot {
+                            self.arena.apply_pending_writes();
                         }
                         self.step_commit(prep, None, Vec::new(), SbLocation::B)
                     }
@@ -5745,6 +6026,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             self.snapshots.retain(|s| s.record.snap_id != *snap_id);
             self.snap_deletes.retain(|id| id != snap_id);
             self.pin_changes.retain(|(id, _)| id != snap_id);
+            // A damaged snapshot's warning goes with it.
+            self.warnings.retain(|w| {
+                !matches!(w, OperatorWarning::SnapshotDamaged { snap_id: id, .. } if id == snap_id)
+            });
             self.stats.snapshots_deleted += 1;
             self.events.push(Event::SnapshotDeleted {
                 snap_id: *snap_id,
@@ -6166,6 +6451,31 @@ fn runs_of(placed: &[PlacedSlot]) -> Vec<(u32, u64, DirtyExtent)> {
         out.push((p.vol, p.lba, DirtyExtent::data(p.ring, 1, p.seq)));
     }
     out
+}
+
+/// [`Engine::quarantine_snapshot`] over the fields it touches, for the
+/// places that hold other fields borrowed (the CP's metadata layout).
+fn quarantine(
+    snapshots: &mut [SnapState],
+    events: &mut Vec<Event>,
+    warnings: &mut Vec<OperatorWarning>,
+    snap_id: u64,
+    reason: String,
+) {
+    let Some(s) = snapshots.iter_mut().find(|s| s.record.snap_id == snap_id) else {
+        return;
+    };
+    if s.damage.is_some() {
+        return;
+    }
+    s.damage = Some(reason.clone());
+    let warning = OperatorWarning::SnapshotDamaged {
+        snap_id,
+        vol: s.record.vol,
+        reason,
+    };
+    events.push(Event::OperatorWarning(warning.clone()));
+    warnings.push(warning);
 }
 
 /// `true` when a snapshot of `vol` among `snaps` was taken at or after the

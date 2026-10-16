@@ -1732,6 +1732,42 @@ impl MapSet {
         }
         Ok(())
     }
+
+    /// [`pinned_diff`](Self::pinned_diff) that walks past a page that does
+    /// not verify ([`MapError::Format`]): its entries are not reported, and
+    /// its page number is returned, in order, so the caller can treat the
+    /// tree as damaged without stopping (Step 6A: a snapshot's damaged page
+    /// must not stop the consistency points of the pool). A read error
+    /// still stops the walk: it may be transient.
+    pub fn pinned_diff_tolerant(
+        &mut self,
+        reader: &mut dyn PageReader,
+        pinned: &PinnedRoot,
+        base_cp: u64,
+        mut f: impl FnMut(u64, MapEntry),
+    ) -> Result<Vec<u64>, MapError> {
+        let mut damaged = Vec::new();
+        for (page_no, entry) in pinned.index.iter().enumerate() {
+            if entry.is_none() || u64::from(entry.max_birth) <= base_cp {
+                continue;
+            }
+            let page = match self.page(reader, entry) {
+                Ok(page) => *page,
+                Err(MapError::Format(_)) => {
+                    damaged.push(page_no as u64);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let first = MapPage::first_lba(page_no as u64);
+            for (slot, e) in page.entries.iter().enumerate() {
+                if u64::from(e.birth_cp) > base_cp && !e.is_unmapped() {
+                    f(first + slot as u64, *e);
+                }
+            }
+        }
+        Ok(damaged)
+    }
 }
 
 /// What [`MapSet::rewrite_pinned`] produced: the pinned root as it stands

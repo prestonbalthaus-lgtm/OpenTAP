@@ -50,7 +50,7 @@
 //!   every address the entry names until its CQE is reaped.
 //!
 //! # Unsafe inventory
-//! Thirteen blocks, all Linux-only; the fallback contains none.
+//! Fourteen blocks, all Linux-only; the fallback contains none.
 //!
 //! 1. `hugetlb`, `Mapping::map_file`: `MmapOptions::map_mut`. The file is on
 //!    hugetlbfs (no write path), sized by us and exclusively `flock`ed for
@@ -81,10 +81,14 @@
 //! 11. `ublk`, `UblkControlRing::execute`: `push` of a control command.
 //!     The command area is inline in the entry; a reply buffer, when one is
 //!     given, is the caller's and outlives the wait for the CQE.
-//! 12. `ublk`, `UblkQueue::new`: `MmapOptions::map` of the queue's command
+//! 12. `ublk`, `UblkControlRing::begin`: `push` of a control command that
+//!     is not waited for (`START_DEV`, Step 6A). It must name no buffer
+//!     (checked), so the entry names no memory of ours; the ring that
+//!     holds it is the caller's, which reaps its CQE in `poll`.
+//! 13. `ublk`, `UblkQueue::new`: `MmapOptions::map` of the queue's command
 //!     buffer at the UAPI offset, read-only, the length the stride rule
 //!     gives; the mapping is dropped with the queue after the ring.
-//! 13. `ublk`, `UblkQueue::push_command`: `push` of a fetch or a commit.
+//! 14. `ublk`, `UblkQueue::push_command`: `push` of a fetch or a commit.
 //!     Under `UBLK_F_USER_COPY` the entry names no buffer of ours.
 //!
 //! # Example

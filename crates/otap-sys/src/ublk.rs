@@ -1178,12 +1178,18 @@ mod linux {
     };
 
     /// The control device with a private ring of 128-byte SQEs, running
-    /// one control command at a time, synchronously: what device creation
-    /// and teardown need (`ADD_DEV`, `SET_PARAMS`, `START_DEV`,
-    /// `STOP_DEV`, `DEL_DEV`, the recovery pair).
+    /// one control command at a time: synchronously what device creation
+    /// and teardown need (`ADD_DEV`, `SET_PARAMS`, `STOP_DEV`, `DEL_DEV`,
+    /// the recovery pair), and `START_DEV` started and polled
+    /// ([`UblkControlRing::begin`], [`UblkControlRing::poll`]), because it
+    /// completes only once the queue has served the reads of the new
+    /// disk's partition scan, which the thread that waits here serves.
     pub struct UblkControlRing {
         control: UblkControl,
         ring: IoUring<squeue::Entry128, cqueue::Entry>,
+        /// The command [`UblkControlRing::begin`] submitted, until its CQE
+        /// is reaped.
+        in_flight: Option<u32>,
     }
 
     impl UblkControlRing {
@@ -1193,7 +1199,11 @@ mod linux {
         /// The `io_uring_setup(2)` error.
         pub fn new(control: UblkControl) -> io::Result<Self> {
             let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder().build(2)?;
-            Ok(Self { control, ring })
+            Ok(Self {
+                control,
+                ring,
+                in_flight: None,
+            })
         }
 
         /// The control device.
@@ -1202,15 +1212,111 @@ mod linux {
             &self.control
         }
 
+        /// `true` while a command [`begin`](Self::begin) submitted has not
+        /// been reaped by [`poll`](Self::poll).
+        #[must_use]
+        pub const fn in_flight(&self) -> bool {
+            self.in_flight.is_some()
+        }
+
+        /// Submits `cmd`, which must name no buffer, and returns without
+        /// waiting: the driver runs control commands in an io-wq worker
+        /// (`ublk_ctrl_uring_cmd` answers `-EAGAIN` to the inline issue),
+        /// so the caller goes on serving while it runs, and reaps its
+        /// result with [`poll`](Self::poll).
+        ///
+        /// # Errors
+        /// A command that names a buffer or one already in flight
+        /// ([`io::ErrorKind::InvalidInput`]), or the ring's error.
+        pub fn begin(&mut self, cmd: &CtrlCommand) -> io::Result<()> {
+            if cmd.header.addr != 0 || cmd.header.len != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a command started without waiting may name no buffer",
+                ));
+            }
+            if self.in_flight.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a control command is already in flight",
+                ));
+            }
+            let sqe = self
+                .control
+                .command_sqe(cmd)
+                .user_data(u64::from(cmd.cmd_op));
+            // SAFETY: `push` requires every address the entry names to stay
+            // valid until the operation completes. The entry names no
+            // memory (checked above: no buffer address, no length); the
+            // command block is copied into the SQE, and the ring that holds
+            // it is owned by `self`, which reaps its CQE in `poll` (or, if
+            // dropped first, io_uring's own teardown waits for the
+            // operation, which touches no caller memory).
+            let pushed = unsafe { self.ring.submission().push(&sqe) };
+            if pushed.is_err() {
+                return Err(io::Error::other("the control ring refused its entry"));
+            }
+            // From here the entry is the ring's: its CQE is the one `poll`
+            // reaps (a refused submission leaves it queued, and `poll`'s
+            // own submission sends it), and `execute` waits its turn.
+            self.in_flight = Some(cmd.cmd_op);
+            loop {
+                match self.ring.submit() {
+                    Ok(_) => return Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        /// The result of the command [`begin`](Self::begin) submitted:
+        /// `Ok(None)` while it runs, `Ok(Some(result))` once its CQE is
+        /// reaped (the call that reaps it is the last for that command).
+        /// Enters the kernel without waiting, so the completion's task work
+        /// runs.
+        ///
+        /// # Errors
+        /// No command in flight ([`io::ErrorKind::InvalidInput`]), the
+        /// ring's error, or the command's negative result as an OS error.
+        pub fn poll(&mut self) -> io::Result<Option<i32>> {
+            if self.in_flight.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "no control command is in flight",
+                ));
+            }
+            match self.ring.submit() {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+            let Some(cqe) = self.ring.completion().next() else {
+                return Ok(None);
+            };
+            self.in_flight = None;
+            let result = cqe.result();
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result));
+            }
+            Ok(Some(result))
+        }
+
         /// Runs `cmd` and returns its result (0, or a negative errno which
         /// is also returned as an error). `buf` is the command's IN or OUT
         /// buffer and must be the one `cmd.header.addr` names with
         /// `cmd.header.len` bytes (checked), so it is alive for the call.
         ///
         /// # Errors
-        /// A buffer that does not match the command, the ring's error, or
-        /// the command's negative result as an OS error.
+        /// A buffer that does not match the command, a command started with
+        /// [`begin`](Self::begin) still in flight, the ring's error, or the
+        /// command's negative result as an OS error.
         pub fn execute(&mut self, cmd: &CtrlCommand, buf: Option<&mut [u8]>) -> io::Result<i32> {
+            if self.in_flight.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a control command started without waiting is still in flight",
+                ));
+            }
             match &buf {
                 Some(b) => {
                     if b.as_ptr().expose_provenance() as u64 != cmd.header.addr

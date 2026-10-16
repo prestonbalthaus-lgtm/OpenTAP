@@ -81,6 +81,11 @@ pub struct DaemonConfig {
     pub allow_remote: bool,
     /// How long a control request may wait for its consistency point.
     pub op_timeout: Duration,
+    /// For the pool booted at start only: recreate its arena file when it
+    /// was made for another size, even if it may hold acknowledged writes
+    /// (they are destroyed and their volumes held under nvfail). A
+    /// `PoolBoot` request never discards.
+    pub discard_arena: bool,
 }
 
 impl Default for DaemonConfig {
@@ -95,6 +100,7 @@ impl Default for DaemonConfig {
             ublk: cfg!(target_os = "linux"),
             allow_remote: false,
             op_timeout: Duration::from_secs(120),
+            discard_arena: false,
         }
     }
 }

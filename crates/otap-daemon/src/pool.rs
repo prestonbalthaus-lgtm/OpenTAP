@@ -22,7 +22,7 @@ use otap_cp::{
 };
 use otap_format::{SnapKind, SnapOrigin, Uuid, BLOCK_SIZE, MAX_VOLS, PIN_MASK, PIN_REPLICATION};
 
-use crate::arena::open_arena;
+use crate::arena::open_pool_arena;
 use crate::backstore::{holds_data, open_backstore, probe_superblock};
 use crate::clock::SystemClock;
 use crate::config::Overrides;
@@ -49,6 +49,10 @@ pub struct BootSpec {
     pub ublk: bool,
     /// How long an operation may wait for its consistency point.
     pub op_timeout: Duration,
+    /// Recreate an arena file made for another size even when it may hold
+    /// acknowledged writes (`dbladed --discard-arena`; see
+    /// [`crate::arena::open_pool_arena`]).
+    pub discard_arena: bool,
 }
 
 /// Lines of recent events the pool keeps.
@@ -238,13 +242,35 @@ impl Pool {
             Some(cp_timer_ns),
         )?;
         let profile = opened.profile;
-        let memory = open_arena(&spec.arena, spec.arena_bytes)?;
+        let mut backstore = opened.backstore;
+        // An arena file of another size is judged before it is resized:
+        // whether the pool shut down cleanly is read from the device only
+        // then, with the boot's own evaluation.
+        let memory = open_pool_arena(
+            &spec.arena,
+            spec.arena_bytes,
+            &agg_id,
+            spec.discard_arena,
+            || {
+                let layout = DiskLayout::new(&profile.geom)
+                    .map_err(|e| bad_request(format!("the geometry cannot be laid out: {e}")))?;
+                let state =
+                    otap_cp::boot::evaluate(&mut backstore, &layout, &agg_id).map_err(|e| {
+                        ControlError::new(
+                            ErrorCode::Engine,
+                            format!("cannot read {}: {e}", spec.device.display()),
+                        )
+                    })?;
+                Ok(state.is_clean())
+            },
+        )?;
         let arena_slots = otap_arena::slots_for_len(memory.len())
             .map_err(|e| bad_request(format!("the arena cannot be laid out: {e}")))?;
-        let cfg = EngineConfig::new(agg_id, Vec::new());
+        let mut cfg = EngineConfig::new(agg_id, Vec::new());
+        cfg.discard_arena = spec.discard_arena;
         let mut engine = PoolEngine::boot(
             cfg,
-            opened.backstore,
+            backstore,
             DaemonFrontDoor::new(),
             clock.clone(),
             memory,
@@ -691,7 +717,13 @@ impl Pool {
                 self.rotational,
                 self.arena_slots,
             )?;
+            // The engine serves the queue from here on, so the reads the
+            // driver's start makes through it are answered (Step 6A).
             self.engine.front_door().add_device(vol, device);
+            if let Err(e) = self.start_device(vol) {
+                self.abandon_device(vol);
+                return Err(e);
+            }
             self.devices.insert(vol, path.clone());
             self.log(format!("volume {vol} is {path}"));
         }
@@ -706,6 +738,87 @@ impl Pool {
             );
         }
         Ok(())
+    }
+
+    /// Starts the device of `vol` that the engine's front door holds:
+    /// `START_DEV` is issued without waiting and polled between ticks of
+    /// the engine, which serve the device's queue meanwhile, because the
+    /// driver's partition scan reads the new disk through that queue before
+    /// the command completes (Step 6A; waiting for it here instead never
+    /// returned for a privileged daemon). Bounded by the operation timeout
+    /// and the stop flag.
+    #[cfg(target_os = "linux")]
+    fn start_device(&mut self, vol: u32) -> Result<(), ControlError> {
+        use otap_ublk::{DeviceControl, StartError, TransportError};
+        const GONE: TransportError = TransportError {
+            what: "the device left the front door",
+            errno: 19,
+        };
+        let deadline = Instant::now() + self.op_timeout;
+        let started = otap_ublk::start_while_serving(
+            self,
+            |p| match p.engine.front_door().device_mut(vol) {
+                Some(dev) => DeviceControl::begin_start(&mut dev.device),
+                None => Err(GONE),
+            },
+            |p| match p.engine.front_door().device_mut(vol) {
+                Some(dev) => DeviceControl::poll_start(&mut dev.device),
+                None => Err(GONE),
+            },
+            |p| {
+                if p.interrupted() {
+                    return Err(Self::interrupted_error("the ublk device's start"));
+                }
+                if !p.tick()? {
+                    std::thread::sleep(IDLE_TICK);
+                }
+                Ok(())
+            },
+            || Instant::now() >= deadline,
+        );
+        started.map_err(|e| match e {
+            StartError::Serve(e) => e,
+            StartError::TimedOut => ControlError::new(
+                ErrorCode::Timeout,
+                format!(
+                    "the ublk device of volume {vol} did not start within {} s",
+                    self.op_timeout.as_secs()
+                ),
+            ),
+            StartError::Start(e) => ControlError::new(
+                ErrorCode::Io,
+                format!("cannot start the ublk device of volume {vol}: {e}"),
+            ),
+        })
+    }
+
+    /// Tears down the device of `vol` whose start failed: out of the
+    /// engine's front door, its queue closed (which ends the reads a start
+    /// still in flight waits for), the start reaped when it finishes within
+    /// a few seconds, then deleted. `DEL_DEV` waits for the character
+    /// device, so the queue goes first; a start that never finishes leaves
+    /// the device to the operator, and says so.
+    #[cfg(target_os = "linux")]
+    fn abandon_device(&mut self, vol: u32) {
+        let Some(dev) = self.engine.front_door().remove_device(vol) else {
+            return;
+        };
+        let crate::frontdoor::VolumeDevice { mut device, front } = dev;
+        drop(front);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while device.start_in_flight() && Instant::now() < deadline {
+            if device.poll_start().is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let id = device.dev_id();
+        if let Err(e) = device.delete() {
+            self.log(format!(
+                "volume {vol}: the ublk device {id} whose start failed was not deleted ({e}); \
+                 delete it with the ublk tools"
+            ));
+        }
     }
 
     /// Takes the ublk device of `vol` down: the queue answers `ENODEV`,

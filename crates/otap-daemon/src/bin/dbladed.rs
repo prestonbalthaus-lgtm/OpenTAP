@@ -29,6 +29,10 @@ OPTIONS
                             [default: /run/opentap/arena/dbladed]
     --heap-arena            back the arena with heap memory instead (no huge pages;
                             does not survive a crash) [default off Linux]
+    --discard-arena         with --device: recreate an arena file made for another
+                            --arena-bytes even if it holds writes not yet on disk;
+                            they are destroyed and their volumes held (nvfail).
+                            Without it such a boot is refused
     --cp-interval <secs>    the consistency point timer, 1 to 15 [default: 5]
     --media <hdd|flash>     the media, when the device cannot say (files)
     --stripe <size>         stripe override (must match the pool at boot)
@@ -84,6 +88,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             "--arena-bytes" => cfg.arena_bytes = parse_size(&take(&mut i)?)?,
             "--arena-file" => arena_file = Some(take(&mut i)?),
             "--heap-arena" => heap = true,
+            "--discard-arena" => cfg.discard_arena = true,
             "--cp-interval" => {
                 let text = take(&mut i)?;
                 cfg.cp_interval_secs = text
@@ -124,6 +129,11 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
     }
     if heap && arena_file.is_some() {
         return Err("--heap-arena and --arena-file exclude each other".to_string());
+    }
+    if cfg.discard_arena && cfg.device.is_none() {
+        return Err(
+            "--discard-arena applies to the pool booted at start: it needs --device".to_string(),
+        );
     }
     if heap {
         cfg.arena = ArenaKind::Heap;

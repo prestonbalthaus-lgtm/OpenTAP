@@ -27,6 +27,10 @@
 //!   `SET_PARAMS` with a 4 KiB block, a volatile cache and FUA, discard
 //!   limits; `START_DEV` once every tag has a fetch pending) and runs the
 //!   engine's tick loop against it.
+//! - [`start`] is the start handshake (Step 6A): `START_DEV` is issued
+//!   without waiting and polled while the queue is served, because the
+//!   driver's partition scan reads the new disk through that queue before
+//!   the command returns; [`mock::MockStart`] models it on any host.
 //!
 //! Two things the front door does not do, on purpose: it drops the
 //! `UBLK_IO_F_FUA` flag (a write is acknowledged when it is placed in the
@@ -46,9 +50,11 @@
 pub mod device;
 pub mod frontdoor;
 pub mod mock;
+pub mod start;
 
 pub use frontdoor::{
     decode_request, errno_for, request_id, split_id, FrontDoorStats, QueueEvent, Transport,
     TransportError, UblkFrontDoor, Watermarks, EINVAL, EIO, ENODEV, ENOSPC, EOPNOTSUPP,
 };
-pub use mock::MockTransport;
+pub use mock::{MockStart, MockTransport};
+pub use start::{start_while_serving, DeviceControl, StartError};

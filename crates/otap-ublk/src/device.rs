@@ -16,6 +16,7 @@ use otap_sys::ublk::{
 use otap_sys::{FromBytes, IntoBytes};
 
 use crate::frontdoor::{QueueEvent, Transport, TransportError, UblkFrontDoor, Watermarks};
+use crate::start::DeviceControl;
 
 /// How the device is shaped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,8 +81,9 @@ impl UblkDevice {
     /// the ioctl encoding; `SET_PARAMS` with a 4 KiB logical and physical
     /// block, a volatile cache and FUA so the block layer sends flushes and
     /// FUA writes, and the discard limits), opens its character device and
-    /// pushes a fetch on every tag. [`start`](Self::start) exposes
-    /// `/dev/ublkbN` afterwards.
+    /// submits a fetch on every tag, on the calling thread, which must be
+    /// the one that serves the queue. [`begin_start`](Self::begin_start)
+    /// exposes `/dev/ublkbN` afterwards, while that thread serves.
     ///
     /// # Errors
     /// Any control command's error.
@@ -176,17 +178,47 @@ impl UblkDevice {
         Ok(())
     }
 
-    /// `START_DEV`: exposes `/dev/ublkbN`. Blocks until the driver sees a
-    /// fetch pending on every tag, which [`create`](Self::create) issued.
+    /// Issues `START_DEV`, which exposes `/dev/ublkbN`, and returns at once
+    /// (Step 6A). The driver completes it only after every tag has a
+    /// processed fetch, which [`create`](Self::create) submitted, and after
+    /// `add_disk`, whose partition scan reads the new disk through this
+    /// device's queue: so the queue must be served, on the thread that
+    /// created the device, while the start is in flight, and the start is
+    /// polled with [`poll_start`](Self::poll_start) between turns
+    /// ([`crate::start::start_while_serving`]). Waiting for it on that
+    /// thread instead never returns for a privileged daemon.
     ///
     /// # Errors
-    /// The command's error.
-    pub fn start(&mut self) -> io::Result<()> {
+    /// The command could not be submitted.
+    pub fn begin_start(&mut self) -> io::Result<()> {
         let pid = std::process::id();
         self.control
-            .execute(&CtrlCommand::start_dev(self.dev_id, pid), None)?;
-        self.started = true;
-        Ok(())
+            .begin(&CtrlCommand::start_dev(self.dev_id, pid))
+    }
+
+    /// `true` once the `START_DEV` that
+    /// [`begin_start`](Self::begin_start) issued has completed and the
+    /// device is live; `false` while it runs.
+    ///
+    /// # Errors
+    /// The command's error, or no start in flight.
+    pub fn poll_start(&mut self) -> io::Result<bool> {
+        if self.started {
+            return Ok(true);
+        }
+        match self.control.poll()? {
+            Some(_) => {
+                self.started = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// `true` while a `START_DEV` is in flight.
+    #[must_use]
+    pub const fn start_in_flight(&self) -> bool {
+        self.control.in_flight()
     }
 
     /// `STOP_DEV`.
@@ -207,7 +239,10 @@ impl UblkDevice {
         Ok(())
     }
 
-    /// Stops (if started) and deletes the device.
+    /// Stops (if started) and deletes the device. The transport taken from
+    /// it ([`take_transport`](Self::take_transport)), which holds
+    /// `/dev/ublkcN` open, must be dropped first: `DEL_DEV` waits until the
+    /// character device is released.
     ///
     /// # Errors
     /// The command's error.
@@ -243,6 +278,22 @@ impl UblkDevice {
         self.queue.take().map(|queue| LinuxTransport {
             queue,
             aborted: Vec::new(),
+        })
+    }
+}
+
+impl DeviceControl for UblkDevice {
+    fn begin_start(&mut self) -> Result<(), TransportError> {
+        Self::begin_start(self).map_err(|e| TransportError {
+            what: "START_DEV",
+            errno: e.raw_os_error().unwrap_or(0),
+        })
+    }
+
+    fn poll_start(&mut self) -> Result<bool, TransportError> {
+        Self::poll_start(self).map_err(|e| TransportError {
+            what: "START_DEV",
+            errno: e.raw_os_error().unwrap_or(0),
         })
     }
 }

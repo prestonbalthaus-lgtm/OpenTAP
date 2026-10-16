@@ -49,10 +49,11 @@
 //! change while the slot is `Free`), then one 8-byte aligned store writes the
 //! *word*: the state, the lap and a CRC-32C over the descriptor including
 //! that state and lap. A kill between the two leaves a `Free` slot whose word
-//! does not verify, which is what a never-used slot looks like too; a `Placed`
-//! or `Committed` slot whose word does not verify was damaged by something
-//! other than this code, and [`Arena::attach`] reports it instead of trusting
-//! it (invariant 3 of section 7.7: every byte under a CRC).
+//! no longer verifies: the reservation's seal over fields the fill has since
+//! changed (a never-used slot has a zero word). A `Placed` or `Committed`
+//! slot whose word does not verify was damaged by something other than this
+//! code, and [`Arena::attach`] reports it instead of trusting it (invariant
+//! 3 of section 7.7: every byte under a CRC).
 //!
 //! # Re-attach after `kill -9`
 //!
@@ -69,6 +70,35 @@
 //! the arena: the header is gone, [`Arena::is_blank`] says so, and the boot is
 //! a dirty one (invariant 1 of section 7.7).
 //!
+//! A write is one run of slots with one sequence number, filled and placed in
+//! slot order, so the attach judges a slot by its neighbours of the same
+//! write (Step 6A):
+//!
+//! - A `Free` slot under a stale seal whose write has a `Filled` slot before
+//!   it, or only its reservation's `Free` slots after it, is a fill the kill
+//!   interrupted: never acknowledged, it is released (counted in
+//!   [`Reattach::interrupted_fills`]) so the tail can pass it; left `Free`
+//!   inside the window it would stop the tail for ever. One whose write has a
+//!   `Placed` slot before it, or any filled, placed or committed slot after
+//!   it, was past its fill: its word was damaged, and it is reported.
+//! - A `Placed` slot whose write still has a `Filled` slot is a `place` the
+//!   kill interrupted: the write was never acknowledged (the acknowledgement
+//!   follows the whole `place`), so the whole write is dropped (counted in
+//!   [`Reattach::torn_places`]) instead of replaying a torn prefix of it.
+//!
+//! # Deferred writes
+//!
+//! An attach rewrites descriptor words (the dropped, released and damaged
+//! slots) and the attach counter, and a creation formats the memory. Both
+//! erase what a boot may still need to see again: the damage, the blank or
+//! lost arena that obliges it to hold the volumes whose writes it lost. A
+//! boot therefore uses [`Arena::attach_deferred`] or
+//! [`Arena::create_deferred`], which write nothing, and calls
+//! [`Arena::apply_pending_writes`] only once it has recorded its hold
+//! durably; a boot that stops before then leaves the memory as it found it,
+//! and the next boot finds the same evidence. Nothing is handed out while
+//! writes are pending ([`ArenaError::Pending`]).
+//!
 //! The arena is single-writer: every method takes `&mut self` or `&self`.
 //! Concurrent reactors in `dbladed` partition the slot ring between them
 //! (E16 in `docs/07-engineering-decisions.md`).
@@ -80,6 +110,7 @@
 use core::fmt;
 use core::mem::{align_of, offset_of, size_of};
 use core::sync::atomic::{compiler_fence, Ordering};
+use std::collections::HashSet;
 
 use otap_format::checksum::crc32c;
 use otap_format::{
@@ -203,8 +234,9 @@ impl ArenaHeader {
         self.crc32c = self.compute_crc();
     }
 
-    /// Checks magic, major version, CRC and the geometry against `len`.
-    pub fn verify(&self, len: usize) -> Result<(), ArenaError> {
+    /// Checks magic, major version and CRC: the header is an arena's
+    /// header, whatever memory it lies in.
+    pub fn verify_identity(&self) -> Result<(), ArenaError> {
         if self.magic != ARENA_MAGIC {
             return Err(ArenaError::BadMagic { found: self.magic });
         }
@@ -214,6 +246,12 @@ impl ArenaHeader {
         if self.compute_crc() != self.crc32c {
             return Err(ArenaError::BadCrc);
         }
+        Ok(())
+    }
+
+    /// Checks magic, major version, CRC and the geometry against `len`.
+    pub fn verify(&self, len: usize) -> Result<(), ArenaError> {
+        self.verify_identity()?;
         let geometry = Geometry::for_len(len)?;
         if self.slots != geometry.slots
             || self.slot_bytes as usize != SLOT_BYTES
@@ -516,6 +554,12 @@ pub struct Reattach {
     pub damaged: Vec<DamagedSlot>,
     /// `Filled` slots dropped because their write was never acknowledged.
     pub dropped_filled: u32,
+    /// `Placed` slots dropped because their write still had `Filled` slots:
+    /// a `place` the kill interrupted, never acknowledged.
+    pub torn_places: u32,
+    /// `Free` slots under a stale seal inside the window, released: a fill
+    /// the kill interrupted between a slot's field stores and its word.
+    pub interrupted_fills: u32,
     /// `Committed` slots found (free for reuse).
     pub committed: u32,
     /// The attach count after this attach (1 after a torn counter).
@@ -528,6 +572,33 @@ impl Reattach {
     #[must_use]
     pub fn is_damaged(&self) -> bool {
         !self.damaged.is_empty()
+    }
+}
+
+/// The page an arena's length is a whole number of: 2 MiB, the only size
+/// the daemon maps.
+const SURVEY_PAGE: usize = 2 * 1024 * 1024;
+
+/// What [`Arena::survey`] found in an arena read under the geometry its
+/// header records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArenaSurvey {
+    /// The smallest memory, in whole 2 MiB pages, that holds the recorded
+    /// geometry: the length the arena was made for.
+    pub recorded_bytes: u64,
+    /// Slots in the recorded ring.
+    pub slots: u32,
+    /// Slots in the `Placed` state, or sealed as placed under damaged state
+    /// bits: writes that may have been acknowledged and that a recreation
+    /// would destroy.
+    pub placed: u32,
+}
+
+impl ArenaSurvey {
+    /// `true` when nothing in the arena may be an acknowledged write.
+    #[must_use]
+    pub const fn holds_nothing(&self) -> bool {
+        self.placed == 0
     }
 }
 
@@ -611,6 +682,10 @@ pub enum ArenaError {
         /// The slot.
         slot: u32,
     },
+    /// The attach's or the creation's writes are still pending
+    /// ([`Arena::apply_pending_writes`]): nothing is handed out on a table
+    /// that is not written yet.
+    Pending,
 }
 
 impl fmt::Display for ArenaError {
@@ -642,6 +717,9 @@ impl fmt::Display for ArenaError {
                 )
             }
             Self::DataCrc { slot } => write!(f, "slot {slot} fails its block CRC"),
+            Self::Pending => {
+                f.write_str("the arena's re-attach or creation has not been written yet")
+            }
         }
     }
 }
@@ -684,6 +762,20 @@ impl Geometry {
     }
 }
 
+/// Writes an attach or a creation left for [`Arena::apply_pending_writes`].
+#[derive(Debug)]
+enum Pending {
+    /// The attach's descriptor words, `(slot, state, lap)` in order, and
+    /// its attach counter word.
+    Attach {
+        rewrite: Vec<(u32, SlotState, u32)>,
+        attach_word: u64,
+    },
+    /// A fresh arena's header, written after its descriptor table is
+    /// zeroed.
+    Create { header: Box<ArenaHeader> },
+}
+
 /// The write-cache arena.
 #[derive(Debug)]
 pub struct Arena {
@@ -696,13 +788,30 @@ pub struct Arena {
     /// The oldest position that may still hold unflushed data.
     tail: u64,
     next_seq: u64,
+    /// Writes not yet made (deferred attach or creation).
+    pending: Option<Pending>,
 }
 
 impl Arena {
     /// Formats `mem` as a fresh arena for `agg_id`. Every slot is `Free`.
     /// Gives the memory back with the error when it is too small.
     pub fn create(
-        mut mem: HugeArena,
+        mem: HugeArena,
+        agg_id: Uuid,
+        wall_ns: u64,
+    ) -> Result<Self, (ArenaError, HugeArena)> {
+        let mut arena = Self::create_deferred(mem, agg_id, wall_ns)?;
+        arena.apply_pending_writes();
+        Ok(arena)
+    }
+
+    /// [`create`](Self::create) without writing anything yet: the memory
+    /// keeps whatever it held (blank, or a lost arena) until
+    /// [`apply_pending_writes`](Self::apply_pending_writes), so a process
+    /// that stops before then leaves the next one the same evidence.
+    /// Gives the memory back with the error when it is too small.
+    pub fn create_deferred(
+        mem: HugeArena,
         agg_id: Uuid,
         wall_ns: u64,
     ) -> Result<Self, (ArenaError, HugeArena)> {
@@ -710,8 +819,6 @@ impl Arena {
             Ok(g) => g,
             Err(e) => return Err((e, mem)),
         };
-        let bytes = mem.as_mut_slice();
-        bytes[..geometry.data_off].fill(0);
         let mut hdr = ArenaHeader::new_zeroed();
         hdr.magic = ARENA_MAGIC;
         hdr.ver = ARENA_VERSION;
@@ -723,7 +830,6 @@ impl Arena {
         hdr.created_wall_ns = wall_ns;
         hdr.attach_word = ArenaHeader::encode_attach_count(1);
         hdr.seal();
-        bytes[..ARENA_HEADER_SIZE].copy_from_slice(hdr.as_bytes());
         Ok(Self {
             mem,
             slots: geometry.slots,
@@ -732,7 +838,46 @@ impl Arena {
             head: 0,
             tail: 0,
             next_seq: 1,
+            pending: Some(Pending::Create {
+                header: Box::new(hdr),
+            }),
         })
+    }
+
+    /// `true` while an attach's or a creation's writes wait for
+    /// [`apply_pending_writes`](Self::apply_pending_writes).
+    #[must_use]
+    pub const fn has_pending_writes(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Makes the writes a deferred attach or creation left: the attach's
+    /// descriptor words (with every release asked for meanwhile) and its
+    /// attach counter, or the creation's zeroed descriptor table and then
+    /// its header. A no-op when nothing is pending.
+    pub fn apply_pending_writes(&mut self) {
+        match self.pending.take() {
+            None => {}
+            Some(Pending::Attach {
+                rewrite,
+                attach_word,
+            }) => {
+                for (slot, state, lap) in rewrite {
+                    self.write_word(slot, state, lap);
+                }
+                self.mem.as_mut_slice()[ARENA_ATTACH_WORD_OFFSET..ARENA_ATTACH_WORD_OFFSET + 8]
+                    .copy_from_slice(&attach_word.to_le_bytes());
+                self.advance_tail();
+            }
+            Some(Pending::Create { header }) => {
+                // The table first, the header last: a kill in between
+                // leaves a blank header, never a valid one over garbage.
+                let bytes = self.mem.as_mut_slice();
+                bytes[..self.data_off].fill(0);
+                compiler_fence(Ordering::SeqCst);
+                bytes[..ARENA_HEADER_SIZE].copy_from_slice(header.as_bytes());
+            }
+        }
     }
 
     /// `true` when the header page is all zero: fresh memory, or memory a
@@ -745,7 +890,11 @@ impl Arena {
     }
 
     /// Checks whether `mem` holds an arena of `agg_id` that
-    /// [`attach`](Self::attach) would accept, without touching it.
+    /// [`attach`](Self::attach) would accept, without touching it. The
+    /// aggregate is checked before the geometry, so another pool's arena is
+    /// [`ArenaError::WrongAggregate`] whatever its size, and
+    /// [`ArenaError::BadGeometry`] means an arena of this pool made for
+    /// another size ([`survey`](Self::survey) reads it).
     pub fn can_attach(mem: &HugeArena, agg_id: &Uuid) -> Result<(), ArenaError> {
         let len = mem.len();
         if len < ARENA_HEADER_SIZE {
@@ -753,17 +902,93 @@ impl Arena {
         }
         let hdr = ArenaHeader::read_from_bytes(&mem.as_slice()[..ARENA_HEADER_SIZE])
             .map_err(|_| ArenaError::BadGeometry)?;
-        hdr.verify(len)?;
+        hdr.verify_identity()?;
         if hdr.agg_id != *agg_id {
             return Err(ArenaError::WrongAggregate { found: hdr.agg_id });
         }
-        Ok(())
+        hdr.verify(len)
+    }
+
+    /// Reads the arena of `agg_id` in `mem` under the geometry its header
+    /// records, which need not be the one `mem`'s length gives (an arena
+    /// file that a larger size grew, or one mapped at its own length to be
+    /// judged before a resize), without touching it: how much it holds
+    /// that a recreation would lose.
+    ///
+    /// # Errors
+    /// The header's identity errors, [`ArenaError::WrongAggregate`] for
+    /// another pool's arena, and [`ArenaError::BadGeometry`] when the
+    /// recorded geometry is not one this layout builds or does not fit in
+    /// `mem`.
+    pub fn survey(mem: &HugeArena, agg_id: &Uuid) -> Result<ArenaSurvey, ArenaError> {
+        let len = mem.len();
+        if len < ARENA_HEADER_SIZE {
+            return Err(ArenaError::TooSmall { len });
+        }
+        let hdr = ArenaHeader::read_from_bytes(&mem.as_slice()[..ARENA_HEADER_SIZE])
+            .map_err(|_| ArenaError::BadGeometry)?;
+        hdr.verify_identity()?;
+        if hdr.agg_id != *agg_id {
+            return Err(ArenaError::WrongAggregate { found: hdr.agg_id });
+        }
+        // The recorded geometry must be what `Geometry::for_len` builds for
+        // the smallest whole number of 2 MiB pages that holds it, and lie
+        // inside `mem`.
+        let slots = hdr.slots as usize;
+        let spans = usize::try_from(hdr.data_off)
+            .ok()
+            .zip(slots.checked_mul(SLOT_BYTES))
+            .and_then(|(data, ring)| data.checked_add(ring))
+            .filter(|_| slots > 0 && hdr.slot_bytes as usize == SLOT_BYTES)
+            .ok_or(ArenaError::BadGeometry)?;
+        let recorded_bytes = spans.div_ceil(SURVEY_PAGE) * SURVEY_PAGE;
+        let geometry = Geometry::for_len(recorded_bytes).map_err(|_| ArenaError::BadGeometry)?;
+        if geometry.slots != hdr.slots
+            || geometry.desc_off as u64 != hdr.desc_off
+            || geometry.data_off as u64 != hdr.data_off
+            || spans > len
+        {
+            return Err(ArenaError::BadGeometry);
+        }
+        let mut survey = ArenaSurvey {
+            recorded_bytes: recorded_bytes as u64,
+            slots: hdr.slots,
+            placed: 0,
+        };
+        for slot in 0..hdr.slots {
+            let at = geometry.desc_off + slot as usize * SLOT_DESC_SIZE;
+            let desc = SlotDesc::read_from_bytes(&mem.as_slice()[at..at + SLOT_DESC_SIZE])
+                .map_err(|_| ArenaError::BadGeometry)?;
+            // Placed, or a word sealed as placed whose state bits were
+            // damaged: either may be an acknowledged write.
+            let placed = desc.state() == SlotState::Placed
+                || (!desc.verify() && desc.sealed_as() == Some(SlotState::Placed));
+            if placed {
+                survey.placed += 1;
+            }
+        }
+        Ok(survey)
     }
 
     /// Re-attaches to an arena left by an earlier process. See the crate
     /// documentation for what is kept, dropped and reported. Gives the
     /// memory back with the error when it refuses.
     pub fn attach(
+        mem: HugeArena,
+        agg_id: &Uuid,
+    ) -> Result<(Self, Reattach), (ArenaError, HugeArena)> {
+        let (mut arena, report) = Self::attach_deferred(mem, agg_id)?;
+        arena.apply_pending_writes();
+        Ok((arena, report))
+    }
+
+    /// [`attach`](Self::attach) without writing anything yet: the report,
+    /// the window and the next sequence number are the attach's, and the
+    /// memory is as it was found until
+    /// [`apply_pending_writes`](Self::apply_pending_writes). Releases asked
+    /// for meanwhile ([`release_after_attach`](Self::release_after_attach))
+    /// join the pending writes.
+    pub fn attach_deferred(
         mem: HugeArena,
         agg_id: &Uuid,
     ) -> Result<(Self, Reattach), (ArenaError, HugeArena)> {
@@ -787,6 +1012,7 @@ impl Arena {
             head: 0,
             tail: 0,
             next_seq: 1,
+            pending: None,
         };
         match arena.scan_on_attach(&hdr) {
             Ok(report) => Ok((arena, report)),
@@ -794,17 +1020,28 @@ impl Arena {
         }
     }
 
-    /// The scan behind [`attach`](Self::attach), once the header verified.
+    /// The scan behind [`attach_deferred`](Self::attach_deferred), once the
+    /// header verified: the report, the window and the next sequence number
+    /// from the table as it was found, and the writes it calls for left
+    /// pending.
+    #[allow(clippy::too_many_lines)]
     fn scan_on_attach(&mut self, hdr: &ArenaHeader) -> Result<Reattach, ArenaError> {
         let arena = self;
         let mut report = Reattach::default();
         let slots = u64::from(arena.slots);
         let mut max_pos: Option<u64> = None;
-        let mut min_placed: Option<u64> = None;
         let mut max_seq = 0u64;
         // What each slot's word becomes, applied after the scan so the head
         // and the tail come from the table as it was found.
         let mut rewrite: Vec<(u32, SlotState, u32)> = Vec::new();
+        // The `Placed` slots that verify, with their positions, before the
+        // interrupted places are taken out.
+        let mut placed: Vec<(PlacedSlot, u64)> = Vec::new();
+        // `(seq, lap)` of every `Filled` slot that verifies: a write whose
+        // `place` had not finished.
+        let mut filling: HashSet<(u64, u32)> = HashSet::new();
+        // `Free` slots under a stale seal, judged once the head is known.
+        let mut stale: Vec<(u32, SlotDesc)> = Vec::new();
         for slot in 0..arena.slots {
             let desc = *arena.desc(slot);
             max_seq = max_seq.max(desc.seq);
@@ -830,11 +1067,19 @@ impl Arena {
                             damage: Damage::Descriptor,
                         });
                         rewrite.push((slot, SlotState::Committed, lap));
+                    } else if desc.word != 0 {
+                        // A seal over other fields: a fill interrupted
+                        // between this slot's field stores and its word, or
+                        // damage; its neighbours tell (below). Never noted:
+                        // its lap is not verified, and a lap it does not
+                        // have must not move the head.
+                        stale.push((slot, desc));
                     }
                 }
                 SlotState::Filled => {
                     if valid {
                         report.dropped_filled += 1;
+                        filling.insert((desc.seq, lap));
                         note_pos();
                     } else {
                         // A fill seals its word in one store: an unsealed
@@ -897,15 +1142,17 @@ impl Arena {
                             continue;
                         }
                     };
-                    report.placed.push(PlacedSlot {
-                        ring: RingRef { slot, lap },
-                        vol: desc.vol(),
-                        lba: desc.lba(),
-                        seq: desc.seq,
-                        crc32c: desc.crc32c,
-                        hole_blocks,
-                    });
-                    min_placed = Some(min_placed.map_or(pos, |m| m.min(pos)));
+                    placed.push((
+                        PlacedSlot {
+                            ring: RingRef { slot, lap },
+                            vol: desc.vol(),
+                            lba: desc.lba(),
+                            seq: desc.seq,
+                            crc32c: desc.crc32c,
+                            hole_blocks,
+                        },
+                        pos,
+                    ));
                 }
                 SlotState::Committed => {
                     if valid {
@@ -922,6 +1169,20 @@ impl Arena {
                 }
             }
         }
+        // A place the kill interrupted: the write still has `Filled` slots,
+        // so it was never acknowledged (the acknowledgement follows the
+        // whole `place`). Its placed prefix goes with the rest of it rather
+        // than replaying a torn write.
+        let mut min_placed: Option<u64> = None;
+        for (p, pos) in placed {
+            if filling.contains(&(p.seq, p.ring.lap)) {
+                report.torn_places += 1;
+                rewrite.push((p.ring.slot, SlotState::Committed, p.ring.lap));
+            } else {
+                min_placed = Some(min_placed.map_or(pos, |m| m.min(pos)));
+                report.placed.push(p);
+            }
+        }
         arena.head = max_pos.map_or(0, |m| m + 1);
         arena.tail = min_placed.unwrap_or(arena.head);
         if arena.head - arena.tail > slots {
@@ -929,11 +1190,28 @@ impl Arena {
                 reason: "the live window is wider than the ring",
             });
         }
-        arena.next_seq = max_seq + 1;
-        for (slot, state, lap) in rewrite {
-            arena.write_word(slot, state, lap);
+        for (slot, desc) in stale {
+            let lap = desc.lap();
+            if arena.fill_went_past(slot, &desc) {
+                // The write this slot belongs to was filled past it, or
+                // placed: its word was damaged, and the block may have
+                // been acknowledged.
+                report.damaged.push(DamagedSlot {
+                    slot,
+                    desc,
+                    damage: Damage::Descriptor,
+                });
+                rewrite.push((slot, SlotState::Committed, lap));
+            } else if u64::from(lap) * slots + u64::from(slot) < arena.head {
+                // An interrupted fill inside the window (or behind it):
+                // released, so the tail passes it. At or beyond the head it
+                // is outside the window and the next reservation re-seals
+                // it.
+                report.interrupted_fills += 1;
+                rewrite.push((slot, SlotState::Committed, lap));
+            }
         }
-        arena.advance_tail();
+        arena.next_seq = max_seq + 1;
         report.placed.sort_by_key(|p| {
             (
                 p.seq,
@@ -941,11 +1219,63 @@ impl Arena {
             )
         });
         let count = hdr.attach_count().map_or(1, |c| c.wrapping_add(1).max(1));
-        let word = ArenaHeader::encode_attach_count(count).to_le_bytes();
-        arena.mem.as_mut_slice()[ARENA_ATTACH_WORD_OFFSET..ARENA_ATTACH_WORD_OFFSET + 8]
-            .copy_from_slice(&word);
         report.attach_count = count;
+        arena.pending = Some(Pending::Attach {
+            rewrite,
+            attach_word: ArenaHeader::encode_attach_count(count),
+        });
         Ok(report)
+    }
+
+    /// For a `Free` slot under a stale seal: `true` when a neighbour of the
+    /// same write (the same sequence, volume, kind and lap, at the previous
+    /// or the next LBA) shows the write got past this slot's fill. A fill
+    /// stores slot by slot in order, so an interrupted one has only
+    /// `Filled` slots of its write before the stale slot and only its
+    /// reservation's `Free` slots after it; a `Placed` slot of the write
+    /// before it, or a filled, placed or committed one after it, means the
+    /// word was damaged. (A `Committed` slot before it says nothing: an
+    /// earlier attach released the `Filled` slots of an interrupted fill.)
+    fn fill_went_past(&self, slot: u32, desc: &SlotDesc) -> bool {
+        let same_write = |n: &SlotDesc, lba: Option<u64>| {
+            n.verify()
+                && n.seq == desc.seq
+                && n.vol() == desc.vol()
+                && n.kind == desc.kind
+                && n.lap() == desc.lap()
+                && Some(n.lba()) == lba
+        };
+        if slot > 0 {
+            let prev = self.desc(slot - 1);
+            if prev.state() == SlotState::Placed && same_write(prev, desc.lba().checked_sub(1)) {
+                return true;
+            }
+        }
+        if slot + 1 < self.slots {
+            let next = self.desc(slot + 1);
+            if next.state() != SlotState::Free && same_write(next, desc.lba().checked_add(1)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Releases a `Placed` run like [`commit`](Self::commit); while a
+    /// deferred attach's writes are pending, the release joins them (the
+    /// slots stay `Placed` in the memory until
+    /// [`apply_pending_writes`](Self::apply_pending_writes)).
+    pub fn release_after_attach(&mut self, ring: RingRef, blocks: u32) -> Result<(), ArenaError> {
+        if !matches!(self.pending, Some(Pending::Attach { .. })) {
+            return self.commit(ring, blocks);
+        }
+        self.check_run(ring, blocks)?;
+        self.check_states(ring, blocks, &[SlotState::Placed])?;
+        if let Some(Pending::Attach { rewrite, .. }) = &mut self.pending {
+            for i in 0..blocks {
+                rewrite.push((ring.slot + i, SlotState::Committed, ring.lap));
+            }
+        }
+        Ok(())
     }
 
     /// The header as stored.
@@ -1000,6 +1330,11 @@ impl Arena {
     /// [`ArenaError::Full`] when the run would reach into live data, counting
     /// the slots a skip to the next lap would leave dead as passable.
     pub fn reserve(&mut self, blocks: u32) -> Result<RingRef, ArenaError> {
+        // Nothing is handed out on a table whose attach or creation is not
+        // written yet.
+        if self.pending.is_some() {
+            return Err(ArenaError::Pending);
+        }
         if blocks == 0 || blocks > self.slots {
             return Err(ArenaError::BadRun { wanted: blocks });
         }
@@ -1201,6 +1536,8 @@ impl Arena {
     }
 
     /// Gives the memory back (the sim keeps it across a daemon restart).
+    /// Writes still pending are dropped: the memory is as the deferred
+    /// attach or creation found it.
     #[must_use]
     pub fn into_memory(self) -> HugeArena {
         self.mem

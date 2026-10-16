@@ -399,6 +399,9 @@ enum St {
     Reserved,
     Filled,
     Placed,
+    /// The placed prefix of a write whose `place` the kill interrupted:
+    /// never acknowledged, dropped with the rest of the write (Step 6A).
+    Torn,
 }
 
 #[derive(Debug, Clone)]
@@ -445,6 +448,8 @@ enum Op {
     Discard(usize),
     Kill,
     KillMidFill(usize, u32),
+    /// A kill between one slot's field stores and its word store (Step 6A).
+    KillInsideFill(usize, u32),
     KillMidPlace(usize, u32),
     KillMidCommit(usize, u32),
 }
@@ -459,6 +464,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => any::<usize>().prop_map(Op::Discard),
         1 => Just(Op::Kill),
         1 => (any::<usize>(), any::<u32>()).prop_map(|(i, k)| Op::KillMidFill(i, k)),
+        1 => (any::<usize>(), any::<u32>()).prop_map(|(i, k)| Op::KillInsideFill(i, k)),
         1 => (any::<usize>(), any::<u32>()).prop_map(|(i, k)| Op::KillMidPlace(i, k)),
         1 => (any::<usize>(), any::<u32>()).prop_map(|(i, k)| Op::KillMidCommit(i, k)),
     ]
@@ -504,8 +510,10 @@ fn reattach(
     let slots = a.slots();
     let mut expected: Vec<(u32, u32, u32, u64, u64, u32)> = Vec::new();
     let mut filled = 0u32;
+    let mut torn = 0u32;
     for r in runs.iter() {
         match r.st {
+            St::Torn => torn += r.blocks,
             St::Placed => {
                 for k in 0..r.blocks {
                     expected.push((
@@ -553,6 +561,12 @@ fn reattach(
         filled,
         "every filled slot is dropped"
     );
+    prop_assert_eq!(
+        report.torn_places,
+        torn,
+        "the placed prefix of an interrupted place is dropped"
+    );
+    prop_assert!(report.damaged.is_empty(), "a kill is not damage");
     runs.retain(|r| r.st == St::Placed);
     let (tail, head) = a.window();
     prop_assert!(head - tail <= u64::from(slots), "window {tail}..{head}");
@@ -714,6 +728,41 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
                 }
                 a = Some(reattach(mem, &mut runs, &mut attaches)?);
             }
+            Op::KillInsideFill(i, j) => {
+                let Some(i) = pick(&runs, St::Reserved, i) else {
+                    continue;
+                };
+                let r0 = runs[i].clone();
+                let j = j % r0.blocks;
+                // The reservation's descriptors, before the fill changes
+                // their fields.
+                let mut before = Vec::with_capacity(r0.blocks as usize);
+                for k in 0..r0.blocks {
+                    before.push(
+                        arena
+                            .descriptor(r0.ring.slot + k)
+                            .map_err(|e| TestCaseError::fail(format!("descriptor: {e}")))?,
+                    );
+                }
+                fill_run(arena, &mut runs[i])?;
+                let r = runs.remove(i);
+                let mut mem = a.take().expect("an arena").into_memory();
+                // Slots 0..j were filled whole; slot j has the fill's fields
+                // under the reservation's word; the slots after it are still
+                // the reservation's. The write was never acknowledged and
+                // goes whole; the stale slot is released when it lies inside
+                // the window, so nothing stalls (Step 6A).
+                let mut stale = read_desc(&mem, r.ring.slot + j);
+                stale.word = before[j as usize].word;
+                write_desc(&mut mem, r.ring.slot + j, &stale);
+                for k in j + 1..r.blocks {
+                    write_desc(&mut mem, r.ring.slot + k, &before[k as usize]);
+                }
+                if j > 0 {
+                    runs.push(r.slice(0, j));
+                }
+                a = Some(reattach(mem, &mut runs, &mut attaches)?);
+            }
             Op::KillMidPlace(i, j) => {
                 let Some(i) = pick(&runs, St::Filled, i) else {
                     continue;
@@ -729,7 +778,13 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
                     set_state(&mut mem, r.ring.slot + k, SlotState::Filled);
                 }
                 if j > 0 {
-                    runs.push(r.slice(0, j));
+                    let mut prefix = r.slice(0, j);
+                    if j < r.blocks {
+                        // A place that did not finish: the write was never
+                        // acknowledged and goes whole (Step 6A).
+                        prefix.st = St::Torn;
+                    }
+                    runs.push(prefix);
                 }
                 if j < r.blocks {
                     let mut rest = r.slice(j, r.blocks);
@@ -759,7 +814,11 @@ fn run_ops(ops: &[Op]) -> Result<(), TestCaseError> {
         }
         let killed = matches!(
             op,
-            Op::Kill | Op::KillMidFill(..) | Op::KillMidPlace(..) | Op::KillMidCommit(..)
+            Op::Kill
+                | Op::KillMidFill(..)
+                | Op::KillInsideFill(..)
+                | Op::KillMidPlace(..)
+                | Op::KillMidCommit(..)
         );
         check(a.as_ref().expect("an arena"), &runs, killed)?;
     }

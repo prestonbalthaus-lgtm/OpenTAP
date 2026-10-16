@@ -100,10 +100,10 @@ pub mod traits;
 pub use boot::{BootError, BootSnapshot, BootState, TornReason};
 pub use cleaner::{CleanTarget, CleanerPolicy, RelocBlock, Scan, SkipReason};
 pub use engine::{
-    reserve_for, BootFailure, CpTrigger, Engine, EngineConfig, EngineError, Event, FoldPolicy,
-    LivenessDrift, OperatorWarning, Pacing, PeekSource, Phase, PoolStatus, SnapshotInfo, Stats,
-    VolumeSpec, VolumeStatus, MAX_PUNCH_BLOCKS, MAX_REQUEST_BLOCKS, MAX_RESERVED_SNAPSHOTS,
-    MAX_USER_SNAPSHOTS, META_RESERVE_SEGMENTS,
+    check_arena_resize, reserve_for, BootFailure, CpTrigger, Engine, EngineConfig, EngineError,
+    Event, FoldPolicy, LivenessDrift, OperatorWarning, Pacing, PeekSource, Phase, PoolStatus,
+    SnapshotInfo, Stats, VolumeSpec, VolumeStatus, MAX_PUNCH_BLOCKS, MAX_REQUEST_BLOCKS,
+    MAX_RESERVED_SNAPSHOTS, MAX_USER_SNAPSHOTS, META_RESERVE_SEGMENTS,
 };
 pub use layout::{DiskLayout, LayoutError};
 pub use meta::{MetaError, MetaStream};
