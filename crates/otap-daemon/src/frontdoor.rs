@@ -1,13 +1,15 @@
 //! The daemon's front doors: a channel the control plane feeds (the `Io*`
-//! requests, and every host without a block device), and on Linux the
-//! ublk device of each online volume, behind one composite the engine
-//! sees as its single [`FrontDoor`].
+//! requests, and every host without a block device), and the ublk device
+//! of each online volume (on Linux, or over the tests' in-memory driver),
+//! behind one composite the engine sees as its single [`FrontDoor`].
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use otap_cp::{FrontDoor, IoError, ReqId, Request, RequestKind, Status};
 use otap_format::BLOCK_SIZE;
+
+pub use crate::device::VolumeDevice;
 
 /// How a channel request ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,24 +175,11 @@ impl FrontDoor for ChannelFrontDoor {
     }
 }
 
-/// One volume's ublk device on Linux.
-#[cfg(target_os = "linux")]
-pub struct VolumeDevice {
-    /// The device.
-    pub device: otap_ublk::device::UblkDevice,
-    /// Its queue as the engine's front door.
-    pub front: otap_ublk::UblkFrontDoor<otap_ublk::device::LinuxTransport>,
-}
-
 /// The composite the engine runs on: the channel, and the devices.
 pub struct DaemonFrontDoor {
     channel: ChannelFrontDoor,
-    #[cfg(target_os = "linux")]
     devices: BTreeMap<u32, VolumeDevice>,
-    #[cfg(not(target_os = "linux"))]
-    devices: BTreeMap<u32, ()>,
     /// Which device is polled first next time, so none starves.
-    #[cfg(target_os = "linux")]
     turn: usize,
 }
 
@@ -216,7 +205,6 @@ impl DaemonFrontDoor {
         Self {
             channel: ChannelFrontDoor::new(),
             devices: BTreeMap::new(),
-            #[cfg(target_os = "linux")]
             turn: 0,
         }
     }
@@ -230,16 +218,7 @@ impl DaemonFrontDoor {
     /// Requests the engine holds, over every door.
     #[must_use]
     pub fn in_engine(&self) -> usize {
-        let devices: usize = {
-            #[cfg(target_os = "linux")]
-            {
-                self.devices.values().map(|d| d.front.in_engine()).sum()
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                0
-            }
-        };
+        let devices: usize = self.devices.values().map(|d| d.front.in_engine()).sum();
         self.channel.in_engine() + devices
     }
 
@@ -249,26 +228,23 @@ impl DaemonFrontDoor {
         self.devices.keys().copied().collect()
     }
 
-    /// Adds the device of `vol` (Linux).
-    #[cfg(target_os = "linux")]
+    /// Adds the device of `vol`.
     pub fn add_device(&mut self, vol: u32, device: VolumeDevice) {
         self.devices.insert(vol, device);
     }
 
-    /// Takes the device of `vol` out (Linux), for its teardown.
-    #[cfg(target_os = "linux")]
+    /// Takes the device of `vol` out, for its teardown.
     pub fn remove_device(&mut self, vol: u32) -> Option<VolumeDevice> {
         self.devices.remove(&vol)
     }
 
-    /// The device of `vol` (Linux).
-    #[cfg(target_os = "linux")]
+    /// The device of `vol`.
+    #[must_use]
     pub fn device(&self, vol: u32) -> Option<&VolumeDevice> {
         self.devices.get(&vol)
     }
 
-    /// The device of `vol`, mutably (Linux).
-    #[cfg(target_os = "linux")]
+    /// The device of `vol`, mutably.
     pub fn device_mut(&mut self, vol: u32) -> Option<&mut VolumeDevice> {
         self.devices.get_mut(&vol)
     }
@@ -276,18 +252,15 @@ impl DaemonFrontDoor {
 
 impl FrontDoor for DaemonFrontDoor {
     fn fetch(&mut self) -> Option<Request> {
-        #[cfg(target_os = "linux")]
-        {
-            let n = self.devices.len();
-            if n > 0 {
-                let keys: Vec<u32> = self.devices.keys().copied().collect();
-                for k in 0..n {
-                    let vol = keys[(self.turn + k) % n];
-                    if let Some(dev) = self.devices.get_mut(&vol) {
-                        if let Some(req) = dev.front.fetch() {
-                            self.turn = (self.turn + k + 1) % n;
-                            return Some(req);
-                        }
+        let n = self.devices.len();
+        if n > 0 {
+            let keys: Vec<u32> = self.devices.keys().copied().collect();
+            for k in 0..n {
+                let vol = keys[(self.turn + k) % n];
+                if let Some(dev) = self.devices.get_mut(&vol) {
+                    if let Some(req) = dev.front.fetch() {
+                        self.turn = (self.turn + k + 1) % n;
+                        return Some(req);
                     }
                 }
             }
@@ -299,7 +272,6 @@ impl FrontDoor for DaemonFrontDoor {
         if self.channel.owns(req.id) {
             return self.channel.copy_in(req, dst);
         }
-        #[cfg(target_os = "linux")]
         if let Some(dev) = self.devices.get_mut(&req.vol()) {
             return dev.front.copy_in(req, dst);
         }
@@ -310,7 +282,6 @@ impl FrontDoor for DaemonFrontDoor {
         if self.channel.owns(req.id) {
             return self.channel.copy_out(req, src);
         }
-        #[cfg(target_os = "linux")]
         if let Some(dev) = self.devices.get_mut(&req.vol()) {
             return dev.front.copy_out(req, src);
         }
@@ -320,11 +291,8 @@ impl FrontDoor for DaemonFrontDoor {
     fn complete(&mut self, req: Request, status: Status, seq: u64) {
         if self.channel.owns(req.id) {
             self.channel.complete(req, status, seq);
-        } else {
-            #[cfg(target_os = "linux")]
-            if let Some(dev) = self.devices.get_mut(&req.vol()) {
-                dev.front.complete(req, status, seq);
-            }
+        } else if let Some(dev) = self.devices.get_mut(&req.vol()) {
+            dev.front.complete(req, status, seq);
         }
     }
 }

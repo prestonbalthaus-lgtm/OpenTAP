@@ -1,10 +1,86 @@
 //! What the daemon is started with.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use otap_control::{ArenaKind, Endpoint, MediaKind, DEFAULT_ARENA_BYTES, DEFAULT_CP_INTERVAL_SECS};
 use otap_cp::{DiscardPolicy, FlushPolicy, Media};
+use otap_ublk::{UblkHost, DEFAULT_RECOVERY_BUDGET_NS};
+
+/// The longest `--recovery-timeout` the daemon takes, in seconds.
+pub const MAX_RECOVERY_TIMEOUT_SECS: u64 = 300;
+
+/// A function that starts a ublk control plane, called once per daemon.
+pub type HostFactory = Arc<dyn Fn() -> Box<dyn UblkHost> + Send + Sync>;
+
+/// Whose ublk control plane the daemon drives.
+#[derive(Clone, Default)]
+pub enum UblkBackend {
+    /// The kernel's ublk driver over `/dev/ublk-control` on Linux; none
+    /// elsewhere, where no volume gets a device.
+    #[default]
+    Kernel,
+    /// A control plane the caller supplies: the tests' in-memory driver
+    /// (`otap_ublk::MockKernel`), so the device lifecycle, the restart
+    /// reconciliation and the reaper run on any host.
+    Custom(HostFactory),
+}
+
+impl UblkBackend {
+    /// A new control plane for one daemon, or `None` when this host has
+    /// none.
+    #[must_use]
+    pub fn start(&self) -> Option<Box<dyn UblkHost>> {
+        match self {
+            Self::Custom(make) => Some(make()),
+            Self::Kernel => {
+                #[cfg(target_os = "linux")]
+                {
+                    Some(Box::new(otap_ublk::device::LinuxHost::new()))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    None
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for UblkBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kernel => f.write_str("Kernel"),
+            Self::Custom(_) => f.write_str("Custom"),
+        }
+    }
+}
+
+impl PartialEq for UblkBackend {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Kernel, Self::Kernel) => true,
+            (Self::Custom(a), Self::Custom(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for UblkBackend {}
+
+/// Where the daemon keeps its host-local runtime state when none is given:
+/// `/run/opentap` on Linux (a tmpfs, emptied at reboot like the ublk
+/// devices the state describes), the temporary directory's `opentap`
+/// elsewhere.
+#[must_use]
+pub fn default_state_dir() -> PathBuf {
+    if cfg!(target_os = "linux") {
+        PathBuf::from("/run/opentap")
+    } else {
+        std::env::temp_dir().join("opentap")
+    }
+}
 
 /// Geometry and policy overrides an operator may give at format and at
 /// boot (a boot must give the same geometry the pool was formatted with,
@@ -74,8 +150,19 @@ pub struct DaemonConfig {
     pub cp_interval_secs: u32,
     /// Geometry and policy overrides for the pool booted at start.
     pub overrides: Overrides,
-    /// Expose a ublk device per online volume (Linux; ignored elsewhere).
+    /// Expose a ublk device per online volume (Linux, or any host with a
+    /// [`UblkBackend::Custom`] control plane; ignored otherwise).
     pub ublk: bool,
+    /// The ublk control plane.
+    pub ublk_backend: UblkBackend,
+    /// Where the daemon keeps its host-local state: the binding of each
+    /// volume to its ublk device (`crate::bindings`), which lets a daemon
+    /// restarted after `kill -9` re-attach the same devices.
+    pub state_dir: PathBuf,
+    /// How long a restarted daemon waits for the driver to quiesce a dead
+    /// daemon's device before it gives up on re-attaching it, creates a new
+    /// one for the volume and lists the old one as stale.
+    pub recovery_timeout: Duration,
     /// Listen on a TCP address beyond loopback. The control plane is
     /// unauthenticated, so this is off unless the operator says so.
     pub allow_remote: bool,
@@ -98,6 +185,9 @@ impl Default for DaemonConfig {
             cp_interval_secs: DEFAULT_CP_INTERVAL_SECS,
             overrides: Overrides::default(),
             ublk: cfg!(target_os = "linux"),
+            ublk_backend: UblkBackend::Kernel,
+            state_dir: default_state_dir(),
+            recovery_timeout: Duration::from_nanos(DEFAULT_RECOVERY_BUDGET_NS),
             allow_remote: false,
             op_timeout: Duration::from_secs(120),
             discard_arena: false,

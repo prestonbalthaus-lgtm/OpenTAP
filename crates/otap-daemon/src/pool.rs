@@ -1,8 +1,12 @@
 //! A booted pool: the engine over its backstore and arena, the ublk
-//! devices of its online volumes (Linux), and every operation the control
-//! plane runs against it. Everything here runs on the engine thread, so
-//! an operation ticks the engine itself while it waits for the consistency
-//! point it needs, and the data path keeps flowing meanwhile.
+//! devices of its online volumes (Linux, or the tests' in-memory driver),
+//! and every operation the control plane runs against it. Everything here
+//! runs on the engine thread, so an operation ticks the engine itself
+//! while it waits for the consistency point it needs, and the data path
+//! keeps flowing meanwhile. The devices' recovery after a crash and the
+//! reaper are in its `devices` module (Step 6B).
+
+mod devices;
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -21,11 +25,14 @@ use otap_cp::{
     Status,
 };
 use otap_format::{SnapKind, SnapOrigin, Uuid, BLOCK_SIZE, MAX_VOLS, PIN_MASK, PIN_REPLICATION};
+use otap_ublk::{device_stamp, pool_fingerprint, DeviceSpec};
 
 use crate::arena::open_pool_arena;
 use crate::backstore::{holds_data, open_backstore, probe_superblock};
+use crate::bindings::{Bindings, StaleReason};
 use crate::clock::SystemClock;
 use crate::config::Overrides;
+use crate::device::{destroy_device, volume_device, HostRef, VolumeDevice};
 use crate::frontdoor::{blocks_of, DaemonFrontDoor, IoCompletion, IoHandle};
 use crate::report::{pool_report, snapshot_report, volume_report};
 
@@ -45,7 +52,7 @@ pub struct BootSpec {
     pub arena: ArenaKind,
     /// The CP timer in seconds.
     pub cp_interval_secs: u32,
-    /// Expose ublk devices (Linux).
+    /// Expose ublk devices (when the daemon has a ublk control plane).
     pub ublk: bool,
     /// How long an operation may wait for its consistency point.
     pub op_timeout: Duration,
@@ -53,6 +60,19 @@ pub struct BootSpec {
     /// acknowledged writes (`dbladed --discard-arena`; see
     /// [`crate::arena::open_pool_arena`]).
     pub discard_arena: bool,
+    /// Where the record of the pool's ublk devices lives
+    /// ([`crate::bindings`]).
+    pub state_dir: PathBuf,
+    /// How long the boot waits for the driver to quiesce a dead daemon's
+    /// device before it gives the volume a new one.
+    pub recovery_timeout: Duration,
+}
+
+/// A device the pool serves for a volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Served {
+    dev_id: u32,
+    path: String,
 }
 
 /// Lines of recent events the pool keeps.
@@ -141,8 +161,16 @@ pub struct Pool {
     last_boot: String,
     rotational: bool,
     stripe_bytes: u32,
-    ublk: bool,
-    devices: BTreeMap<u32, String>,
+    /// The ublk control plane, when the pool exposes devices.
+    host: Option<HostRef>,
+    /// The devices served, by volume.
+    devices: BTreeMap<u32, Served>,
+    /// The record of the devices, kept in `state_dir` ([`crate::bindings`]).
+    bindings: Bindings,
+    state_dir: PathBuf,
+    /// The pool's fingerprint, which its devices' stamps carry.
+    pool_fp: u32,
+    recovery_timeout: Duration,
     op_timeout: Duration,
     log: VecDeque<String>,
     /// The daemon's stop flag (a signal): an operation waiting for its
@@ -207,13 +235,16 @@ impl Pool {
 
     /// Boots the pool on `spec.device`: opens the device under the recorded
     /// geometry, the arena, and the engine; ticks until the boot commit is
-    /// durable; then exposes a ublk device for every online volume on
-    /// Linux when `spec.ublk`. `stop` is the daemon's stop flag, which
+    /// durable; then, when `spec.ublk` and the daemon has a ublk control
+    /// plane (`host`), re-attaches the devices a killed daemon left to the
+    /// online volumes they exposed (Step 6B, its `devices` module) and creates one for
+    /// every other online volume. `stop` is the daemon's stop flag, which
     /// interrupts an operation's wait.
     pub fn boot(
         spec: &BootSpec,
         clock: &SystemClock,
         stop: Option<Arc<AtomicBool>>,
+        host: Option<HostRef>,
     ) -> Result<Self, ControlError> {
         check_arena_bytes(spec.arena_bytes).map_err(bad_request)?;
         check_cp_interval(spec.cp_interval_secs).map_err(bad_request)?;
@@ -233,6 +264,10 @@ impl Pool {
                 ),
             ));
         };
+        let host = if spec.ublk { host } else { None };
+        if let Some(host) = &host {
+            devices::refuse_a_second_server(host, pool_fingerprint(&agg_id))?;
+        }
         let cp_timer_ns = u64::from(spec.cp_interval_secs) * 1_000_000_000;
         let opened = open_backstore(
             &spec.device,
@@ -268,6 +303,9 @@ impl Pool {
             .map_err(|e| bad_request(format!("the arena cannot be laid out: {e}")))?;
         let mut cfg = EngineConfig::new(agg_id, Vec::new());
         cfg.discard_arena = spec.discard_arena;
+        // The engine's boot re-attaches the arena: the devices' recovery is
+        // timed from here (its target is 2 s, `otap_ublk::recovery`).
+        let reattach_began = Instant::now();
         let mut engine = PoolEngine::boot(
             cfg,
             backstore,
@@ -293,8 +331,12 @@ impl Pool {
             last_boot: "booting".to_string(),
             rotational: profile.media == Media::Hdd,
             stripe_bytes: profile.geom.stripe_bytes,
-            ublk: spec.ublk,
+            host,
             devices: BTreeMap::new(),
+            bindings: Bindings::new(agg_id),
+            state_dir: spec.state_dir.clone(),
+            pool_fp: pool_fingerprint(&agg_id),
+            recovery_timeout: spec.recovery_timeout,
             op_timeout: spec.op_timeout,
             log: VecDeque::new(),
             stop,
@@ -304,6 +346,15 @@ impl Pool {
             pool.log(format!("geometry: {warning}"));
         }
         pool.wait_until("the boot commit", |e| e.is_serving())?;
+        // The devices a killed daemon left are re-attached before any new
+        // one is made, so a volume keeps its `/dev/ublkbN` (Step 6B).
+        if pool.host.is_some() {
+            pool.load_bindings();
+            if let Err(e) = pool.reconcile_devices(reattach_began) {
+                let _ = pool.stop();
+                return Err(e);
+            }
+        }
         let online: Vec<u32> = pool
             .engine
             .volumes()
@@ -332,10 +383,22 @@ impl Pool {
         &self.engine
     }
 
-    /// The block device path of `vol` (Linux), if one is exposed.
+    /// The block device path of `vol`, if one is exposed.
     #[must_use]
     pub fn device_path(&self, vol: u32) -> Option<&str> {
-        self.devices.get(&vol).map(String::as_str)
+        self.devices.get(&vol).map(|s| s.path.as_str())
+    }
+
+    /// The ublk device id of `vol`, if one is exposed.
+    #[must_use]
+    pub fn device_id(&self, vol: u32) -> Option<u32> {
+        self.devices.get(&vol).map(|s| s.dev_id)
+    }
+
+    /// The record of the pool's ublk devices as it stands.
+    #[must_use]
+    pub const fn bindings(&self) -> &Bindings {
+        &self.bindings
     }
 
     /// The recent noteworthy events, oldest first.
@@ -662,7 +725,7 @@ impl Pool {
         Some(volume_report(
             vol,
             &v,
-            self.devices.get(&vol).cloned(),
+            self.devices.get(&vol).map(|s| s.path.clone()),
             snapshots,
         ))
     }
@@ -698,56 +761,74 @@ impl Pool {
             })
     }
 
+    /// The shape of the device of a volume of `size_blocks` blocks.
+    fn device_spec(&self, size_blocks: u64) -> DeviceSpec {
+        DeviceSpec::new(size_blocks, self.stripe_bytes, self.rotational).for_arena(self.arena_slots)
+    }
+
     /// Exposes the ublk device of `vol` when the pool serves devices, the
-    /// volume is online and no device exists yet (Linux; nothing
-    /// elsewhere).
+    /// volume is online and no device exists yet: the device is created
+    /// with the pool's stamp for the volume, recorded in the bindings
+    /// before it is started (so a crash from there on leaves it findable),
+    /// handed to the engine, and started while the engine serves it.
     fn ensure_device(&mut self, vol: u32) -> Result<(), ControlError> {
-        #[cfg(target_os = "linux")]
-        {
-            if !self.ublk || self.devices.contains_key(&vol) {
-                return Ok(());
-            }
-            let Some(st) = self.engine.volume(vol).filter(|v| v.present && !v.offline) else {
-                return Ok(());
-            };
-            let (device, path) = crate::device::create_device(
-                vol,
-                st.size_blocks,
-                self.stripe_bytes,
-                self.rotational,
-                self.arena_slots,
-            )?;
-            // The engine serves the queue from here on, so the reads the
-            // driver's start makes through it are answered (Step 6A).
-            self.engine.front_door().add_device(vol, device);
-            if let Err(e) = self.start_device(vol) {
-                self.abandon_device(vol);
+        let Some(host) = self.host.clone() else {
+            return Ok(());
+        };
+        if self.devices.contains_key(&vol) {
+            return Ok(());
+        }
+        let Some(st) = self.engine.volume(vol).filter(|v| v.present && !v.offline) else {
+            return Ok(());
+        };
+        let spec = self.device_spec(st.size_blocks);
+        let stamp = device_stamp(self.pool_fp, vol);
+        let created = host.borrow_mut().create(&spec, stamp);
+        let device = created.map_err(|e| {
+            ControlError::new(
+                ErrorCode::Io,
+                format!("cannot create the ublk device of volume {vol}: {e}"),
+            )
+        })?;
+        let dev_id = device.dev_id();
+        self.bindings.bind(vol, dev_id, st.size_blocks);
+        self.save_bindings();
+        let dev = match volume_device(device, vol, st.size_blocks) {
+            Ok(dev) => dev,
+            Err(e) => {
+                self.bindings.forget(dev_id);
+                self.save_bindings();
                 return Err(e);
             }
-            self.devices.insert(vol, path.clone());
-            self.log(format!("volume {vol} is {path}"));
+        };
+        // The engine serves the queue from here on, so the reads the
+        // driver's start makes through it are answered (Step 6A).
+        self.engine.front_door().add_device(vol, dev);
+        if let Err(e) = self.start_device(vol) {
+            self.abandon_device(vol, StaleReason::StartAbandoned);
+            return Err(e);
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (
-                vol,
-                self.ublk,
-                self.stripe_bytes,
-                self.rotational,
-                self.arena_slots,
-            );
-        }
+        let path = format!("/dev/ublkb{dev_id}");
+        self.devices.insert(
+            vol,
+            Served {
+                dev_id,
+                path: path.clone(),
+            },
+        );
+        self.log(format!("volume {vol} is {path}"));
         Ok(())
     }
 
-    /// Starts the device of `vol` that the engine's front door holds:
-    /// `START_DEV` is issued without waiting and polled between ticks of
+    /// Brings live the device of `vol` that the engine's front door holds:
+    /// `START_DEV` for a created device, `END_USER_RECOVERY` for a
+    /// re-attached one, issued without waiting and polled between ticks of
     /// the engine, which serve the device's queue meanwhile, because the
-    /// driver's partition scan reads the new disk through that queue before
-    /// the command completes (Step 6A; waiting for it here instead never
-    /// returned for a privileged daemon). Bounded by the operation timeout
-    /// and the stop flag.
-    #[cfg(target_os = "linux")]
+    /// driver's partition scan reads a new disk through that queue before
+    /// `START_DEV` completes (Step 6A; waiting for it here instead never
+    /// returned for a privileged daemon) and `END_USER_RECOVERY` releases
+    /// the requests a dead daemon held into it. Bounded by the operation
+    /// timeout and the stop flag.
     fn start_device(&mut self, vol: u32) -> Result<(), ControlError> {
         use otap_ublk::{DeviceControl, StartError, TransportError};
         const GONE: TransportError = TransportError {
@@ -758,11 +839,11 @@ impl Pool {
         let started = otap_ublk::start_while_serving(
             self,
             |p| match p.engine.front_door().device_mut(vol) {
-                Some(dev) => DeviceControl::begin_start(&mut dev.device),
+                Some(dev) => DeviceControl::begin_start(&mut *dev.device),
                 None => Err(GONE),
             },
             |p| match p.engine.front_door().device_mut(vol) {
-                Some(dev) => DeviceControl::poll_start(&mut dev.device),
+                Some(dev) => DeviceControl::poll_start(&mut *dev.device),
                 None => Err(GONE),
             },
             |p| {
@@ -795,15 +876,15 @@ impl Pool {
     /// Tears down the device of `vol` whose start failed: out of the
     /// engine's front door, its queue closed (which ends the reads a start
     /// still in flight waits for), the start reaped when it finishes within
-    /// a few seconds, then deleted. `DEL_DEV` waits for the character
-    /// device, so the queue goes first; a start that never finishes leaves
-    /// the device to the operator, and says so.
-    #[cfg(target_os = "linux")]
-    fn abandon_device(&mut self, vol: u32) {
+    /// a few seconds, then deleted and forgotten. `DEL_DEV` waits for the
+    /// character device, so the queue goes first; a device that cannot be
+    /// deleted is recorded stale (`reason`) for `otapctl device reap`, and
+    /// the log says so.
+    fn abandon_device(&mut self, vol: u32, reason: StaleReason) {
         let Some(dev) = self.engine.front_door().remove_device(vol) else {
             return;
         };
-        let crate::frontdoor::VolumeDevice { mut device, front } = dev;
+        let VolumeDevice { mut device, front } = dev;
         drop(front);
         let deadline = Instant::now() + Duration::from_secs(5);
         while device.start_in_flight() && Instant::now() < deadline {
@@ -813,40 +894,49 @@ impl Pool {
             std::thread::sleep(Duration::from_millis(1));
         }
         let id = device.dev_id();
-        if let Err(e) = device.delete() {
-            self.log(format!(
-                "volume {vol}: the ublk device {id} whose start failed was not deleted ({e}); \
-                 delete it with the ublk tools"
-            ));
+        match device.delete() {
+            Ok(()) => {
+                self.bindings.forget(id);
+            }
+            Err(e) => {
+                self.bindings.mark_stale(id, vol, reason);
+                self.log(format!(
+                    "volume {vol}: the ublk device {id} whose start failed was not deleted ({e}); \
+                     `otapctl device reap {id}` deletes it"
+                ));
+            }
         }
+        self.save_bindings();
     }
 
     /// Takes the ublk device of `vol` down: the queue answers `ENODEV`,
-    /// the requests the engine holds finish, then the device is deleted
-    /// (Linux; nothing elsewhere).
+    /// the requests the engine holds finish, then the device is deleted and
+    /// forgotten (nothing when the volume has none).
     fn drop_device(&mut self, vol: u32) -> Result<(), ControlError> {
-        #[cfg(target_os = "linux")]
-        {
-            if !self.devices.contains_key(&vol) {
-                return Ok(());
-            }
-            if let Some(dev) = self.engine.front_door().device_mut(vol) {
-                dev.front.set_offline(true);
-            }
-            self.wait_until("the device's requests to drain", |e| {
-                e.front_door()
-                    .device(vol)
-                    .is_none_or(|d| d.front.in_engine() == 0)
-            })?;
-            if let Some(dev) = self.engine.front_door().remove_device(vol) {
-                let path = self.devices.remove(&vol).unwrap_or_default();
-                crate::device::destroy_device(dev)?;
-                self.log(format!("volume {vol} left {path}"));
-            }
+        if !self.devices.contains_key(&vol) {
+            return Ok(());
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            self.devices.remove(&vol);
+        if let Some(dev) = self.engine.front_door().device_mut(vol) {
+            dev.front.set_offline(true);
+        }
+        self.wait_until("the device's requests to drain", |e| {
+            e.front_door()
+                .device(vol)
+                .is_none_or(|d| d.front.in_engine() == 0)
+        })?;
+        if let Some(dev) = self.engine.front_door().remove_device(vol) {
+            let served = self.devices.remove(&vol);
+            let (id, path) =
+                served.map_or((dev.device.dev_id(), String::new()), |s| (s.dev_id, s.path));
+            if let Err(e) = destroy_device(dev) {
+                self.bindings
+                    .mark_stale(id, vol, StaleReason::TeardownFailed);
+                self.save_bindings();
+                return Err(e);
+            }
+            self.bindings.forget(id);
+            self.save_bindings();
+            self.log(format!("volume {vol} left {path}"));
         }
         Ok(())
     }
@@ -913,6 +1003,8 @@ impl Pool {
                 lba,
                 blocks,
             } => self.io_punch(volume, *lba, *blocks),
+            Request::DeviceList {} => self.device_list(),
+            Request::DeviceReap { dev_id, stale } => self.device_reap(*dev_id, *stale),
             Request::Ping
             | Request::PoolFormat { .. }
             | Request::PoolBoot { .. }

@@ -75,6 +75,26 @@ pub trait Transport {
     fn commit(&mut self, tag: u16, result: i32) -> Result<(), TransportError>;
 }
 
+/// A boxed queue is a queue, so one front door type serves the devices of
+/// any control plane (`crate::host::BoxedTransport`).
+impl<T: Transport + ?Sized> Transport for Box<T> {
+    fn poll(&mut self, out: &mut Vec<QueueEvent>) -> Result<usize, TransportError> {
+        (**self).poll(out)
+    }
+
+    fn read_data(&mut self, tag: u16, off: u32, dst: &mut [u8]) -> Result<(), IoError> {
+        (**self).read_data(tag, off, dst)
+    }
+
+    fn write_data(&mut self, tag: u16, off: u32, src: &[u8]) -> Result<(), IoError> {
+        (**self).write_data(tag, off, src)
+    }
+
+    fn commit(&mut self, tag: u16, result: i32) -> Result<(), TransportError> {
+        (**self).commit(tag, result)
+    }
+}
+
 /// Back-pressure: how many requests the engine holds at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Watermarks {

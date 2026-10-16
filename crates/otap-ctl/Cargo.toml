@@ -21,3 +21,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 otap-daemon = { path = "../otap-daemon" }
+# The in-memory ublk driver the device verbs are tested over (Step 6B).
+otap-ublk = { path = "../otap-ublk" }

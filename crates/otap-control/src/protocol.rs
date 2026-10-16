@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 
 /// The protocol version a client and a daemon must agree on; carried by
 /// `Ping` and checked by the client.
+///
+/// Every request, reply and report refuses unknown fields, so a field
+/// added to an existing shape is a change both peers would refuse, and it
+/// bumps the version. A new request or reply variant does not: a daemon
+/// that does not know a request answers it `BadRequest`, and a reply
+/// variant reaches only a client that sent the request it answers. Step 6B
+/// added `DeviceList` and `DeviceReap` (answered `Devices` and `Reaped`)
+/// that way, under version 1.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The most blocks one `IoWrite` or `IoRead` moves (1 MiB).
@@ -215,6 +223,74 @@ pub enum Request {
         /// Blocks.
         blocks: u32,
     },
+    /// The ublk devices on the host and how each stands with this daemon
+    /// (Step 6B); answered with or without a booted pool. A struct variant
+    /// with no fields, not a unit one: serde lets an internally tagged unit
+    /// variant ignore fields it does not know, which `deny_unknown_fields`
+    /// is meant to refuse.
+    DeviceList {},
+    /// Deletes ublk devices that no daemon will re-attach: the one named by
+    /// `dev_id` (stale, or recoverable by a pool not booted here), or, with
+    /// `stale`, every stale one. Exactly one of the two. A device that is
+    /// served, belongs to another pool or other software, or is still
+    /// quiescing is never deleted.
+    DeviceReap {
+        /// The device `N` of `/dev/ublkbN`.
+        dev_id: Option<u32>,
+        /// Every stale device.
+        stale: bool,
+    },
+}
+
+/// How a ublk device on the host stands with the daemon (Step 6B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceState {
+    /// This daemon serves it for a volume of the booted pool.
+    Serving,
+    /// Its server is dead and it carries an OpenTAP stamp: a daemon booting
+    /// its pool re-attaches it, keeping its number.
+    Recoverable,
+    /// Its server is dead and nothing will re-attach it; `device reap`
+    /// deletes it (the requests it holds fail).
+    Stale,
+    /// Not this daemon's: another live process serves it, another pool owns
+    /// it, or other software may still be setting it up.
+    Foreign,
+}
+
+/// A ublk device on the host as the daemon reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceReport {
+    /// `N` of `/dev/ublkbN`.
+    pub dev_id: u32,
+    /// The block device, `/dev/ublkbN`.
+    pub path: String,
+    /// How it stands with the daemon.
+    pub state: DeviceState,
+    /// Why, for the operator.
+    pub reason: String,
+    /// The driver's state: `live`, `quiesced` or `dead`.
+    pub kernel_state: String,
+    /// The server pid the driver records (0 before a start, -1 after a
+    /// stop).
+    pub pid: i32,
+    /// That pid is a live process.
+    pub pid_alive: bool,
+    /// The volume it exposes: the one the daemon serves it for, or the one
+    /// its OpenTAP stamp names.
+    pub volume_index: Option<u32>,
+    /// That volume's name, when it is a volume of the booted pool.
+    pub volume: Option<String>,
+    /// The fingerprint of the OpenTAP pool its stamp names, as eight hex
+    /// digits.
+    pub pool: Option<String>,
+    /// The capacity in bytes, when the driver reported it.
+    pub size_bytes: Option<u64>,
+    /// Created with `UBLK_F_USER_RECOVERY_REISSUE`: the requests a dead
+    /// server held are delivered again after a re-attach.
+    pub reissue: bool,
 }
 
 /// A volume as the daemon reports it.
@@ -401,6 +477,16 @@ pub enum Response {
     Committed {
         /// The CP.
         cp_seq: u64,
+    },
+    /// The ublk devices on the host (`DeviceList`), by id.
+    Devices {
+        /// Every device.
+        devices: Vec<DeviceReport>,
+    },
+    /// What a `DeviceReap` deleted, as each device stood before.
+    Reaped {
+        /// The deleted devices; empty when nothing was stale.
+        devices: Vec<DeviceReport>,
     },
 }
 

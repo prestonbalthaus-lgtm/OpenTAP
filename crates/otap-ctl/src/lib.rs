@@ -2,7 +2,8 @@
 //! brief, "Opus-Daemon-CLI"; E38 in `docs/07-engineering-decisions.md`).
 //!
 //! The grammar is ONTAP's: `otapctl <group> <verb> --flag value`, with
-//! `pool`, `daemon`, `volume`, `snapshot` and `io` as the groups ([`USAGE`]
+//! `pool`, `daemon`, `volume`, `snapshot`, `io` and `device` (Step 6B: the
+//! host's ublk devices and the reaper) as the groups ([`USAGE`]
 //! lists every verb). [`args::parse`] turns a command line into one
 //! [`otap_control::Request`]; [`run`] connects, checks the protocol, sends
 //! it and renders the reply as text ([`render()`]) or JSON (`--json`).

@@ -36,8 +36,14 @@ use core::fmt;
 use crate::frontdoor::TransportError;
 
 /// The control half of a device's start, as the serving loop drives it.
+/// A device created by this process starts with `START_DEV`; one it
+/// re-attached after its server died (Step 6B, [`crate::recovery`]) with
+/// `END_USER_RECOVERY`, which likewise completes only after the fetches
+/// of the queue being served, and releases the requests the device held
+/// into that queue.
 pub trait DeviceControl {
-    /// Issues `START_DEV` and returns at once, before the device is live.
+    /// Issues `START_DEV` (or `END_USER_RECOVERY`) and returns at once,
+    /// before the device is live.
     ///
     /// # Errors
     /// The command could not be issued.

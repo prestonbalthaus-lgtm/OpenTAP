@@ -8,10 +8,15 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use otap_control::{ControlError, ErrorCode, Reply, Request, Response, PROTOCOL_VERSION};
+use otap_ublk::Owner;
 
 use crate::clock::SystemClock;
 use crate::config::{DaemonConfig, Overrides};
+use crate::device::{no_ublk, HostRef};
 use crate::pool::{BootSpec, Pool};
 
 /// A request and where its reply goes.
@@ -26,6 +31,9 @@ pub struct Daemon {
     /// The stop flag the signals set, handed to the pool so a long
     /// operation gives way to the shutdown.
     stop: Option<Arc<AtomicBool>>,
+    /// The ublk control plane (when `cfg.ublk` and the host has one),
+    /// shared with the booted pool.
+    host: Option<HostRef>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -50,15 +58,23 @@ fn pool_booted(what: &str) -> ControlError {
 }
 
 impl Daemon {
-    /// A daemon with no pool booted.
+    /// A daemon with no pool booted. Its ublk control plane is started
+    /// here when the configuration asks for devices (the kernel's opens
+    /// `/dev/ublk-control` only at its first command).
     #[must_use]
     pub fn new(cfg: DaemonConfig) -> Self {
+        let host = if cfg.ublk {
+            cfg.ublk_backend.start().map(|h| Rc::new(RefCell::new(h)))
+        } else {
+            None
+        };
         Self {
             cfg,
             clock: SystemClock::new(),
             pool: None,
             exit: false,
             stop: None,
+            host,
         }
     }
 
@@ -105,9 +121,41 @@ impl Daemon {
             ublk: self.cfg.ublk,
             op_timeout: self.cfg.op_timeout,
             discard_arena: self.cfg.discard_arena,
+            state_dir: self.cfg.state_dir.clone(),
+            recovery_timeout: self.cfg.recovery_timeout,
         };
-        self.pool = Some(Pool::boot(&spec, &self.clock, self.stop.clone())?);
+        self.pool = Some(Pool::boot(
+            &spec,
+            &self.clock,
+            self.stop.clone(),
+            self.host.clone(),
+        )?);
         Ok(())
+    }
+
+    /// `device list` and `device reap` with no pool booted: every device
+    /// is classified without a pool's knowledge (an OpenTAP device of a
+    /// dead daemon is recoverable by its pool, any other with no live
+    /// server is stale).
+    fn devices_without_pool(&mut self, req: &Request) -> Reply {
+        let host = self.host.clone().ok_or_else(no_ublk)?;
+        let wants = |_: u16| false;
+        let name_of = |_: u32| None;
+        let owner = Owner {
+            pool: None,
+            serving: &[],
+            stale: &[],
+            wants: &wants,
+        };
+        let mut host = host.borrow_mut();
+        match req {
+            Request::DeviceReap { dev_id, stale } => {
+                crate::devices::reap(&mut **host, &owner, &name_of, *dev_id, *stale)?.into_reply()
+            }
+            _ => Ok(Response::Devices {
+                devices: crate::devices::list(&mut **host, &owner, &name_of)?,
+            }),
+        }
     }
 
     /// One tick of the pool; `true` when it has work in hand.
@@ -191,8 +239,10 @@ impl Daemon {
                     // Destroying an arena is asked for on dbladed's command
                     // line only, for the pool it boots at start.
                     discard_arena: false,
+                    state_dir: self.cfg.state_dir.clone(),
+                    recovery_timeout: self.cfg.recovery_timeout,
                 };
-                let pool = Pool::boot(&spec, &self.clock, self.stop.clone())?;
+                let pool = Pool::boot(&spec, &self.clock, self.stop.clone(), self.host.clone())?;
                 let reply = pool.status();
                 self.pool = Some(pool);
                 reply
@@ -208,6 +258,9 @@ impl Daemon {
                 };
                 self.exit = true;
                 reply
+            }
+            Request::DeviceList {} | Request::DeviceReap { .. } if self.pool.is_none() => {
+                self.devices_without_pool(req)
             }
             other => {
                 let pool = self.pool.as_mut().ok_or_else(no_pool)?;

@@ -632,7 +632,11 @@ fn opcodes_match_the_header_enum() {
 #[test]
 fn required_set_is_the_v0_1_set() {
     assert_eq!(REQUIRED_OPCODES, [22, 23, 5, 3, 46, 47, 27]);
-    assert_eq!(REQUIRED_UBLK_FEATURES, (1 << 7) | (1 << 3) | (1 << 6));
+    // Step 6B added UBLK_F_USER_RECOVERY_REISSUE (bit 4) to the set.
+    assert_eq!(
+        REQUIRED_UBLK_FEATURES,
+        (1 << 7) | (1 << 3) | (1 << 4) | (1 << 6)
+    );
 }
 
 #[test]

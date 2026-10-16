@@ -27,8 +27,13 @@
 //! crash.
 //!
 //! Everything durable lives in the pool: the volumes and their names (the
-//! catalogue, F16), the snapshots, the offline flags. The daemon keeps no
-//! state of its own beyond the command line it was started with.
+//! catalogue, F16), the snapshots, the offline flags. The daemon keeps one
+//! host-local hint of its own beyond its command line (Step 6B): which ublk
+//! device exposes which volume ([`bindings`], in `--state-dir`), so that a
+//! daemon restarted after `kill -9` re-attaches the same devices with
+//! `UBLK_F_USER_RECOVERY` before it serves (`otap_ublk::recovery`), and
+//! lists the devices it will not re-attach as stale, for `otapctl device
+//! reap`. Device numbers are the host's, so this never enters the pool.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -36,11 +41,12 @@
 
 pub mod arena;
 pub mod backstore;
+pub mod bindings;
 pub mod clock;
 pub mod config;
 pub mod daemon;
-#[cfg(target_os = "linux")]
 pub mod device;
+pub mod devices;
 pub mod frontdoor;
 pub mod pool;
 pub mod report;
@@ -48,8 +54,11 @@ pub mod server;
 
 pub use arena::{check_resize, open_arena, open_pool_arena};
 pub use backstore::{open_backstore, probe_superblock, Opened};
+pub use bindings::{Binding, Bindings, BindingsError, StaleReason};
 pub use clock::SystemClock;
-pub use config::{DaemonConfig, Overrides};
+pub use config::{
+    default_state_dir, DaemonConfig, HostFactory, Overrides, UblkBackend, MAX_RECOVERY_TIMEOUT_SECS,
+};
 pub use daemon::{install_signal_flag, Daemon, DaemonHandle};
 pub use frontdoor::{ChannelFrontDoor, DaemonFrontDoor, IoCompletion, IoHandle};
 pub use pool::{engine_error, status_word, BootSpec, Pool, PoolEngine};

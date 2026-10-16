@@ -13,7 +13,10 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use crate::ublk::{feature_name, UBLK_F_CMD_IOCTL_ENCODE, UBLK_F_USER_COPY, UBLK_F_USER_RECOVERY};
+use crate::ublk::{
+    feature_name, UBLK_F_CMD_IOCTL_ENCODE, UBLK_F_USER_COPY, UBLK_F_USER_RECOVERY,
+    UBLK_F_USER_RECOVERY_REISSUE,
+};
 use crate::uring::{
     opcode_name, IORING_OP_FSYNC, IORING_OP_READ, IORING_OP_RECV, IORING_OP_SEND_ZC,
     IORING_OP_URING_CMD, IORING_OP_WRITE, IORING_OP_WRITE_FIXED,
@@ -33,9 +36,13 @@ pub const REQUIRED_OPCODES: [u8; 7] = [
 ];
 
 /// The ublk features OpenTAP v0.1 needs: the user copy, recovery after the
-/// daemon's death, and the ioctl command encoding.
-pub const REQUIRED_UBLK_FEATURES: u64 =
-    UBLK_F_USER_COPY | UBLK_F_USER_RECOVERY | UBLK_F_CMD_IOCTL_ENCODE;
+/// daemon's death with the reissue of the requests the dead daemon held
+/// (Step 6B: without it they fail with `EIO` at the crash), and the ioctl
+/// command encoding. Every device is created with all four.
+pub const REQUIRED_UBLK_FEATURES: u64 = UBLK_F_USER_COPY
+    | UBLK_F_USER_RECOVERY
+    | UBLK_F_USER_RECOVERY_REISSUE
+    | UBLK_F_CMD_IOCTL_ENCODE;
 
 /// A set of io_uring opcodes: a 256-bit bitset, one bit per `u8` value.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]

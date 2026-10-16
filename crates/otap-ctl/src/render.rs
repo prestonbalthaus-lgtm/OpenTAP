@@ -3,8 +3,8 @@
 use std::io::{self, Write};
 
 use otap_control::{
-    decode_hex, format_size, PoolReport, Response, SnapshotReport, VolumeReport, PIN_CLONE,
-    PIN_REPLICATION, PIN_SCHEDULE, PIN_USER,
+    decode_hex, format_size, DeviceReport, DeviceState, PoolReport, Response, SnapshotReport,
+    VolumeReport, PIN_CLONE, PIN_REPLICATION, PIN_SCHEDULE, PIN_USER,
 };
 
 use crate::args::Command;
@@ -142,7 +142,72 @@ pub fn render(response: &Response, cmd: &Command, out: &mut dyn Write) -> io::Re
             }
         }
         Response::Committed { cp_seq } => writeln!(out, "committed cp {cp_seq}"),
+        Response::Devices { devices } => render_devices(devices, out),
+        Response::Reaped { devices } => {
+            if devices.is_empty() {
+                return writeln!(out, "nothing to reap");
+            }
+            for d in devices {
+                writeln!(
+                    out,
+                    "reaped {} ({}: {})",
+                    d.path,
+                    device_state(d.state),
+                    d.reason
+                )?;
+            }
+            Ok(())
+        }
     }
+}
+
+/// `serving`, `recoverable`, `stale` or `foreign`.
+const fn device_state(state: DeviceState) -> &'static str {
+    match state {
+        DeviceState::Serving => "serving",
+        DeviceState::Recoverable => "recoverable",
+        DeviceState::Stale => "stale",
+        DeviceState::Foreign => "foreign",
+    }
+}
+
+fn render_devices(devices: &[DeviceReport], out: &mut dyn Write) -> io::Result<()> {
+    if devices.is_empty() {
+        return writeln!(out, "no ublk devices");
+    }
+    let mut rows = vec![vec![
+        "ID".to_string(),
+        "PATH".to_string(),
+        "STATE".to_string(),
+        "VOLUME".to_string(),
+        "KERNEL".to_string(),
+        "PID".to_string(),
+        "REASON".to_string(),
+    ]];
+    for d in devices {
+        let volume = match (&d.volume, d.volume_index) {
+            (Some(name), _) => name.clone(),
+            (None, Some(index)) => format!("#{index}"),
+            (None, None) => "-".to_string(),
+        };
+        let pid = if d.pid <= 0 {
+            "-".to_string()
+        } else if d.pid_alive {
+            d.pid.to_string()
+        } else {
+            format!("{} (dead)", d.pid)
+        };
+        rows.push(vec![
+            d.dev_id.to_string(),
+            d.path.clone(),
+            device_state(d.state).to_string(),
+            volume,
+            d.kernel_state.clone(),
+            pid,
+            d.reason.clone(),
+        ]);
+    }
+    write_table(&rows, out)
 }
 
 fn render_pool(r: &PoolReport, out: &mut dyn Write) -> io::Result<()> {

@@ -141,6 +141,36 @@ pub const UBLK_U_CMD_DEL_DEV_ASYNC: u32 = ctrl_ior(0x14);
 /// `len`.
 pub const UBLK_FEATURES_LEN: u16 = 8;
 
+/// The bound on device numbers: `UBLK_MAX_UBLKS`, which is `UBLK_MINORS`,
+/// `1 << MINORBITS` (a driver constant of `ublk_drv.c`, not of the UAPI
+/// header). `ADD_DEV` refuses a requested id at or above it and the
+/// driver's id allocator never hands one out; a device number read from
+/// anywhere else (a directory listing, a state file) is checked against it.
+pub const UBLK_MAX_UBLKS: u32 = 1 << 20;
+
+/// Where the driver's character devices appear in sysfs: the `ublk-char`
+/// class (`ublk_chr_class` in `ublk_drv.c`), one entry `ublkc<N>` per
+/// device from `ADD_DEV` to its release (`ublk_add_chdev`). The driver has
+/// no command that lists its devices, so this directory is the list; each
+/// entry is then asked about with `GET_DEV_INFO`.
+pub const UBLK_CHAR_CLASS_DIR: &str = "/sys/class/ublk-char";
+
+/// The device number of a `ublk-char` class entry or a `/dev` node name,
+/// `ublkc<N>` (decimal, no sign, no leading zero unless it is `0`, below
+/// [`UBLK_MAX_UBLKS`]); `None` for any other name.
+#[must_use]
+pub fn parse_char_name(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix("ublkc")?;
+    if digits.is_empty()
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    let id: u32 = digits.parse().ok()?;
+    (id < UBLK_MAX_UBLKS).then_some(id)
+}
+
 // ---------------------------------------------------------------------------
 // I/O commands, results and the user-copy window (ublk_cmd.h:86 to 127)
 // ---------------------------------------------------------------------------
@@ -282,7 +312,11 @@ pub const UBLK_F_NEED_GET_DATA: u64 = 1 << 2;
 /// `END_USER_RECOVERY`).
 pub const UBLK_F_USER_RECOVERY: u64 = 1 << 3;
 /// `UBLK_F_USER_RECOVERY_REISSUE` (ublk_cmd.h:152): requests in flight at the
-/// server's death are reissued to the new server.
+/// server's death are reissued to the new server. With `USER_RECOVERY`
+/// alone a request the dead server had fetched and not committed is failed
+/// with `EIO` (`__ublk_fail_req`); with this flag too it is requeued and
+/// delivered to the new server after `END_USER_RECOVERY`. 6.12 has no
+/// `UBLK_F_USER_RECOVERY_FAIL_IO` (`UBLK_F_ALL` in `ublk_drv.c`).
 pub const UBLK_F_USER_RECOVERY_REISSUE: u64 = 1 << 4;
 /// `UBLK_F_UNPRIVILEGED_DEV` (ublk_cmd.h:173). Excluded by design (C04): the
 /// driver refuses it together with `UBLK_F_USER_COPY`.
@@ -749,10 +783,22 @@ impl CtrlCommand {
         Self::new(UBLK_U_CMD_ADD_DEV, dev_id, Some(info))
     }
 
-    /// `DEL_DEV`.
+    /// `DEL_DEV`: removes the device and waits until its number is freed,
+    /// which is only once every reference is dropped, including an open
+    /// `/dev/ublkcN` anywhere (`ublk_ctrl_del_dev` with `wait`).
     #[must_use]
     pub const fn del_dev(dev_id: u32) -> Self {
         Self::new(UBLK_U_CMD_DEL_DEV, dev_id, None)
+    }
+
+    /// `DEL_DEV_ASYNC` (ublk_cmd.h:52): removes the device like `DEL_DEV`
+    /// and returns without waiting for its number to be freed
+    /// (`ublk_ctrl_del_dev` without `wait`), so deleting a device whose
+    /// character device a dying process still holds does not block; the
+    /// number is freed when the last reference goes.
+    #[must_use]
+    pub const fn del_dev_async(dev_id: u32) -> Self {
+        Self::new(UBLK_U_CMD_DEL_DEV_ASYNC, dev_id, None)
     }
 
     /// `START_DEV`: completes once every tag of every queue has a fetch

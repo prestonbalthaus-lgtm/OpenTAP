@@ -61,10 +61,16 @@ COMMANDS
     io read --volume <name> --lba <n> [--blocks <n>] [--out <path>]
     io punch --volume <name> --lba <n> --blocks <n>
 
+    device list                              the host's ublk devices: serving,
+                                             recoverable, stale or foreign
+    device reap (<id> | --stale)             delete a stale device (or, by id, a
+                                             recoverable one), or every stale one
+
 Sizes take K, M, G or T (binary). LBAs and block counts are 4 KiB blocks;
 an io request moves at most 256 blocks (1 MiB).
 A volume whose name was lost (a damaged catalogue) is addressed as #<index>
 until it is named again with `volume rename`.
+A device id is N of /dev/ublkbN, given as N or as the path.
 
 EXIT STATUS
     0 a reply; 1 the daemon refused; 2 the command line does not parse;
@@ -86,6 +92,7 @@ const BOOL_FLAGS: &[&str] = &[
     "--schedule",
     "--clone",
     "--release",
+    "--stale",
 ];
 
 /// A parsed command.
@@ -231,12 +238,16 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
     if timeout.is_zero() {
         return Err("--timeout needs at least one second".to_string());
     }
-    let [group, verb] = words.as_slice() else {
-        return Err(match words.len() {
-            0 => "no command given".to_string(),
-            1 => format!("`{}` needs a verb", words[0]),
-            _ => format!("too many words: {:?}", words),
-        });
+    let (group, verb, rest) = match words.as_slice() {
+        [] => return Err("no command given".to_string()),
+        [group] => return Err(format!("`{group}` needs a verb")),
+        [group, verb, rest @ ..] => (group, verb, rest),
+    };
+    // Only `device reap` takes a word after its verb: the device.
+    let operand = match (group.as_str(), verb.as_str(), rest) {
+        (_, _, []) => None,
+        ("device", "reap", [device]) => Some(device.as_str()),
+        _ => return Err(format!("too many words: {words:?}")),
     };
     flags.context = format!("{group} {verb}");
     let mut read_to = None;
@@ -439,7 +450,21 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                 blocks,
             }
         }
-        ("daemon" | "pool" | "volume" | "snapshot" | "io", verb) => {
+        ("device", "list") => Request::DeviceList {},
+        ("device", "reap") => {
+            let stale = flags.flag("--stale");
+            let dev_id = operand.map(parse_device).transpose()?;
+            match (dev_id, stale) {
+                (Some(_), true) => {
+                    return Err("`device reap` takes a device id or --stale, not both".to_string())
+                }
+                (None, false) => {
+                    return Err("`device reap` needs a device id or --stale".to_string())
+                }
+                _ => Request::DeviceReap { dev_id, stale },
+            }
+        }
+        ("daemon" | "pool" | "volume" | "snapshot" | "io" | "device", verb) => {
             return Err(format!("`{group}` has no verb {verb:?}"))
         }
         (group, _) => return Err(format!("unknown command group {group:?}")),
@@ -452,6 +477,22 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
         request,
         read_to,
     }))
+}
+
+/// A ublk device as `N`, `ublkbN` or `/dev/ublkbN`.
+fn parse_device(text: &str) -> Result<u32, String> {
+    let digits = text
+        .strip_prefix("/dev/ublkb")
+        .or_else(|| text.strip_prefix("ublkb"))
+        .unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{text:?} is not a ublk device (N, ublkbN or /dev/ublkbN)"
+        ));
+    }
+    digits
+        .parse::<u32>()
+        .map_err(|_| format!("{text:?} is not a ublk device number"))
 }
 
 fn check_blocks(blocks: u32) -> Result<(), String> {
@@ -747,6 +788,28 @@ mod tests {
                 blocks: 1000,
             }
         );
+        assert_eq!(request("device list"), Request::DeviceList {});
+        assert_eq!(
+            request("device reap 3"),
+            Request::DeviceReap {
+                dev_id: Some(3),
+                stale: false,
+            }
+        );
+        assert_eq!(
+            request("device reap /dev/ublkb12"),
+            Request::DeviceReap {
+                dev_id: Some(12),
+                stale: false,
+            }
+        );
+        assert_eq!(
+            request("device reap --stale"),
+            Request::DeviceReap {
+                dev_id: None,
+                stale: true,
+            }
+        );
     }
 
     #[test]
@@ -774,5 +837,11 @@ mod tests {
         assert!(err("--timeout 0 pool status").contains("--timeout"));
         assert!(err("--control nowhere pool status").contains("neither"));
         assert!(err("-x pool status").contains("unknown option"));
+        assert!(err("device reap").contains("needs a device id or --stale"));
+        assert!(err("device reap 3 --stale").contains("not both"));
+        assert!(err("device reap sda").contains("not a ublk device"));
+        assert!(err("device reap 3 4").contains("too many"));
+        assert!(err("device list 3").contains("too many"));
+        assert!(err("device fly").contains("no verb"));
     }
 }

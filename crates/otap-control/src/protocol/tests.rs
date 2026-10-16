@@ -85,6 +85,23 @@ fn pool_report() -> PoolReport {
     }
 }
 
+fn device(state: DeviceState) -> DeviceReport {
+    DeviceReport {
+        dev_id: 4,
+        path: "/dev/ublkb4".into(),
+        state,
+        reason: "served by this daemon for volume 3".into(),
+        kernel_state: "live".into(),
+        pid: 4321,
+        pid_alive: true,
+        volume_index: Some(3),
+        volume: (state == DeviceState::Serving).then(|| "data".into()),
+        pool: Some("0a1b2c3d".into()),
+        size_bytes: Some(16 << 20),
+        reissue: true,
+    }
+}
+
 #[test]
 fn every_reply_round_trips() {
     let replies: Vec<Reply> = vec![
@@ -122,6 +139,18 @@ fn every_reply_round_trips() {
             data_hex: "ab".repeat(BLOCK_SIZE),
         })),
         Ok(Response::Committed { cp_seq: 9 }),
+        Ok(Response::Devices {
+            devices: vec![device(DeviceState::Serving), device(DeviceState::Foreign)],
+        }),
+        Ok(Response::Devices {
+            devices: Vec::new(),
+        }),
+        Ok(Response::Reaped {
+            devices: vec![device(DeviceState::Stale)],
+        }),
+        Ok(Response::Reaped {
+            devices: Vec::new(),
+        }),
         Err(ControlError::new(ErrorCode::NoPool, "no pool is booted")),
         Err(ControlError::new(ErrorCode::Timeout, "")),
     ];
@@ -253,6 +282,15 @@ fn every_request_round_trips() {
             volume: "data".into(),
             lba: 8,
             blocks: 1,
+        },
+        Request::DeviceList {},
+        Request::DeviceReap {
+            dev_id: Some(4),
+            stale: false,
+        },
+        Request::DeviceReap {
+            dev_id: None,
+            stale: true,
         },
     ];
     for request in &requests {

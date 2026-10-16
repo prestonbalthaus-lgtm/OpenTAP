@@ -10,7 +10,9 @@ use std::time::Duration;
 use otap_control::{
     check_arena_bytes, check_cp_interval, parse_size, ArenaKind, Endpoint, MediaKind,
 };
-use otap_daemon::{install_signal_flag, serve, Daemon, DaemonConfig, Server, VERSION};
+use otap_daemon::{
+    install_signal_flag, serve, Daemon, DaemonConfig, Server, MAX_RECOVERY_TIMEOUT_SECS, VERSION,
+};
 
 const USAGE: &str = "\
 dbladed: the OpenTAP data daemon
@@ -40,6 +42,13 @@ OPTIONS
     --flush-opaque          treat the device as flush-opaque (hardware RAID)
     --strict-flush          refuse a flush-opaque device
     --no-ublk               do not expose ublk devices (Linux)
+    --state-dir <path>      where the record of the volumes' ublk devices lives, so a
+                            daemon restarted after a crash re-attaches the same
+                            /dev/ublkbN [default: /run/opentap on Linux]
+    --recovery-timeout <secs>
+                            how long a restarted daemon waits for the kernel to
+                            quiesce a dead daemon's device before the volume gets a
+                            new one, 1 to 300 [default: 5]
     --allow-remote-control  accept a TCP control address that is not loopback (the
                             control plane is unauthenticated: it can format any device)
     --op-timeout <secs>     how long a control request may wait for its
@@ -52,7 +61,7 @@ its commands.
 ";
 
 enum Parsed {
-    Run(DaemonConfig),
+    Run(Box<DaemonConfig>),
     Help,
     Version,
 }
@@ -112,6 +121,26 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             "--flush-opaque" => cfg.overrides.flush_opaque = Some(true),
             "--strict-flush" => cfg.overrides.strict_flush = true,
             "--no-ublk" => cfg.ublk = false,
+            "--state-dir" => {
+                let text = take(&mut i)?;
+                if text.is_empty() {
+                    return Err("--state-dir needs a directory".to_string());
+                }
+                cfg.state_dir = PathBuf::from(text);
+            }
+            "--recovery-timeout" => {
+                let text = take(&mut i)?;
+                let secs: u64 = text
+                    .parse()
+                    .map_err(|_| format!("{text:?} is not a number of seconds"))?;
+                if secs == 0 || secs > MAX_RECOVERY_TIMEOUT_SECS {
+                    return Err(format!(
+                        "--recovery-timeout takes 1 to {MAX_RECOVERY_TIMEOUT_SECS} seconds, not \
+                         {secs}"
+                    ));
+                }
+                cfg.recovery_timeout = Duration::from_secs(secs);
+            }
             "--allow-remote-control" => cfg.allow_remote = true,
             "--op-timeout" => {
                 let text = take(&mut i)?;
@@ -142,13 +171,13 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
     }
     check_arena_bytes(cfg.arena_bytes)?;
     check_cp_interval(cfg.cp_interval_secs)?;
-    Ok(Parsed::Run(cfg))
+    Ok(Parsed::Run(Box::new(cfg)))
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = match parse(&args) {
-        Ok(Parsed::Run(cfg)) => cfg,
+        Ok(Parsed::Run(cfg)) => *cfg,
         Ok(Parsed::Help) => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
