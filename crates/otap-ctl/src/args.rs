@@ -70,16 +70,44 @@ COMMANDS
     device reap (<id> | --stale)             delete a stale device (or, by id, a
                                              recoverable one), or every stale one
 
+    replicate push <volume> <snapshot> --to <host:port>[/<volume>] [--no-wait]
+                                             ship the snapshot to the dbladed
+                                             listening there (--replication-listen),
+                                             into its volume (default: the same
+                                             name): the whole volume the first
+                                             time, the delta against the base the
+                                             mirror holds after that; waits for
+                                             the job, which resumes by itself
+                                             across lost connections
+    replicate pull <volume> <snapshot> --from <host:port>[/<volume>] [--no-wait]
+                                             the same, driven from the mirror:
+                                             the local <volume>, the snapshot of
+                                             the source's volume (default: the
+                                             same name)
+    replicate status [<id>]                  the jobs, or one job
+    replicate cursor <volume>                a mirror's resume cursor and base, or
+                                             a source volume's replication base
+    replicate cancel <id>                    stop a job (a mirror keeps its cursor)
+    replicate release <volume>               end a mirror's relationship (a partial
+                                             delta is rolled back first); the
+                                             volume stays offline
+
 Sizes take K, M, G or T (binary). LBAs and block counts are 4 KiB blocks;
 an io request moves at most 256 blocks (1 MiB).
 A volume whose name was lost (a damaged catalogue) is addressed as #<index>
-until it is named again with `volume rename`.
+until it is named again with `volume rename`; a snapshot without a name as
+#<id>.
 A device id is N of /dev/ublkbN, given as N or as the path.
+The replication stream has no TLS and no authentication: dbladed sends and
+accepts it on loopback addresses only, unless started with
+--allow-remote-replication on a network you trust.
 
 EXIT STATUS
     0 a reply; 1 the daemon refused; 2 the command line does not parse;
     3 the daemon cannot be reached; 4 a `pool verify` that waited for its
-    report did not conclude clean (findings, or it did not finish).
+    report did not conclude clean (findings, or it did not finish), or a
+    `replicate push` or `pull` that waited for its job did not end done
+    (it failed or was cancelled).
 ";
 
 /// The default reply timeout.
@@ -119,6 +147,9 @@ pub struct Command {
     /// For `pool verify`: follow the verification until it ends and print
     /// its final report (without `--no-wait`).
     pub wait_verify: bool,
+    /// For `replicate push` and `pull`: follow the job until it ends and
+    /// print its final report (without `--no-wait`).
+    pub wait_job: bool,
 }
 
 /// What a command line asked for.
@@ -254,15 +285,28 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
         [group] => return Err(format!("`{group}` needs a verb")),
         [group, verb, rest @ ..] => (group, verb, rest),
     };
-    // Only `device reap` takes a word after its verb: the device.
-    let operand = match (group.as_str(), verb.as_str(), rest) {
-        (_, _, []) => None,
-        ("device", "reap", [device]) => Some(device.as_str()),
-        _ => return Err(format!("too many words: {words:?}")),
+    // `device reap` and the `replicate` verbs take words after the verb.
+    let takes = match (group.as_str(), verb.as_str()) {
+        ("device", "reap") | ("replicate", "status") => 0..=1,
+        ("replicate", "push" | "pull") => 2..=2,
+        ("replicate", "cursor" | "cancel" | "release") => 1..=1,
+        _ => 0..=0,
     };
+    if !takes.contains(&rest.len()) {
+        return Err(if rest.len() > *takes.end() {
+            format!("too many words: {words:?}")
+        } else {
+            format!(
+                "`{group} {verb}` needs {} word(s) after the verb; see `otapctl --help`",
+                takes.start()
+            )
+        });
+    }
+    let operand = rest.first().map(String::as_str);
     flags.context = format!("{group} {verb}");
     let mut read_to = None;
     let mut wait_verify = false;
+    let mut wait_job = false;
     let request = match (group.as_str(), verb.as_str()) {
         ("daemon", "ping") => Request::Ping,
         ("daemon", "stop") => Request::DaemonStop,
@@ -494,7 +538,39 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
                 _ => Request::DeviceReap { dev_id, stale },
             }
         }
-        ("daemon" | "pool" | "volume" | "snapshot" | "io" | "device", verb) => {
+        ("replicate", "push") => {
+            let (to, destination) = parse_peer(&flags.required("--to")?, "--to")?;
+            wait_job = !flags.flag("--no-wait");
+            Request::ReplicatePush {
+                volume: rest[0].clone(),
+                snapshot: rest[1].clone(),
+                to,
+                destination,
+            }
+        }
+        ("replicate", "pull") => {
+            let (from, source) = parse_peer(&flags.required("--from")?, "--from")?;
+            wait_job = !flags.flag("--no-wait");
+            Request::ReplicatePull {
+                volume: rest[0].clone(),
+                snapshot: rest[1].clone(),
+                from,
+                source,
+            }
+        }
+        ("replicate", "status") => Request::ReplicateStatus {
+            id: operand.map(parse_job).transpose()?,
+        },
+        ("replicate", "cursor") => Request::ReplicateCursor {
+            volume: rest[0].clone(),
+        },
+        ("replicate", "cancel") => Request::ReplicateCancel {
+            id: parse_job(&rest[0])?,
+        },
+        ("replicate", "release") => Request::ReplicateRelease {
+            volume: rest[0].clone(),
+        },
+        ("daemon" | "pool" | "volume" | "snapshot" | "io" | "device" | "replicate", verb) => {
             return Err(format!("`{group}` has no verb {verb:?}"))
         }
         (group, _) => return Err(format!("unknown command group {group:?}")),
@@ -507,7 +583,39 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
         request,
         read_to,
         wait_verify,
+        wait_job,
     }))
+}
+
+/// A replication peer, `host:port`, with an optional `/<volume>` after it.
+fn parse_peer(text: &str, flag: &str) -> Result<(String, Option<String>), String> {
+    let (addr, volume) = match text.split_once('/') {
+        Some((addr, volume)) => (addr, Some(volume)),
+        None => (text, None),
+    };
+    let port = addr
+        .rsplit_once(':')
+        .map(|(_, p)| p)
+        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if port.is_none_or(|p| p.parse::<u16>().is_err()) {
+        return Err(format!(
+            "{flag}: {text:?} is not host:port[/volume] (e.g. 127.0.0.1:7422/backup)"
+        ));
+    }
+    if let Some(v) = volume {
+        if v.is_empty() {
+            return Err(format!(
+                "{flag}: {text:?} names an empty volume after the /"
+            ));
+        }
+    }
+    Ok((addr.to_string(), volume.map(str::to_string)))
+}
+
+/// A replication job's number.
+fn parse_job(text: &str) -> Result<u64, String> {
+    text.parse::<u64>()
+        .map_err(|_| format!("{text:?} is not a replication job number"))
 }
 
 /// A ublk device as `N`, `ublkbN` or `/dev/ublkbN`.

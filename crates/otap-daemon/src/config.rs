@@ -173,6 +173,14 @@ pub struct DaemonConfig {
     /// (they are destroyed and their volumes held under nvfail). A
     /// `PoolBoot` request never discards.
     pub discard_arena: bool,
+    /// Where to listen for replication (Step 6C), `host:port`: the sink side
+    /// of a push and the source side of a pull. `None` takes no inbound
+    /// transfer (this daemon can still push and pull).
+    pub replication_listen: Option<String>,
+    /// Listen on, and dial, replication addresses beyond loopback. The
+    /// transport is unauthenticated and unencrypted (no TLS), so this is off
+    /// unless the operator says so.
+    pub allow_remote_replication: bool,
 }
 
 impl Default for DaemonConfig {
@@ -191,6 +199,8 @@ impl Default for DaemonConfig {
             allow_remote: false,
             op_timeout: Duration::from_secs(120),
             discard_arena: false,
+            replication_listen: None,
+            allow_remote_replication: false,
         }
     }
 }

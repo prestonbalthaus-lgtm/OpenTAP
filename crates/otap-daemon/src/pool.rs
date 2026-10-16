@@ -20,9 +20,10 @@ use otap_control::{
     ErrorCode, IoResultReport, Reply, Request, Response, SnapshotReport, VolumeReport,
     MAX_IO_BLOCKS,
 };
+use otap_cp::repl::{ReplConfig, ReplError, Replicator};
 use otap_cp::{
-    Backstore, Clock, DiskLayout, Engine, EngineConfig, EngineError, Event, Media, RequestKind,
-    Status,
+    Backstore, Clock, DiskLayout, Engine, EngineConfig, EngineError, Event, LinkListener, Media,
+    RequestKind, Status,
 };
 use otap_format::{SnapKind, SnapOrigin, Uuid, BLOCK_SIZE, MAX_VOLS, PIN_MASK, PIN_REPLICATION};
 use otap_ublk::{device_stamp, pool_fingerprint, DeviceSpec};
@@ -34,7 +35,13 @@ use crate::clock::SystemClock;
 use crate::config::Overrides;
 use crate::device::{destroy_device, volume_device, HostRef, VolumeDevice};
 use crate::frontdoor::{blocks_of, DaemonFrontDoor, IoCompletion, IoHandle};
-use crate::report::{pool_report, snapshot_report, verify_report, volume_report};
+use crate::replication::{
+    FileSinkStore, TcpConfig, TcpReplicationListener, TcpReplicationTransport,
+};
+use crate::report::{
+    pool_report, replication_cursor_report, replication_report, snapshot_report, verify_report,
+    volume_report,
+};
 
 /// The engine as the daemon runs it.
 pub type PoolEngine = Engine<Box<dyn Backstore>, DaemonFrontDoor, SystemClock>;
@@ -66,6 +73,8 @@ pub struct BootSpec {
     /// How long the boot waits for the driver to quiesce a dead daemon's
     /// device before it gives the volume a new one.
     pub recovery_timeout: Duration,
+    /// Dial replication addresses beyond loopback (Step 6C).
+    pub allow_remote_replication: bool,
 }
 
 /// A device the pool serves for a volume.
@@ -121,6 +130,16 @@ pub fn engine_error(e: EngineError) -> ControlError {
 
 fn bad_request(message: impl Into<String>) -> ControlError {
     ControlError::new(ErrorCode::BadRequest, message)
+}
+
+/// A replication refusal as the protocol reports it.
+fn repl_error(e: ReplError) -> ControlError {
+    match e {
+        ReplError::NotFound(m) => ControlError::new(ErrorCode::NotFound, m),
+        ReplError::BadRequest(m) => ControlError::new(ErrorCode::BadRequest, m),
+        ReplError::Engine(e) => engine_error(e),
+        other => ControlError::new(ErrorCode::Engine, other.to_string()),
+    }
 }
 
 /// A request's status as a word.
@@ -179,6 +198,10 @@ pub struct Pool {
     stop: Option<Arc<AtomicBool>>,
     /// The shutdown's own waits are exempt from the flag.
     stopping: bool,
+    /// The replication jobs (Step 6C), stepped after every tick.
+    repl: Replicator,
+    /// The daemon's replication port, lent to the booted pool.
+    repl_listener: Option<TcpReplicationListener>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -320,6 +343,14 @@ impl Pool {
             )
         })?;
         let io = engine.front_door().io_handle();
+        let repl = Replicator::new(
+            ReplConfig::default(),
+            Box::new(TcpReplicationTransport::new(TcpConfig {
+                allow_remote: spec.allow_remote_replication,
+                ..TcpConfig::default()
+            })),
+            Box::new(FileSinkStore::new(&spec.state_dir, agg_id)),
+        );
         let mut pool = Self {
             engine,
             io,
@@ -341,11 +372,17 @@ impl Pool {
             log: VecDeque::new(),
             stop,
             stopping: false,
+            repl,
+            repl_listener: None,
         };
         for warning in &opened.warnings {
             pool.log(format!("geometry: {warning}"));
         }
         pool.wait_until("the boot commit", |e| e.is_serving())?;
+        // A mirror is marked again before any request can bring it online.
+        for line in pool.repl.attach(&mut pool.engine) {
+            pool.log(line);
+        }
         // The devices a killed daemon left are re-attached before any new
         // one is made, so a volume keeps its `/dev/ublkbN` (Step 6B).
         if pool.host.is_some() {
@@ -536,12 +573,42 @@ impl Pool {
         self.engine
             .tick()
             .map_err(|e| ControlError::new(ErrorCode::Engine, format!("engine tick: {e}")))?;
+        // Replication (Step 6C): the connections the port accepted are
+        // routed, then every job takes one bounded step.
+        if let Some(listener) = self.repl_listener.as_mut() {
+            while let Some(link) = listener.accept() {
+                let now = self.engine.mono_ns();
+                self.repl.offer(link, now);
+            }
+        }
+        let replicating = self.repl.step(&mut self.engine);
+        for line in self.repl.take_log() {
+            self.log(line);
+        }
         // A verification in progress is work in hand: the loop ticks again
         // at once, each tick one bounded slice of it.
         Ok(self.engine.stats() != before
             || !self.engine.is_quiet()
             || self.engine.front_door().in_engine() > 0
-            || self.engine.verify_running())
+            || self.engine.verify_running()
+            || replicating)
+    }
+
+    /// Lends the daemon's replication port to the pool: its connections
+    /// are taken on the engine thread between ticks.
+    pub fn attach_listener(&mut self, listener: Option<TcpReplicationListener>) {
+        self.repl_listener = listener;
+    }
+
+    /// Gives the replication port back (before the pool stops).
+    pub fn take_listener(&mut self) -> Option<TcpReplicationListener> {
+        self.repl_listener.take()
+    }
+
+    /// The replication jobs, for a checker.
+    #[must_use]
+    pub const fn replicator(&self) -> &Replicator {
+        &self.repl
     }
 
     /// One tick with its events noted; `true` when the engine has work in
@@ -1021,6 +1088,68 @@ impl Pool {
             Request::PoolVerify {} => self.verify_start(),
             Request::PoolVerifyStatus {} => self.verify_status(),
             Request::PoolVerifyCancel {} => self.verify_cancel(),
+            Request::ReplicatePush {
+                volume,
+                snapshot,
+                to,
+                destination,
+            } => {
+                let report = self
+                    .repl
+                    .push(
+                        &mut self.engine,
+                        volume,
+                        snapshot,
+                        to,
+                        destination.as_deref(),
+                    )
+                    .map_err(repl_error)?;
+                self.note_repl();
+                Ok(Response::Replication(replication_report(&report)))
+            }
+            Request::ReplicatePull {
+                volume,
+                snapshot,
+                from,
+                source,
+            } => {
+                let report = self
+                    .repl
+                    .pull(&mut self.engine, volume, snapshot, from, source.as_deref())
+                    .map_err(repl_error)?;
+                self.note_repl();
+                Ok(Response::Replication(replication_report(&report)))
+            }
+            Request::ReplicateStatus { id } => match id {
+                Some(id) => self
+                    .repl
+                    .job(*id)
+                    .map(|r| Response::Replication(replication_report(&r)))
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            ErrorCode::NotFound,
+                            format!("no replication job {id} (finished jobs are kept a while)"),
+                        )
+                    }),
+                None => Ok(Response::Replications {
+                    jobs: self.repl.jobs().iter().map(replication_report).collect(),
+                }),
+            },
+            Request::ReplicateCursor { volume } => {
+                let report = self
+                    .repl
+                    .cursor(&mut self.engine, volume)
+                    .map_err(repl_error)?;
+                Ok(Response::ReplicationCursor(replication_cursor_report(
+                    &report,
+                )))
+            }
+            Request::ReplicateCancel { id } => {
+                let report = self.repl.cancel(*id).map_err(repl_error)?;
+                self.note_repl();
+                Ok(Response::Replication(replication_report(&report)))
+            }
+            Request::ReplicateRelease { volume } => self.replicate_release(volume),
             Request::Ping
             | Request::PoolFormat { .. }
             | Request::PoolBoot { .. }
@@ -1076,6 +1205,34 @@ impl Pool {
             self.note(&ev);
         }
         Ok(Response::Verify(verify_report(&report)))
+    }
+
+    /// Journals what the replicator did while answering a request.
+    fn note_repl(&mut self) {
+        for line in self.repl.take_log() {
+            self.log(line);
+        }
+    }
+
+    /// Ends a mirror's replication relationship (Step 6C): whatever of the
+    /// volume is in the arena is flushed first, a partial delta is rolled
+    /// back to the last complete snapshot, and the replica mark, the base
+    /// pin and the cursor go. The volume stays offline.
+    pub fn replicate_release(&mut self, volume: &str) -> Reply {
+        let vol = self.vol_index(volume)?;
+        self.sync_now()?;
+        let outcome = self
+            .repl
+            .release(&mut self.engine, volume)
+            .map_err(repl_error)?;
+        self.note_repl();
+        if outcome.rolled_back {
+            self.wait_until("the mirror's rollback to its last complete snapshot", |e| {
+                e.volume_ready(vol)
+            })?;
+        }
+        self.sync_now()?;
+        self.report_volume(vol)
     }
 
     /// A consistency point now.

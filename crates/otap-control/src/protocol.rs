@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 /// variant reaches only a client that sent the request it answers. Step 6B
 /// added `DeviceList` and `DeviceReap` (answered `Devices` and `Reaped`),
 /// and `PoolVerify`, `PoolVerifyStatus` and `PoolVerifyCancel` (answered
-/// `Verify`), that way, under version 1.
+/// `Verify`), that way, under version 1; Step 6C added `ReplicatePush`,
+/// `ReplicatePull`, `ReplicateStatus`, `ReplicateCursor`,
+/// `ReplicateCancel` and `ReplicateRelease` (answered `Replication`,
+/// `Replications`, `ReplicationCursor` and `Ok`) the same way.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The most blocks one `IoWrite` or `IoRead` moves (1 MiB).
@@ -252,6 +255,184 @@ pub enum Request {
     PoolVerifyStatus {},
     /// Cancels the verification in progress.
     PoolVerifyCancel {},
+    /// Starts pushing a snapshot of a volume to the replication listener
+    /// of another daemon (Step 6C), into its volume `destination` (by
+    /// default the same name), which it creates or which must be a mirror
+    /// of this volume. Answered at once with the job's report; the job runs
+    /// between the engine's ticks and `ReplicateStatus` follows it.
+    ReplicatePush {
+        /// The volume.
+        volume: String,
+        /// The snapshot (a name, or `#<id>`).
+        snapshot: String,
+        /// The sink daemon's replication address, `host:port`.
+        to: String,
+        /// The destination volume on the sink.
+        destination: Option<String>,
+    },
+    /// Starts pulling a snapshot of a volume of another daemon (Step 6C)
+    /// into the local mirror `volume`: the source's volume `source` (by
+    /// default the same name). Answered at once with the job's report.
+    ReplicatePull {
+        /// The local destination volume (a mirror, created when missing).
+        volume: String,
+        /// The snapshot on the source (a name, or `#<id>`).
+        snapshot: String,
+        /// The source daemon's replication address, `host:port`.
+        from: String,
+        /// The source volume.
+        source: Option<String>,
+    },
+    /// Every replication job the daemon keeps, or the one numbered `id`.
+    ReplicateStatus {
+        /// The job, or every job.
+        id: Option<u64>,
+    },
+    /// The durable replication position of a volume: a mirror's resume
+    /// cursor and committed base, or a source volume's replication base.
+    ReplicateCursor {
+        /// The volume.
+        volume: String,
+    },
+    /// Cancels a running replication job (a mirror keeps its cursor).
+    ReplicateCancel {
+        /// The job.
+        id: u64,
+    },
+    /// Ends a mirror's replication relationship: the replica mark, its
+    /// base pin and its cursor go (a partial delta is rolled back to the
+    /// last complete snapshot first). The volume stays offline.
+    ReplicateRelease {
+        /// The mirror.
+        volume: String,
+    },
+}
+
+/// Where a replication job stands (Step 6C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationState {
+    /// In progress.
+    Running,
+    /// The delta committed.
+    Done,
+    /// Gave up; `last_error` says why.
+    Failed,
+    /// Cancelled by the operator.
+    Cancelled,
+}
+
+/// A replication job as the daemon reports it (Step 6C).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationReport {
+    /// The job's number.
+    pub id: u64,
+    /// This daemon's end: `source` or `sink`.
+    pub role: String,
+    /// `push`, `pull`, `inbound push` or `inbound pull`.
+    pub mode: String,
+    /// Where it stands.
+    pub state: ReplicationState,
+    /// What it is doing, as words.
+    pub phase: String,
+    /// The local volume.
+    pub volume: String,
+    /// Its index, once it exists.
+    pub volume_index: Option<u32>,
+    /// The peer's address.
+    pub peer: String,
+    /// The peer's volume.
+    pub remote_volume: String,
+    /// The snapshot shipped, by name.
+    pub snapshot: Option<String>,
+    /// The snapshot shipped.
+    pub snapshot_uuid: Option<String>,
+    /// The delta's base.
+    pub base_uuid: Option<String>,
+    /// Chunks in the delta (0 until known).
+    pub chunks: u32,
+    /// Chunks sent (source).
+    pub chunks_sent: u32,
+    /// Chunks acknowledged (source) or landed durably (sink).
+    pub chunks_landed: u32,
+    /// Bytes of every chunk image.
+    pub bytes: u64,
+    /// Chunk bytes sent (source).
+    pub bytes_sent: u64,
+    /// Chunk bytes landed (sink).
+    pub bytes_landed: u64,
+    /// Messages sent over every connection.
+    pub frames_sent: u64,
+    /// Messages received over every connection.
+    pub frames_received: u64,
+    /// Connections made or taken.
+    pub connections: u32,
+    /// Connections lost and made again.
+    pub retries: u32,
+    /// Chunks a resume skipped because the sink had landed them.
+    pub resumed_chunks: u32,
+    /// Chunks sent again after a reconnect.
+    pub resent_chunks: u32,
+    /// Chunks the sink received although they had landed.
+    pub duplicate_chunks: u32,
+    /// The sink's first chunk not landed.
+    pub landed_contig: u32,
+    /// The sink verified the delta's digest (`None`: not yet, or it could
+    /// not, having restarted in the middle of the delta).
+    pub digest_verified: Option<bool>,
+    /// The last error met.
+    pub last_error: Option<String>,
+}
+
+/// The delta in flight on a mirror, as its cursor says (Step 6C).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationLandingReport {
+    /// The CP, in the source's numbering, the delta ends at.
+    pub cp_seq: u64,
+    /// The delta's nonce, as 16 hexadecimal digits.
+    pub nonce: String,
+    /// The snapshot the delta ends at.
+    pub target: String,
+    /// Chunks in the delta.
+    pub chunks: u32,
+    /// Chunks landed.
+    pub landed: u32,
+    /// The first chunk not landed.
+    pub landed_contig: u32,
+    /// Landed ranges above `landed_contig`.
+    pub sparse_ranges: u32,
+}
+
+/// A volume's durable replication position (Step 6C).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationCursorReport {
+    /// The volume.
+    pub volume: String,
+    /// Its index.
+    pub volume_index: u32,
+    /// `sink` (a mirror) or `source`.
+    pub role: String,
+    /// Marked as a mirror (offline to clients).
+    pub replica: bool,
+    /// The committed base: the snapshot both ends hold.
+    pub base_uuid: Option<String>,
+    /// Its name.
+    pub base_name: Option<String>,
+    /// Its CP in the source's numbering, when known.
+    pub base_cp: Option<u64>,
+    /// The source pool (a mirror's view).
+    pub source_pool: Option<String>,
+    /// The source volume's index (a mirror's view).
+    pub source_volume_index: Option<u32>,
+    /// The delta in flight.
+    pub landing: Option<ReplicationLandingReport>,
+    /// The live volume may hold a partial delta.
+    pub dirty: bool,
+    /// A cursor record is kept in the daemon's state directory.
+    pub persisted: bool,
 }
 
 /// Where a pool verification stands (Step 6B).
@@ -604,6 +785,17 @@ pub enum Response {
     /// A pool verification (`PoolVerify`, `PoolVerifyStatus`,
     /// `PoolVerifyCancel`).
     Verify(VerifyReport),
+    /// One replication job (`ReplicatePush`, `ReplicatePull`,
+    /// `ReplicateCancel`, `ReplicateStatus` with an id).
+    Replication(ReplicationReport),
+    /// Every replication job kept (`ReplicateStatus` without an id), oldest
+    /// first.
+    Replications {
+        /// The jobs.
+        jobs: Vec<ReplicationReport>,
+    },
+    /// A volume's replication position (`ReplicateCursor`).
+    ReplicationCursor(ReplicationCursorReport),
 }
 
 /// Why a request was refused or failed.

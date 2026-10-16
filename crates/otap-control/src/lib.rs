@@ -29,7 +29,8 @@ pub mod wire;
 pub use client::{Client, Endpoint};
 pub use protocol::{
     ArenaKind, ControlError, DeviceReport, DeviceState, ErrorCode, FindingSeverity, IoResultReport,
-    MediaKind, PoolReport, Reply, Request, Response, SnapshotReport, VerifyFinding, VerifyReport,
+    MediaKind, PoolReport, ReplicationCursorReport, ReplicationLandingReport, ReplicationReport,
+    ReplicationState, Reply, Request, Response, SnapshotReport, VerifyFinding, VerifyReport,
     VerifyState, VerifyVerdict, VolumeReport, MAX_IO_BLOCKS, PROTOCOL_VERSION,
 };
 pub use units::{

@@ -34,6 +34,12 @@
 //! `UBLK_F_USER_RECOVERY` before it serves (`otap_ublk::recovery`), and
 //! lists the devices it will not re-attach as stale, for `otapctl device
 //! reap`. Device numbers are the host's, so this never enters the pool.
+//!
+//! Replication (Step 6C) runs on the engine thread too: the pool's
+//! [`otap_cp::repl::Replicator`] is stepped after every tick, its TCP
+//! connections ([`replication`]) are served by I/O threads that exchange
+//! whole messages with it, and a mirror's resume cursor is a second
+//! host-local record in `--state-dir`.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -49,6 +55,7 @@ pub mod device;
 pub mod devices;
 pub mod frontdoor;
 pub mod pool;
+pub mod replication;
 pub mod report;
 pub mod server;
 
@@ -62,6 +69,10 @@ pub use config::{
 pub use daemon::{install_signal_flag, Daemon, DaemonHandle};
 pub use frontdoor::{ChannelFrontDoor, DaemonFrontDoor, IoCompletion, IoHandle};
 pub use pool::{engine_error, status_word, BootSpec, Pool, PoolEngine};
+pub use replication::{
+    FileSinkStore, TcpConfig, TcpLink, TcpReplicationListener, TcpReplicationTransport,
+    DEFAULT_REPLICATION_PORT,
+};
 pub use server::{serve, Server};
 
 /// The crate version, which `Ping` reports.

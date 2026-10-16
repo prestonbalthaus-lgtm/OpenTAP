@@ -51,6 +51,15 @@ OPTIONS
                             new one, 1 to 300 [default: 5]
     --allow-remote-control  accept a TCP control address that is not loopback (the
                             control plane is unauthenticated: it can format any device)
+    --replication-listen <host:port>
+                            accept replication on this address: the sink side of
+                            `otapctl replicate push` and the source side of
+                            `replicate pull` (e.g. 127.0.0.1:7422; port 0 picks one)
+    --allow-remote-replication
+                            listen on, and dial, replication addresses that are not
+                            loopback. The replication stream is unauthenticated and
+                            unencrypted (no TLS): anyone who reaches the port can
+                            push into a mirror or pull a snapshot
     --op-timeout <secs>     how long a control request may wait for its
                             consistency point [default: 120]
     -h, --help              this text
@@ -142,6 +151,16 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 cfg.recovery_timeout = Duration::from_secs(secs);
             }
             "--allow-remote-control" => cfg.allow_remote = true,
+            "--replication-listen" => {
+                let text = take(&mut i)?;
+                if !text.contains(':') {
+                    return Err(format!(
+                        "--replication-listen takes host:port (e.g. 127.0.0.1:7422), not {text:?}"
+                    ));
+                }
+                cfg.replication_listen = Some(text);
+            }
+            "--allow-remote-replication" => cfg.allow_remote_replication = true,
             "--op-timeout" => {
                 let text = take(&mut i)?;
                 let secs: u64 = text
@@ -213,6 +232,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(addr) = handle.replication_addr() {
+        eprintln!("dbladed: replication on tcp:{addr}");
+    }
     if let Err(e) = serve(server, &handle, &stop) {
         eprintln!("dbladed: the control server failed: {e}");
     }

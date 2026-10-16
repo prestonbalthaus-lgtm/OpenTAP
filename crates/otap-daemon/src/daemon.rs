@@ -1,6 +1,7 @@
 //! The daemon: one engine thread that owns the pool, ticks it, and answers
 //! every control request between ticks.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -12,12 +13,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use otap_control::{ControlError, ErrorCode, Reply, Request, Response, PROTOCOL_VERSION};
+use otap_cp::repl::{refuse_link, Refusal, RefuseCode};
+use otap_cp::LinkListener;
 use otap_ublk::Owner;
 
 use crate::clock::SystemClock;
 use crate::config::{DaemonConfig, Overrides};
 use crate::device::{no_ublk, HostRef};
 use crate::pool::{BootSpec, Pool};
+use crate::replication::{TcpConfig, TcpReplicationListener, TcpReplicationTransport};
 
 /// A request and where its reply goes.
 type Call = (Request, Sender<Reply>);
@@ -34,6 +38,9 @@ pub struct Daemon {
     /// The ublk control plane (when `cfg.ublk` and the host has one),
     /// shared with the booted pool.
     host: Option<HostRef>,
+    /// The replication port (`--replication-listen`, Step 6C), lent to the
+    /// booted pool; without a pool its connections are refused.
+    repl_listener: Option<TcpReplicationListener>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -75,6 +82,7 @@ impl Daemon {
             exit: false,
             stop: None,
             host,
+            repl_listener: None,
         }
     }
 
@@ -86,6 +94,31 @@ impl Daemon {
         Self {
             stop: Some(stop),
             ..Self::new(cfg)
+        }
+    }
+
+    /// Gives the daemon its replication port (Step 6C): lent to every pool
+    /// it boots, refusing connections while none is booted.
+    pub fn set_replication_listener(&mut self, listener: TcpReplicationListener) {
+        match &mut self.pool {
+            Some(pool) => pool.attach_listener(Some(listener)),
+            None => self.repl_listener = Some(listener),
+        }
+    }
+
+    /// Lends the replication port to the pool just booted.
+    fn lend_listener(&mut self) {
+        if let Some(pool) = &mut self.pool {
+            if let Some(listener) = self.repl_listener.take() {
+                pool.attach_listener(Some(listener));
+            }
+        }
+    }
+
+    /// Takes the replication port back from a pool about to stop.
+    fn reclaim_listener(&mut self, pool: &mut Pool) {
+        if let Some(listener) = pool.take_listener() {
+            self.repl_listener = Some(listener);
         }
     }
 
@@ -123,6 +156,7 @@ impl Daemon {
             discard_arena: self.cfg.discard_arena,
             state_dir: self.cfg.state_dir.clone(),
             recovery_timeout: self.cfg.recovery_timeout,
+            allow_remote_replication: self.cfg.allow_remote_replication,
         };
         self.pool = Some(Pool::boot(
             &spec,
@@ -130,6 +164,7 @@ impl Daemon {
             self.stop.clone(),
             self.host.clone(),
         )?);
+        self.lend_listener();
         Ok(())
     }
 
@@ -158,7 +193,8 @@ impl Daemon {
         }
     }
 
-    /// One tick of the pool; `true` when it has work in hand.
+    /// One tick of the pool; `true` when it has work in hand. With no pool
+    /// booted, a replication connection is refused at once.
     pub fn tick(&mut self) -> bool {
         match &mut self.pool {
             Some(pool) => match pool.tick() {
@@ -168,7 +204,22 @@ impl Daemon {
                     false
                 }
             },
-            None => false,
+            None => {
+                let mut refused = false;
+                if let Some(listener) = self.repl_listener.as_mut() {
+                    while let Some(link) = LinkListener::accept(listener) {
+                        refuse_link(
+                            link,
+                            Refusal::new(
+                                RefuseCode::NoPool,
+                                "no pool is booted on this daemon (`otapctl pool boot`)",
+                            ),
+                        );
+                        refused = true;
+                    }
+                }
+                refused
+            }
         }
     }
 
@@ -241,19 +292,25 @@ impl Daemon {
                     discard_arena: false,
                     state_dir: self.cfg.state_dir.clone(),
                     recovery_timeout: self.cfg.recovery_timeout,
+                    allow_remote_replication: self.cfg.allow_remote_replication,
                 };
                 let pool = Pool::boot(&spec, &self.clock, self.stop.clone(), self.host.clone())?;
                 let reply = pool.status();
                 self.pool = Some(pool);
+                self.lend_listener();
                 reply
             }
             Request::PoolStop => {
                 let mut pool = self.pool.take().ok_or_else(no_pool)?;
+                self.reclaim_listener(&mut pool);
                 pool.stop()
             }
             Request::DaemonStop => {
                 let reply = match self.pool.take() {
-                    Some(mut pool) => pool.stop().map(|_| Response::Ok),
+                    Some(mut pool) => {
+                        self.reclaim_listener(&mut pool);
+                        pool.stop().map(|_| Response::Ok)
+                    }
                     None => Ok(Response::Ok),
                 };
                 self.exit = true;
@@ -273,6 +330,7 @@ impl Daemon {
     /// for exit.
     pub fn shutdown(&mut self) {
         if let Some(mut pool) = self.pool.take() {
+            self.reclaim_listener(&mut pool);
             match pool.stop() {
                 Ok(_) => eprintln!("dbladed: pool {} stopped cleanly", pool.device()),
                 Err(e) => eprintln!("dbladed: {}", e.message),
@@ -285,22 +343,41 @@ impl Daemon {
     /// is returned here and the thread ends), then serves requests from
     /// the returned handle until the handle's last clone is dropped,
     /// `DaemonStop` arrives, or `stop` is set (a signal), shutting the
-    /// pool down cleanly on every one of those.
+    /// pool down cleanly on every one of those. The replication port
+    /// (`replication_listen`) is bound here first: an address that cannot
+    /// be bound, or one beyond loopback without
+    /// `allow_remote_replication`, fails the start.
     pub fn spawn(
         cfg: DaemonConfig,
         stop: Arc<AtomicBool>,
     ) -> Result<(DaemonHandle, JoinHandle<()>), ControlError> {
+        let listener = match &cfg.replication_listen {
+            Some(addr) => Some(
+                TcpReplicationTransport::new(TcpConfig {
+                    allow_remote: cfg.allow_remote_replication,
+                    ..TcpConfig::default()
+                })
+                .listen(addr)
+                .map_err(|m| ControlError::new(ErrorCode::BadRequest, m))?,
+            ),
+            None => None,
+        };
+        let replication = listener.as_ref().map(TcpReplicationListener::local_addr);
         let (tx, rx) = mpsc::channel::<Call>();
         let (boot_tx, boot_rx) = mpsc::channel::<Result<(), ControlError>>();
         let stopped = Arc::new(AtomicBool::new(false));
         let handle = DaemonHandle {
             tx,
             stopped: Arc::clone(&stopped),
+            replication,
         };
         let thread = std::thread::Builder::new()
             .name("dbladed-engine".to_string())
             .spawn(move || {
                 let mut daemon = Self::with_stop_flag(cfg, Arc::clone(&stop));
+                if let Some(listener) = listener {
+                    daemon.set_replication_listener(listener);
+                }
                 let booted = daemon.boot_configured();
                 let failed = booted.is_err();
                 let _ = boot_tx.send(booted);
@@ -392,6 +469,7 @@ fn idle_wait(streak: u32, pool: bool) -> Duration {
 pub struct DaemonHandle {
     tx: Sender<Call>,
     stopped: Arc<AtomicBool>,
+    replication: Option<SocketAddr>,
 }
 
 impl DaemonHandle {
@@ -404,6 +482,12 @@ impl DaemonHandle {
         reply_rx.recv().map_err(|_| {
             ControlError::new(ErrorCode::Io, "the daemon stopped before it answered")
         })?
+    }
+
+    /// The replication port as bound (`replication_listen`), if any.
+    #[must_use]
+    pub const fn replication_addr(&self) -> Option<SocketAddr> {
+        self.replication
     }
 
     /// `true` once the engine thread has ended.

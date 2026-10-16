@@ -10,7 +10,9 @@
 //! | [`Backstore`] | `otap-backstore` (`UringBackstore` on Linux, `FileBackstore` anywhere); the simulator's fake | stripe, metadata, intent and superblock writes, flushes, discards, reads |
 //! | [`FrontDoor`] | `otap-ublk`; the simulator's request script | fetches requests (reads, writes, flushes, discards, writes of zeros), copies data in and out, acknowledges |
 //! | [`Clock`] | the monotonic and wall clocks; the simulator's virtual time | CP timer, nonces, timestamps |
-//! | [`Net`] | `TlsTcp` (later); the simulator's loopback | the replication transport (not used by the engine itself in Step 3) |
+//! | [`Net`] | the simulator's loopback | an ordered message network (kept from Step 3; the replication sessions use [`Link`]) |
+//! | [`Link`], [`Dialer`], [`LinkListener`] | `dbladed`'s TCP transport; the simulator's network | replication connections (Step 6C, [`repl`]) |
+//! | [`SinkStore`] | `dbladed`'s `--state-dir`; the simulator's memory | a replication sink's resume record |
 //!
 //! # The write path
 //!
@@ -81,6 +83,19 @@
 //! deferred frees are held so the view stays on disk; the report lists
 //! what it found and the pool status carries it.
 //!
+//! # Replication
+//!
+//! [`repl`] ships a snapshot from one pool to another as the delta against
+//! the base the destination holds (Step 6C): a source walks the snapshot's
+//! tree against its base ([`Engine::snapshot_delta_scan`]) and packs
+//! stripe-image chunks; a sink places them into an offline replica volume
+//! ([`Engine::apply_write`], [`Engine::set_replica`]), counts a chunk
+//! landed once a committed CP carries it ([`Engine::durable_seq`]), and
+//! takes the destination snapshot under the source's identity when every
+//! chunk landed. The source's replication base pin moves only when the
+//! sink reports the delta committed. Connections are [`Link`]s, so the same
+//! sessions run over `dbladed`'s TCP transport and the simulator's network.
+//!
 //! # What this step leaves out
 //!
 //! Relocation and the cleaner for data segments (metadata segments are
@@ -104,6 +119,7 @@ pub mod cleaner;
 pub mod engine;
 pub mod layout;
 pub mod meta;
+pub mod repl;
 pub mod segments;
 pub mod tables;
 pub mod traits;
@@ -112,10 +128,11 @@ pub mod verify;
 pub use boot::{BootError, BootSnapshot, BootState, TornReason};
 pub use cleaner::{CleanTarget, CleanerPolicy, RelocBlock, Scan, SkipReason};
 pub use engine::{
-    check_arena_resize, reserve_for, BootFailure, CpTrigger, Engine, EngineConfig, EngineError,
-    Event, FoldPolicy, LivenessDrift, OperatorWarning, Pacing, PeekSource, Phase, PoolStatus,
-    SnapshotInfo, Stats, VolumeSpec, VolumeStatus, MAX_PUNCH_BLOCKS, MAX_REQUEST_BLOCKS,
-    MAX_RESERVED_SNAPSHOTS, MAX_USER_SNAPSHOTS, META_RESERVE_SEGMENTS,
+    check_arena_resize, reserve_for, BlockInfo, BootFailure, CpTrigger, DeltaItem, DeltaKind,
+    DeltaScan, Engine, EngineConfig, EngineError, Event, FoldPolicy, LivenessDrift,
+    OperatorWarning, Pacing, PeekSource, Phase, PoolStatus, SnapshotInfo, Stats, VolumeSpec,
+    VolumeStatus, MAX_PUNCH_BLOCKS, MAX_REQUEST_BLOCKS, MAX_RESERVED_SNAPSHOTS, MAX_USER_SNAPSHOTS,
+    META_RESERVE_SEGMENTS,
 };
 pub use layout::{DiskLayout, LayoutError};
 pub use meta::{MetaError, MetaStream};
@@ -124,9 +141,9 @@ pub use tables::{
     load_table, plan_table, TableChain, TableFoldPolicy, TableLoad, TablePlan, TablePlanInput,
 };
 pub use traits::{
-    Backstore, Busy, Clock, DevClass, DiscardPolicy, Done, EndpointId, FlushPolicy, FrontDoor,
-    Geometry, IoError, Media, MediaProfile, Net, NetError, NvfailIntent, ReqId, Request,
-    RequestKind, Status, Tag,
+    Backstore, Busy, Clock, DevClass, Dialer, DiscardPolicy, Done, EndpointId, FlushPolicy,
+    FrontDoor, Geometry, IoError, Link, LinkError, LinkListener, Media, MediaProfile, Net,
+    NetError, NvfailIntent, ReqId, Request, RequestKind, SinkStore, Status, Tag,
 };
 pub use verify::{
     Finding, FindingKind, Severity, Verdict, VerifyCounts, VerifyOptions, VerifyPhase,

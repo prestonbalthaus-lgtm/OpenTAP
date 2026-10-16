@@ -11,6 +11,9 @@
 //!   collects the engine's completions;
 //! - [`SimClock`]: virtual time the harness advances;
 //! - [`LoopbackNet`]: an in-memory network with delay and partitions;
+//! - [`SimNet`]: connections for the replication sessions (Step 6C), with
+//!   seeded drops, cuts and corruptions, and [`MemStore`], the sink records
+//!   that outlive a simulated crash;
 //! - [`Model`]: the checker, which knows every acknowledged write and the
 //!   rules a recovered image and the nvfail set must satisfy;
 //! - [`Sim`]: the harness that boots, drives, crashes and reboots the
@@ -31,14 +34,20 @@ pub mod backstore;
 pub mod clock;
 pub mod frontdoor;
 pub mod harness;
+pub mod memstore;
 pub mod model;
 pub mod net;
 pub mod rng;
+pub mod simnet;
 
 pub use backstore::{BackstoreStats, CrashReport, OpKind, Schedule, SimBackstore, TearPolicy};
 pub use clock::SimClock;
 pub use frontdoor::{Completion, SimFrontDoor};
 pub use harness::{BootInfo, Sim, SimConfig, SimEngine, SnapExpect, Stop, Verdict, TICK_BUDGET};
+pub use memstore::MemStore;
 pub use model::{block_data, decode, expected_data, Decoded, Expected, Model, WriteRecord};
 pub use net::{LoopbackNet, NetEnd};
 pub use rng::SplitMix64;
+pub use simnet::{
+    Direction, FaultKind, FaultRule, NetStats, SimDialer, SimLink, SimListener, SimNet,
+};

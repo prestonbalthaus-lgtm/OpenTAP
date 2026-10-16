@@ -499,3 +499,99 @@ pub trait Net {
     /// many.
     fn poll_recv(&mut self, out: &mut Vec<(EndpointId, Vec<u8>)>) -> usize;
 }
+
+/// Why a replication link refused a message or ended (Step 6C).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LinkError {
+    /// The send queue is full; nothing was queued, retry on a later tick.
+    Busy,
+    /// The connection is gone: closed by either side, reset, timed out,
+    /// refused, or ended by a frame that did not verify. The text says
+    /// which, for the operator.
+    Closed(String),
+    /// The address cannot be used: it does not parse, does not resolve,
+    /// or is not loopback while remote replication is not allowed.
+    Address(String),
+}
+
+impl fmt::Display for LinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Busy => f.write_str("the link's send queue is full"),
+            Self::Closed(why) => write!(f, "the connection ended: {why}"),
+            Self::Address(why) => write!(f, "bad replication address: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
+/// One replication connection as the engine thread sees it (Step 6C): whole
+/// messages in and out, in order, never blocking. A message is what one
+/// link frame carries (the framing, its CRC and its bound are the link's,
+/// [`crate::repl::wire`]); the transport underneath may lose the connection
+/// at any point, and then every later call answers
+/// [`LinkError::Closed`]. Nothing accepted by `send` is reordered or
+/// duplicated while the connection lives; what was in flight when it ended
+/// is lost, and the replication sessions resume from the receiver's cursor
+/// after a new handshake. The TCP transport of `dbladed` and the
+/// simulator's network implement it.
+pub trait Link {
+    /// Queues one message. [`LinkError::Busy`] when the queue is full
+    /// (nothing queued); [`LinkError::Closed`] once the connection is gone.
+    fn send(&mut self, msg: &[u8]) -> Result<(), LinkError>;
+
+    /// The next message received, `Ok(None)` when none is waiting (or the
+    /// connection is still being set up).
+    fn recv(&mut self) -> Result<Option<Vec<u8>>, LinkError>;
+
+    /// Ends the connection; idempotent. Messages `send` accepted before
+    /// are still handed to the transport (a refusal sent just before the
+    /// close reaches the peer when the connection allows), then the
+    /// connection is shut.
+    fn close(&mut self);
+
+    /// The peer, for status lines.
+    fn peer(&self) -> String;
+}
+
+/// Opens replication connections (Step 6C): a TCP transport dials a
+/// `host:port`, the simulator connects to one of its listeners. Never
+/// blocks: the connection is set up behind the returned link, whose calls
+/// answer `Ok(None)` until it is up and [`LinkError::Closed`] if it never
+/// comes up.
+pub trait Dialer {
+    /// A link to `addr`.
+    fn dial(&mut self, addr: &str) -> Result<Box<dyn Link>, LinkError>;
+}
+
+/// Hands over the replication connections a peer opened to us (Step 6C).
+pub trait LinkListener {
+    /// The next connection accepted, if any.
+    fn accept(&mut self) -> Option<Box<dyn Link>>;
+}
+
+/// Where a replication sink keeps its resume state between processes
+/// (Step 6C): one small record per destination volume, written whole and
+/// atomically. `dbladed` keeps the records as files in its `--state-dir`
+/// (like the ublk bindings); the simulator keeps them in memory that
+/// outlives a simulated crash. The pool itself never holds them, so no
+/// format change was needed; what the pool does hold (the destination's
+/// snapshots, whose identities are the source's) is enough to rebuild the
+/// committed state when a record is lost.
+pub trait SinkStore {
+    /// The record under `key`, if one was saved.
+    fn load(&mut self, key: &str) -> Result<Option<Vec<u8>>, String>;
+
+    /// Saves `bytes` under `key`, replacing any record, durably and
+    /// atomically: after a crash the old record or the new one is found,
+    /// never a mixture.
+    fn save(&mut self, key: &str, bytes: &[u8]) -> Result<(), String>;
+
+    /// Removes the record under `key` (nothing when there is none).
+    fn remove(&mut self, key: &str) -> Result<(), String>;
+
+    /// Every key with a record.
+    fn keys(&mut self) -> Result<Vec<String>, String>;
+}

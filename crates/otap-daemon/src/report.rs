@@ -1,9 +1,11 @@
 //! The engine's state as the protocol reports it.
 
 use otap_control::{
-    FindingSeverity, PoolReport, SnapshotReport, VerifyFinding, VerifyState as WireState,
+    FindingSeverity, PoolReport, ReplicationCursorReport, ReplicationLandingReport,
+    ReplicationReport, ReplicationState, SnapshotReport, VerifyFinding, VerifyState as WireState,
     VerifyVerdict, VolumeReport,
 };
+use otap_cp::repl::{CursorReport, JobReport, JobState};
 use otap_cp::{
     Backstore, Clock, Engine, FrontDoor, Severity, SnapshotInfo, Verdict, VerifyReport,
     VerifyState, VolumeStatus,
@@ -156,5 +158,72 @@ pub fn pool_report<B: Backstore, F: FrontDoor, C: Clock>(
         writes: stats.writes,
         reads: stats.reads,
         last_boot: last_boot.to_string(),
+    }
+}
+
+/// A replication job as the protocol carries it (Step 6C).
+#[must_use]
+pub fn replication_report(r: &JobReport) -> ReplicationReport {
+    ReplicationReport {
+        id: r.id,
+        role: r.role.word().to_string(),
+        mode: r.mode.word().to_string(),
+        state: match r.state {
+            JobState::Running => ReplicationState::Running,
+            JobState::Done => ReplicationState::Done,
+            JobState::Failed => ReplicationState::Failed,
+            JobState::Cancelled => ReplicationState::Cancelled,
+        },
+        phase: r.phase.clone(),
+        volume: r.volume.clone(),
+        volume_index: r.volume_index,
+        peer: r.peer.clone(),
+        remote_volume: r.remote_volume.clone(),
+        snapshot: r.snapshot.clone(),
+        snapshot_uuid: r.snapshot_uuid.map(|u| u.to_string()),
+        base_uuid: r.base_uuid.map(|u| u.to_string()),
+        chunks: r.chunks,
+        chunks_sent: r.chunks_sent,
+        chunks_landed: r.chunks_landed,
+        bytes: r.bytes,
+        bytes_sent: r.bytes_sent,
+        bytes_landed: r.bytes_landed,
+        frames_sent: r.frames_sent,
+        frames_received: r.frames_received,
+        connections: r.connections,
+        retries: r.retries,
+        resumed_chunks: r.resumed_chunks,
+        resent_chunks: r.resent_chunks,
+        duplicate_chunks: r.duplicate_chunks,
+        landed_contig: r.landed_contig,
+        digest_verified: r.digest_verified,
+        last_error: r.last_error.clone(),
+    }
+}
+
+/// A volume's replication position as the protocol carries it (Step 6C).
+#[must_use]
+pub fn replication_cursor_report(r: &CursorReport) -> ReplicationCursorReport {
+    ReplicationCursorReport {
+        volume: r.volume.clone(),
+        volume_index: r.volume_index,
+        role: r.role.word().to_string(),
+        replica: r.replica,
+        base_uuid: r.base_uuid.map(|u| u.to_string()),
+        base_name: r.base_name.clone(),
+        base_cp: r.base_cp,
+        source_pool: r.source_pool.map(|u| u.to_string()),
+        source_volume_index: r.source_volume_index,
+        landing: r.landing.as_ref().map(|l| ReplicationLandingReport {
+            cp_seq: l.cp_seq,
+            nonce: format!("{:016x}", l.nonce),
+            target: l.target.to_string(),
+            chunks: l.chunks,
+            landed: l.landed,
+            landed_contig: l.landed_contig,
+            sparse_ranges: l.sparse_ranges,
+        }),
+        dirty: r.dirty,
+        persisted: r.persisted,
     }
 }

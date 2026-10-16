@@ -37,6 +37,10 @@ use crate::verify::{
     LiveVolume, SnapshotView, Verdict, VerifyJob, VerifyOptions, VerifyReport, VerifyState, View,
 };
 
+mod replica;
+
+pub use replica::{BlockInfo, DeltaItem, DeltaKind, DeltaScan};
+
 /// The longest read or write the engine serves, in blocks (8 MiB): bounds
 /// the read buffer and the arena run one request can take.
 pub const MAX_REQUEST_BLOCKS: u32 = 2048;
@@ -803,6 +807,19 @@ pub enum EngineError {
         /// The pool's selected CP is a clean shutdown and nothing rewound.
         clean: bool,
     },
+    /// The volume is not a replication destination (Step 6C): a
+    /// replication write was offered for a volume no sink marked.
+    NotReplica {
+        /// The volume.
+        vol: u32,
+    },
+    /// The volume is a replication destination (a mirror, Step 6C): it
+    /// stays offline to clients until the replication relationship is
+    /// released (`otapctl replicate release`).
+    ReplicaVolume {
+        /// The volume.
+        vol: u32,
+    },
     /// Something this step does not support.
     Unsupported(&'static str),
     /// An invariant the engine relies on did not hold.
@@ -930,6 +947,16 @@ impl fmt::Display for EngineError {
                     why.join(" and ")
                 )
             }
+            Self::NotReplica { vol } => write!(
+                f,
+                "volume {vol} is not a replication destination; only a replication sink writes \
+                 through this path"
+            ),
+            Self::ReplicaVolume { vol } => write!(
+                f,
+                "volume {vol} is a replication destination (a mirror) and stays offline; release \
+                 it with `otapctl replicate release` first"
+            ),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Internal(s) => write!(f, "internal: {s}"),
         }
@@ -1526,6 +1553,8 @@ pub struct Stats {
     pub paced: u64,
     /// Volume rollbacks committed.
     pub rollbacks: u64,
+    /// Blocks written, and holes punched, by a replication sink (Step 6C).
+    pub applied: u64,
 }
 
 /// Reads map pages through a backstore.
@@ -1656,6 +1685,21 @@ pub struct Engine<B: Backstore, F: FrontDoor, C: Clock> {
     intent_inflight: Option<(Tag, VolBitSet, u64)>,
     intent_wanted: bool,
     pending_acks: Vec<(Request, u64)>,
+    /// Volumes a replication sink placed writes to (Step 6C,
+    /// [`Engine::apply_write`]) while outside the durable write-active set:
+    /// the next intent slot carries them, as it carries the volumes of the
+    /// writes waiting in `pending_acks`.
+    apply_intent: VolBitSet,
+    /// Replication destinations (Step 6C): volumes kept offline to clients
+    /// that only [`Engine::apply_write`] and [`Engine::apply_punch`] write.
+    /// In memory only (no format change): the sink marks them again when
+    /// it attaches after a boot, and an offline volume is never served
+    /// meanwhile.
+    replicas: VolBitSet,
+    /// The highest write sequence number a committed CP carried since the
+    /// boot: every write at or below it is durable (sequence numbers are
+    /// in placement order).
+    durable_seq: u64,
     state: State,
     next_tag: u64,
     nonce_counter: u64,
@@ -2306,6 +2350,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             intent_inflight: None,
             intent_wanted: false,
             pending_acks: Vec::new(),
+            apply_intent: VolBitSet::EMPTY,
+            replicas: VolBitSet::EMPTY,
+            durable_seq: 0,
             state: State::Idle,
             next_tag: 1,
             nonce_counter: 0,
@@ -2780,6 +2827,8 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         v.nvfail = None;
         v.clearing = None;
         v.windows = 0;
+        // A new volume at a reused index is nobody's replica.
+        let _ = self.replicas.clear(vol);
         self.request_cp();
         Ok(())
     }
@@ -3054,8 +3103,11 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
 
     /// Takes `vol` offline (nothing is served on it; `Status::Offline`) or
     /// back online. Immediate; recorded in the volume table with the next
-    /// consistency point (F18) so a reboot keeps the state.
+    /// consistency point (F18) so a reboot keeps the state. A replication
+    /// destination (Step 6C) refuses to come online while it is a mirror
+    /// ([`EngineError::ReplicaVolume`]).
     pub fn set_volume_online(&mut self, vol: u32, online: bool) -> Result<(), EngineError> {
+        let replica = self.replicas.get(vol);
         let v = self
             .vols
             .get_mut(vol as usize)
@@ -3063,6 +3115,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             .ok_or(EngineError::NoSuchVolume { vol })?;
         if online && v.op.is_some() {
             return Err(EngineError::VolumeBusy { vol });
+        }
+        if online && replica {
+            return Err(EngineError::ReplicaVolume { vol });
         }
         if v.offline == !online {
             return Ok(());
@@ -4346,7 +4401,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 for (req, seq) in ready {
                     self.front.complete(req, Status::Ok, seq);
                 }
-                if !self.pending_acks.is_empty() {
+                // The replication writes' volumes this intent carried are
+                // covered now; one placed since waits for the next.
+                for vol in set.iter() {
+                    let _ = self.apply_intent.clear(vol);
+                }
+                if !self.pending_acks.is_empty() || !self.apply_intent.is_empty() {
                     self.intent_wanted = true;
                 }
             }
@@ -4370,6 +4430,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         for (req, _) in &self.pending_acks {
             set.set(req.vol())?;
         }
+        set.union_with(&self.apply_intent);
         let seq = self.intent_seq + 1;
         let mut slot = IntentSlot::new(self.cfg.agg_id, seq);
         slot.cp_seq = self.cp_seq;
@@ -6654,6 +6715,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 }
                 VolOp::Delete => {
                     *v = VolRt::default();
+                    let _ = self.replicas.clear(vol);
                     self.events.push(Event::VolumeDeleted {
                         vol,
                         cp_seq: job.cp_seq,
@@ -6777,6 +6839,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         self.release_freed(job.cp_seq, true);
         self.stats.cps += 1;
         self.last_commit_ns = self.clock.mono_ns();
+        self.durable_seq = self.durable_seq.max(job.max_seq);
         self.events.push(Event::CpCommitted {
             cp_seq: job.cp_seq,
             trigger: job.trigger,

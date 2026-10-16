@@ -3,9 +3,10 @@
 use std::io::{self, Write};
 
 use otap_control::{
-    decode_hex, format_size, DeviceReport, DeviceState, FindingSeverity, PoolReport, Response,
-    SnapshotReport, VerifyReport, VerifyState, VerifyVerdict, VolumeReport, PIN_CLONE,
-    PIN_REPLICATION, PIN_SCHEDULE, PIN_USER,
+    decode_hex, format_size, DeviceReport, DeviceState, FindingSeverity, PoolReport,
+    ReplicationCursorReport, ReplicationReport, ReplicationState, Response, SnapshotReport,
+    VerifyReport, VerifyState, VerifyVerdict, VolumeReport, PIN_CLONE, PIN_REPLICATION,
+    PIN_SCHEDULE, PIN_USER,
 };
 
 use crate::args::Command;
@@ -160,7 +161,164 @@ pub fn render(response: &Response, cmd: &Command, out: &mut dyn Write) -> io::Re
             Ok(())
         }
         Response::Verify(report) => render_verify(report, out),
+        Response::Replication(report) => render_replication(report, out),
+        Response::Replications { jobs } => {
+            if jobs.is_empty() {
+                return writeln!(out, "no replication jobs");
+            }
+            let mut rows = vec![vec![
+                "ID".to_string(),
+                "MODE".to_string(),
+                "STATE".to_string(),
+                "VOLUME".to_string(),
+                "PEER".to_string(),
+                "SNAPSHOT".to_string(),
+                "CHUNKS".to_string(),
+                "RETRIES".to_string(),
+                "PHASE".to_string(),
+            ]];
+            for j in jobs {
+                rows.push(vec![
+                    j.id.to_string(),
+                    j.mode.clone(),
+                    replication_state(j.state).to_string(),
+                    j.volume.clone(),
+                    j.peer.clone(),
+                    j.snapshot
+                        .clone()
+                        .or_else(|| j.snapshot_uuid.clone())
+                        .unwrap_or_else(|| "-".to_string()),
+                    format!("{}/{}", j.chunks_landed, j.chunks),
+                    j.retries.to_string(),
+                    j.phase.clone(),
+                ]);
+            }
+            write_table(&rows, out)
+        }
+        Response::ReplicationCursor(c) => render_cursor(c, out),
     }
+}
+
+fn replication_state(state: ReplicationState) -> &'static str {
+    match state {
+        ReplicationState::Running => "running",
+        ReplicationState::Done => "done",
+        ReplicationState::Failed => "FAILED",
+        ReplicationState::Cancelled => "cancelled",
+    }
+}
+
+/// One replication job.
+fn render_replication(j: &ReplicationReport, out: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "replication job {}: {} of {} ({}), {}",
+        j.id,
+        j.mode,
+        j.volume,
+        j.role,
+        replication_state(j.state)
+    )?;
+    writeln!(out, "  phase:      {}", j.phase)?;
+    writeln!(out, "  peer:       {} (volume {})", j.peer, j.remote_volume)?;
+    let snap = match (&j.snapshot, &j.snapshot_uuid) {
+        (Some(name), Some(uuid)) => format!("{name} ({uuid})"),
+        (None, Some(uuid)) => uuid.clone(),
+        (Some(name), None) => name.clone(),
+        (None, None) => "-".to_string(),
+    };
+    writeln!(out, "  snapshot:   {snap}")?;
+    writeln!(
+        out,
+        "  base:       {}",
+        j.base_uuid.as_deref().unwrap_or("none (a full transfer)")
+    )?;
+    if j.role == "source" {
+        writeln!(
+            out,
+            "  chunks:     {} of {} acknowledged, {} sent ({} sent again after a reconnect, {} \
+             skipped as landed)",
+            j.chunks_landed, j.chunks, j.chunks_sent, j.resent_chunks, j.resumed_chunks
+        )?;
+        writeln!(
+            out,
+            "  bytes:      {} sent of {}",
+            format_size(j.bytes_sent),
+            format_size(j.bytes)
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  chunks:     {} landed of {} (first missing {}), {} received again",
+            j.chunks_landed, j.chunks, j.landed_contig, j.duplicate_chunks
+        )?;
+        writeln!(out, "  bytes:      {} landed", format_size(j.bytes_landed))?;
+        let digest = match j.digest_verified {
+            Some(true) => "verified",
+            Some(false) => "MISMATCH (the delta starts over)",
+            None => "not verified (yet, or across a restart)",
+        };
+        writeln!(out, "  digest:     {digest}")?;
+    }
+    writeln!(
+        out,
+        "  frames:     {} sent, {} received over {} connection(s), {} retries",
+        j.frames_sent, j.frames_received, j.connections, j.retries
+    )?;
+    if let Some(e) = &j.last_error {
+        writeln!(out, "  last error: {e}")?;
+    }
+    Ok(())
+}
+
+/// A volume's replication position.
+fn render_cursor(c: &ReplicationCursorReport, out: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "replication cursor of {} (index {}): {}",
+        c.volume,
+        c.volume_index,
+        if c.role == "sink" {
+            "a mirror"
+        } else {
+            "a source"
+        }
+    )?;
+    let base = match (&c.base_name, &c.base_uuid) {
+        (Some(name), Some(uuid)) => format!("{name} ({uuid})"),
+        (None, Some(uuid)) => uuid.clone(),
+        _ => "none".to_string(),
+    };
+    writeln!(out, "  base:       {base}")?;
+    if let Some(cp) = c.base_cp {
+        writeln!(out, "  base cp:    {cp} (the source's numbering)")?;
+    }
+    if c.role == "sink" {
+        writeln!(out, "  replica:    {}", yes_no(c.replica))?;
+        if let (Some(pool), Some(vol)) = (&c.source_pool, c.source_volume_index) {
+            writeln!(out, "  source:     volume {vol} of pool {pool}")?;
+        }
+        match &c.landing {
+            Some(l) => writeln!(
+                out,
+                "  in flight:  delta to {} (cp {}, nonce {}): {} of {} chunks landed, first \
+                 missing {}, {} sparse range(s)",
+                l.target, l.cp_seq, l.nonce, l.landed, l.chunks, l.landed_contig, l.sparse_ranges
+            )?,
+            None => writeln!(out, "  in flight:  none")?,
+        }
+        writeln!(
+            out,
+            "  partial:    {}",
+            if c.dirty {
+                "the live volume may hold part of a delta (rolled back before the next one)"
+            } else {
+                "no"
+            }
+        )?;
+        writeln!(out, "  persisted:  {}", yes_no(c.persisted))?;
+    }
+    Ok(())
 }
 
 /// A verification report: the state and verdict, what was checked, and a

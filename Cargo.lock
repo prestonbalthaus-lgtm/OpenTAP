@@ -350,10 +350,12 @@ name = "otap-cp"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "otap-arena",
  "otap-format",
  "otap-index",
  "otap-map",
+ "otap-stream",
  "otap-sys",
  "proptest",
 ]

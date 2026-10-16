@@ -18,6 +18,9 @@ otap-index = { path = "../otap-index" }
 otap-map = { path = "../otap-map" }
 otap-sys = { path = "../otap-sys" }
 blake3.workspace = true
+# The replication stream (Step 6C): the sessions build and verify its frames.
+otap-stream = { path = "../otap-stream" }
+bytes.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

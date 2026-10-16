@@ -2,8 +2,9 @@
 //! brief, "Opus-Daemon-CLI"; E38 in `docs/07-engineering-decisions.md`).
 //!
 //! The grammar is ONTAP's: `otapctl <group> <verb> --flag value`, with
-//! `pool`, `daemon`, `volume`, `snapshot`, `io` and `device` (Step 6B: the
-//! host's ublk devices and the reaper) as the groups ([`USAGE`]
+//! `pool`, `daemon`, `volume`, `snapshot`, `io`, `device` (Step 6B: the
+//! host's ublk devices and the reaper) and `replicate` (Step 6C: push,
+//! pull, status, cursor, cancel, release) as the groups ([`USAGE`]
 //! lists every verb). [`args::parse`] turns a command line into one
 //! [`otap_control::Request`]; [`run`] connects, checks the protocol, sends
 //! it and renders the reply as text ([`render()`]) or JSON (`--json`).
@@ -12,8 +13,9 @@
 //! on stderr, or in the JSON), 2 for a command line that does not parse,
 //! 3 when the daemon cannot be reached or the stream broke, 4 when a
 //! `pool verify` that waited for its report (Step 6B) did not conclude
-//! clean. `pool verify` follows the verification job by asking for its
-//! status until it ends; the daemon never holds a request for it.
+//! clean, or a `replicate push` or `pull` that waited for its job (Step
+//! 6C) did not end done. Both follow their job by asking for its status
+//! until it ends; the daemon never holds a request for one.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -26,7 +28,9 @@ use std::io::Write;
 use std::time::Duration;
 
 use otap_control::client::ClientError;
-use otap_control::{Client, ErrorCode, Request, Response, VerifyState, VerifyVerdict};
+use otap_control::{
+    Client, ErrorCode, ReplicationState, Request, Response, VerifyState, VerifyVerdict,
+};
 
 /// How often `pool verify` asks for the verification's progress while it
 /// waits for the report.
@@ -43,6 +47,24 @@ fn follow_verify(client: &mut Client, first: Response) -> Result<Response, Clien
         }
         std::thread::sleep(VERIFY_POLL);
         reply = client.call(&Request::PoolVerifyStatus {})?;
+    }
+}
+
+/// How often `replicate push` and `pull` ask for their job's progress
+/// while they wait for it to end.
+const JOB_POLL: Duration = Duration::from_millis(100);
+
+/// Follows a replication job the daemon started until it ends: asks for
+/// its status every [`JOB_POLL`]; returns the final reply.
+fn follow_job(client: &mut Client, first: Response) -> Result<Response, ClientError> {
+    let mut reply = first;
+    loop {
+        let id = match &reply {
+            Response::Replication(job) if job.state == ReplicationState::Running => job.id,
+            _ => return Ok(reply),
+        };
+        std::thread::sleep(JOB_POLL);
+        reply = client.call(&Request::ReplicateStatus { id: Some(id) })?;
     }
 }
 
@@ -104,6 +126,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
     let reply = match client.call(&cmd.request) {
         Ok(response) if cmd.wait_verify => follow_verify(&mut client, response),
+        Ok(response) if cmd.wait_job => follow_job(&mut client, response),
         other => other,
     };
     match reply {
@@ -117,6 +140,11 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             match &response {
                 Response::Verify(report)
                     if cmd.wait_verify && report.verdict != Some(VerifyVerdict::Clean) =>
+                {
+                    4
+                }
+                Response::Replication(job)
+                    if cmd.wait_job && job.state != ReplicationState::Done =>
                 {
                     4
                 }

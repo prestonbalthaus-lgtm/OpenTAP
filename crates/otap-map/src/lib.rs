@@ -1689,6 +1689,18 @@ impl MapSet {
         })
     }
 
+    /// The map page an index entry names, read through this map's cache
+    /// and verified against the entry (its CRC and `max_birth`), as a copy:
+    /// what a walk that compares two trees page by page reads (Step 6C,
+    /// the replication source compares a snapshot with its base).
+    pub fn read_page(
+        &mut self,
+        reader: &mut dyn PageReader,
+        entry: &PageIndexEntry,
+    ) -> Result<MapPage, MapError> {
+        Ok(*self.page(reader, entry)?)
+    }
+
     /// Reads a map page for a pinned root through this map's cache.
     pub fn pinned_get(
         &mut self,

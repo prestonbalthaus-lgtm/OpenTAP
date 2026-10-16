@@ -145,6 +145,64 @@ fn device(state: DeviceState) -> DeviceReport {
     }
 }
 
+fn replication_report() -> ReplicationReport {
+    ReplicationReport {
+        id: 3,
+        role: "source".into(),
+        mode: "push".into(),
+        state: ReplicationState::Running,
+        phase: "streaming".into(),
+        volume: "data".into(),
+        volume_index: Some(0),
+        peer: "127.0.0.1:7422".into(),
+        remote_volume: "mirror".into(),
+        snapshot: Some("s1".into()),
+        snapshot_uuid: Some("00000000-0000-4000-8000-000000000007".into()),
+        base_uuid: None,
+        chunks: 40,
+        chunks_sent: 12,
+        chunks_landed: 10,
+        bytes: 40 << 20,
+        bytes_sent: 12 << 20,
+        bytes_landed: 0,
+        frames_sent: 30,
+        frames_received: 14,
+        connections: 2,
+        retries: 1,
+        resumed_chunks: 5,
+        resent_chunks: 1,
+        duplicate_chunks: 0,
+        landed_contig: 10,
+        digest_verified: None,
+        last_error: Some("the connection ended: closed by the peer".into()),
+    }
+}
+
+fn cursor_report() -> ReplicationCursorReport {
+    ReplicationCursorReport {
+        volume: "mirror".into(),
+        volume_index: 2,
+        role: "sink".into(),
+        replica: true,
+        base_uuid: Some("00000000-0000-4000-8000-000000000006".into()),
+        base_name: Some("s0".into()),
+        base_cp: Some(40),
+        source_pool: Some("00000000-0000-4000-8000-0000000000aa".into()),
+        source_volume_index: Some(0),
+        landing: Some(ReplicationLandingReport {
+            cp_seq: 52,
+            nonce: "00112233445566ff".into(),
+            target: "00000000-0000-4000-8000-000000000007".into(),
+            chunks: 40,
+            landed: 10,
+            landed_contig: 10,
+            sparse_ranges: 0,
+        }),
+        dirty: true,
+        persisted: true,
+    }
+}
+
 #[test]
 fn every_reply_round_trips() {
     let replies: Vec<Reply> = vec![
@@ -201,6 +259,19 @@ fn every_reply_round_trips() {
             findings: Vec::new(),
             reason: None,
             ..verify_report()
+        })),
+        Ok(Response::Replication(replication_report())),
+        Ok(Response::Replications {
+            jobs: vec![replication_report(), replication_report()],
+        }),
+        Ok(Response::Replications { jobs: Vec::new() }),
+        Ok(Response::ReplicationCursor(cursor_report())),
+        Ok(Response::ReplicationCursor(ReplicationCursorReport {
+            landing: None,
+            base_uuid: None,
+            base_name: None,
+            base_cp: None,
+            ..cursor_report()
         })),
         Err(ControlError::new(ErrorCode::NoPool, "no pool is booted")),
         Err(ControlError::new(ErrorCode::Timeout, "")),
@@ -346,6 +417,33 @@ fn every_request_round_trips() {
         Request::PoolVerify {},
         Request::PoolVerifyStatus {},
         Request::PoolVerifyCancel {},
+        Request::ReplicatePush {
+            volume: "data".into(),
+            snapshot: "s1".into(),
+            to: "127.0.0.1:7422".into(),
+            destination: Some("mirror".into()),
+        },
+        Request::ReplicatePush {
+            volume: "data".into(),
+            snapshot: "#4".into(),
+            to: "[::1]:7422".into(),
+            destination: None,
+        },
+        Request::ReplicatePull {
+            volume: "mirror".into(),
+            snapshot: "s1".into(),
+            from: "127.0.0.1:7422".into(),
+            source: Some("data".into()),
+        },
+        Request::ReplicateStatus { id: None },
+        Request::ReplicateStatus { id: Some(3) },
+        Request::ReplicateCursor {
+            volume: "mirror".into(),
+        },
+        Request::ReplicateCancel { id: 3 },
+        Request::ReplicateRelease {
+            volume: "mirror".into(),
+        },
     ];
     for request in &requests {
         round_trip(request);
