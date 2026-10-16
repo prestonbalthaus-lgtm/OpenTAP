@@ -15,6 +15,11 @@
 //!
 //! Every record carries its own CRC, and the region as a whole is sealed by
 //! the superblock's root reference like every other table region (F14).
+//!
+//! Since format 2.4 the `catalog` root names the catalogue's head page and
+//! such a region is its *base*; the changes since the last fold travel in
+//! delta regions ([`crate::tables`], F19 to F21) of whole records and
+//! [tombstones](CatalogRec::tombstone) ([`CATALOG_TOMBSTONE`]).
 
 use core::mem::{align_of, offset_of, size_of};
 
@@ -25,6 +30,12 @@ use crate::constants::{
     BLOCK_SIZE, CATALOG_NAME_MAX, CATALOG_RECORD_SIZE, CATALOG_RESERVED, MAX_VOL,
 };
 use crate::types::{bad_field, check_crc, copy_out, FormatError, Uuid};
+
+/// `CatalogRec::flags` bit (format 2.4, F19): in a delta region only, the
+/// record is a tombstone: the name keyed by `(kind, vol, snap_uuid)` left
+/// the catalogue. Its name is empty and its creation time zero. A base
+/// region refuses it.
+pub const CATALOG_TOMBSTONE: u8 = 1 << 0;
 
 /// What a catalogue record names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,9 +89,11 @@ pub fn validate_name(name: &[u8]) -> Result<(), FormatError> {
 pub struct CatalogRec {
     /// A [`CatalogKind`] byte; 0 marks an empty slot.
     pub kind: u8,
-    /// Bytes of `name` in use, 1 to [`CATALOG_NAME_MAX`].
+    /// Bytes of `name` in use, 1 to [`CATALOG_NAME_MAX`] (0 in a
+    /// tombstone).
     pub name_len: u8,
-    /// Reserved flag bits, zero; ignored by readers.
+    /// Flag bits: [`CATALOG_TOMBSTONE`] (format 2.4, delta regions only);
+    /// the others are reserved, zero, and ignored by readers.
     pub flags: u8,
     /// Reserved, zero.
     pub rsvd0: u8,
@@ -182,9 +195,30 @@ impl CatalogRec {
         (self.kind, self.vol, *self.snap_uuid.as_array())
     }
 
+    /// `true` for a delta region's tombstone ([`CATALOG_TOMBSTONE`]).
+    #[must_use]
+    pub const fn is_tombstone(&self) -> bool {
+        self.flags & CATALOG_TOMBSTONE != 0
+    }
+
+    /// A sealed tombstone (format 2.4, F19): the name of `kind` keyed by
+    /// `vol` (and `snap_uuid` for a snapshot, nil for a volume) left the
+    /// catalogue.
+    pub fn tombstone(kind: CatalogKind, vol: u32, snap_uuid: Uuid) -> Result<Self, FormatError> {
+        let mut rec = Self::new_zeroed();
+        rec.kind = kind.as_u8();
+        rec.flags = CATALOG_TOMBSTONE;
+        rec.vol = vol;
+        rec.snap_uuid = snap_uuid;
+        rec.validate_delta()?;
+        rec.seal();
+        Ok(rec)
+    }
+
     /// Checks the fields: an empty slot is all zero; a record has a defined
-    /// kind, a volume in range, a valid name with zeros after it, and a nil
-    /// uuid for a volume or a non-nil one for a snapshot.
+    /// kind, a volume in range, a valid name with zeros after it, a nil
+    /// uuid for a volume or a non-nil one for a snapshot, and is not a
+    /// tombstone (format 2.4: a base region holds names only).
     pub fn validate(&self) -> Result<(), FormatError> {
         if self.is_empty() {
             if self.as_bytes().iter().any(|b| *b != 0) {
@@ -192,6 +226,20 @@ impl CatalogRec {
             }
             return Ok(());
         }
+        if self.is_tombstone() {
+            return Err(bad_field("flags", u64::from(self.flags)));
+        }
+        self.validate_key()?;
+        validate_name(self.name_bytes())?;
+        if self.name[self.name_len as usize..].iter().any(|b| *b != 0) {
+            return Err(bad_field("name_len", u64::from(self.name_len)));
+        }
+        Ok(())
+    }
+
+    /// The key fields: a defined kind, a volume in range, and a uuid that
+    /// is nil for a volume and set for a snapshot.
+    fn validate_key(&self) -> Result<(), FormatError> {
         let Some(kind) = self.catalog_kind() else {
             return Err(bad_field("kind", u64::from(self.kind)));
         };
@@ -202,15 +250,37 @@ impl CatalogRec {
                 max: u64::from(MAX_VOL),
             });
         }
-        validate_name(self.name_bytes())?;
-        if self.name[self.name_len as usize..].iter().any(|b| *b != 0) {
-            return Err(bad_field("name_len", u64::from(self.name_len)));
-        }
         match kind {
             CatalogKind::Volume if !self.snap_uuid.is_nil() => Err(bad_field("snap_uuid", 1)),
             CatalogKind::Snapshot if self.snap_uuid.is_nil() => Err(bad_field("snap_uuid", 0)),
             _ => Ok(()),
         }
+    }
+
+    /// Checks a record of a delta region (format 2.4, F19): never empty;
+    /// either a record [`validate`](Self::validate) accepts, or a tombstone
+    /// with valid key fields, an empty name and no creation time.
+    pub fn validate_delta(&self) -> Result<(), FormatError> {
+        if self.is_empty() {
+            return Err(bad_field("kind", 0));
+        }
+        if !self.is_tombstone() {
+            return self.validate();
+        }
+        self.validate_key()?;
+        if self.name_len != 0 || self.name.iter().any(|b| *b != 0) {
+            return Err(bad_field("name_len", u64::from(self.name_len)));
+        }
+        if self.created_wall_ns != 0 {
+            return Err(bad_field("created_wall_ns", self.created_wall_ns));
+        }
+        Ok(())
+    }
+
+    /// [`validate_delta`](Self::validate_delta) and the CRC.
+    pub fn verify_delta(&self) -> Result<(), FormatError> {
+        self.validate_delta()?;
+        check_crc("catalogue record", self.compute_crc(), self.crc32c)
     }
 
     /// Validates the fields and checks the CRC (an empty slot has none).

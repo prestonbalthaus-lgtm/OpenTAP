@@ -64,8 +64,11 @@
 //! | [`SnapRootPage`] (2.1) | 4096 | 4096 | trailing | [`records`] |
 //! | [`CatalogRec`] (2.3) | 512 | 8 | trailing | [`catalog`] |
 //! | [`CpStripe`] (2.3) | 16 | 8 | in root region | [`records`] |
+//! | [`TableLogPage`] (`TableLogHdr` + records; 2.4) | 4096 | 4096 | header + records | [`tables`] |
+//! | [`TableHeadPage`] (2.4) | 4096 | 4096 | trailing | [`tables`] |
+//! | [`TableChainEntry`] (2.4) | 32 | 8 | in head | [`tables`] |
 //!
-//! # Format rulings (F1 to F15)
+//! # Format rulings (F1 to F21)
 //! These settle the points on which the Step-1 brief, the round-3 synthesis
 //! (docs/05, section 7.1) and the 4 KiB page bound differ. They are
 //! architect decisions, recorded so that a later change is deliberate.
@@ -227,6 +230,45 @@
 //!   `SegState::Relocated` and `reloc_index` stay reserved: a drained
 //!   segment is freed, not relocated (E37).
 //!
+//! Format 2.4 (Step 6B, 2026-10-16) adds three rulings for the incremental
+//! tables; the earlier vectors stay and are still decoded, and
+//! `tests/vectors/v2.4/` holds the 2.4 set. A pool written by 2.3 or
+//! earlier is refused by the Step 6 boot; none was released.
+//!
+//! - **F19. Delta regions of the tables.** A consistency point that changes
+//!   the snapshot table or the catalogue writes only what changed: a run of
+//!   [`TableLogPage`]s, each a 64-byte [`TableLogHdr`] (aggregate, table,
+//!   CP, nonce, page position, count, CRC) and up to 63 [`SnapRecord`]s or
+//!   7 [`CatalogRec`]s, keys strictly ascending. A record is an upsert by
+//!   key (snapshot id; the catalogue's canonical key) or a tombstone
+//!   ([`SNAP_TOMBSTONE`], [`CATALOG_TOMBSTONE`]: the key's fields set,
+//!   everything else zero), each with its own CRC. A base region keeps the
+//!   2.3 image and refuses tombstones.
+//! - **F20. The table head.** The superblock's `snap_table` and `catalog`
+//!   roots name one [`TableHeadPage`] each: the base region (the table at
+//!   its last fold) and at most [`TABLE_HEAD_DELTAS`] delta regions since,
+//!   oldest first, as [`TableChainEntry`]s (region, writing CP, record
+//!   count), sealed by a trailing CRC; `snap_head_cp` and
+//!   `catalog_head_cp` in the superblock name the CPs that wrote the heads.
+//!   A CP that changes no record of a table carries its head forward; a
+//!   *fold* writes a fresh base and an empty chain; a table with no record
+//!   has no head (as in 2.3), except that a pool with any name keeps the
+//!   snapshot table's head, empty or not. Byte 56 of a head is zero, so a
+//!   2.3 reader (which takes the snapshot head for a table image and
+//!   refuses its `kind` byte) refuses a 2.4 pool that has a name or a
+//!   snapshot instead of rewriting it; a 2.4 pool with neither is one the
+//!   2.3 reader reads correctly.
+//! - **F21. Replay and damage.** The table at a CP is the base, then each
+//!   delta in order (upserts replace, tombstones remove). A head, base or
+//!   delta the booted commit wrote itself that does not verify tears the
+//!   commit; an older one is damage: its readable records are taken, and a
+//!   key whose last readable record precedes the damage is uncertain (a
+//!   name is dropped; a snapshot is kept with [`SNAP_UNCERTAIN`],
+//!   quarantined, its deletion releasing nothing) until the next fold
+//!   rewrites the table. The CP log directory's page entries (F12, F18)
+//!   also list the snapshot root pages a relocation rewrote, so a lost one
+//!   tears the commit that wrote it.
+//!
 //! # Using the views
 //! ```
 //! use otap_format::{FromBytes, IntoBytes, SbLocation, SbSlot, SuperblockSlot, Uuid, VOL_PRESENT};
@@ -270,9 +312,12 @@ pub mod records;
 pub mod stream;
 pub mod stripe;
 pub mod superblock;
+pub mod tables;
 pub mod types;
 
-pub use catalog::{catalog_image, parse_catalog, validate_name, CatalogKind, CatalogRec};
+pub use catalog::{
+    catalog_image, parse_catalog, validate_name, CatalogKind, CatalogRec, CATALOG_TOMBSTONE,
+};
 pub use constants::*;
 pub use map::{
     map_roots_image, parse_map_roots, MapEntry, MapPage, MapRoot, PageIndexEntry, PageIndexPage,
@@ -282,7 +327,7 @@ pub use records::{
     cp_stripes_image, parse_cp_stripes, parse_snap_table, snap_table_image, CpLogDir, CpLogDirHdr,
     CpLogDirPage, CpLogPage, CpLogPageHdr, CpLogRec, CpStripe, SegEntry, SegKind, SegState,
     SnapKind, SnapOrigin, SnapRecord, SnapRootPage, PIN_CLONE, PIN_MASK, PIN_REPLICATION,
-    PIN_SCHEDULE, PIN_USER,
+    PIN_SCHEDULE, PIN_USER, SNAP_FLAGS_MASK, SNAP_TOMBSTONE, SNAP_UNCERTAIN,
 };
 pub use stream::{Codec, FrameKind, HoleRecord, StreamHeader, FLAGS_CODEC_MASK};
 pub use stripe::{
@@ -294,6 +339,11 @@ pub use superblock::{
     boot_write_active, DurableLogHdr, InboundState, IntentSlot, NvCause, RunState, SbLocation,
     SbSlot, Superblock, SuperblockSlot, VolState, VolTable, DURABLE_LOG_LOCAL_NVME_RING,
     DURABLE_LOG_NONE, INBOUND_VALID, VOL_OFFLINE, VOL_PRESENT,
+};
+pub use tables::{
+    parse_table_delta, scan_table_base, scan_table_delta, snapshot_name_key, table_delta_image,
+    TableChainEntry, TableDelta, TableHead, TableHeadPage, TableKind, TableLogHdr, TableLogPage,
+    TableRecord, TableScan,
 };
 pub use types::{AggId, Block4K, FormatError, Page16K, RootRef, Uuid, VolBitSet};
 

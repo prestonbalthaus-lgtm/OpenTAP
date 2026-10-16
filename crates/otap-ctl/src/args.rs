@@ -37,6 +37,10 @@ COMMANDS
     pool status
     pool sync                                a consistency point now
     pool clean                               a cleaning consistency point now
+    pool verify [--no-wait | --status | --cancel]
+                                             attest the pool: the superblock ring,
+                                             every table, tree and live block, and
+                                             the accounting; waits for the report
     pool stop                                clean shutdown; the daemon keeps running
 
     volume create --name <name> --size <size>
@@ -74,7 +78,8 @@ A device id is N of /dev/ublkbN, given as N or as the path.
 
 EXIT STATUS
     0 a reply; 1 the daemon refused; 2 the command line does not parse;
-    3 the daemon cannot be reached.
+    3 the daemon cannot be reached; 4 a `pool verify` that waited for its
+    report did not conclude clean (findings, or it did not finish).
 ";
 
 /// The default reply timeout.
@@ -93,6 +98,9 @@ const BOOL_FLAGS: &[&str] = &[
     "--clone",
     "--release",
     "--stale",
+    "--no-wait",
+    "--status",
+    "--cancel",
 ];
 
 /// A parsed command.
@@ -108,6 +116,9 @@ pub struct Command {
     pub request: Request,
     /// For `io read --out`: where the data goes.
     pub read_to: Option<PathBuf>,
+    /// For `pool verify`: follow the verification until it ends and print
+    /// its final report (without `--no-wait`).
+    pub wait_verify: bool,
 }
 
 /// What a command line asked for.
@@ -251,6 +262,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
     };
     flags.context = format!("{group} {verb}");
     let mut read_to = None;
+    let mut wait_verify = false;
     let request = match (group.as_str(), verb.as_str()) {
         ("daemon", "ping") => Request::Ping,
         ("daemon", "stop") => Request::DaemonStop,
@@ -292,6 +304,24 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
         ("pool", "status") => Request::PoolStatus,
         ("pool", "sync") => Request::PoolSync,
         ("pool", "clean") => Request::PoolClean,
+        ("pool", "verify") => {
+            let no_wait = flags.flag("--no-wait");
+            let status = flags.flag("--status");
+            let cancel = flags.flag("--cancel");
+            match (no_wait, status, cancel) {
+                (true, true, _) | (true, _, true) | (_, true, true) => {
+                    return Err(
+                        "`pool verify` takes one of --no-wait, --status and --cancel".to_string(),
+                    )
+                }
+                (_, true, false) => Request::PoolVerifyStatus {},
+                (_, false, true) => Request::PoolVerifyCancel {},
+                (no_wait, false, false) => {
+                    wait_verify = !no_wait;
+                    Request::PoolVerify {}
+                }
+            }
+        }
         ("pool", "stop") => Request::PoolStop,
         ("volume", "create") => Request::VolumeCreate {
             name: flags.required("--name")?,
@@ -476,6 +506,7 @@ pub fn parse(args: &[String]) -> Result<Parsed, String> {
         timeout,
         request,
         read_to,
+        wait_verify,
     }))
 }
 
@@ -613,6 +644,25 @@ mod tests {
         assert_eq!(cp_interval_secs, DEFAULT_CP_INTERVAL_SECS);
         assert_eq!(request("pool sync"), Request::PoolSync);
         assert_eq!(request("pool clean"), Request::PoolClean);
+        // `pool verify` waits for its report unless told not to.
+        let Parsed::Run(cmd) = parse(&args("pool verify")).unwrap() else {
+            panic!("pool verify runs");
+        };
+        assert_eq!(cmd.request, Request::PoolVerify {});
+        assert!(cmd.wait_verify);
+        let Parsed::Run(cmd) = parse(&args("pool verify --no-wait")).unwrap() else {
+            panic!("pool verify --no-wait runs");
+        };
+        assert_eq!(cmd.request, Request::PoolVerify {});
+        assert!(!cmd.wait_verify);
+        assert_eq!(
+            request("pool verify --status"),
+            Request::PoolVerifyStatus {}
+        );
+        assert_eq!(
+            request("pool verify --cancel"),
+            Request::PoolVerifyCancel {}
+        );
         assert_eq!(request("pool stop"), Request::PoolStop);
         assert_eq!(
             request("volume create --name data --size 10G"),
@@ -843,5 +893,8 @@ mod tests {
         assert!(err("device reap 3 4").contains("too many"));
         assert!(err("device list 3").contains("too many"));
         assert!(err("device fly").contains("no verb"));
+        assert!(err("pool verify --status --cancel").contains("one of"));
+        assert!(err("pool verify --no-wait --status").contains("one of"));
+        assert!(err("pool verify --name x").contains("does not take --name"));
     }
 }

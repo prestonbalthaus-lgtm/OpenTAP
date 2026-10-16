@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use otap_arena::ArenaError;
 use otap_cp::{
     CleanerPolicy, DiscardPolicy, Engine, EngineConfig, Event, FlushPolicy, FoldPolicy, Geometry,
-    MediaProfile, NvfailIntent, Phase, ReqId, Status, VolumeSpec,
+    MediaProfile, NvfailIntent, Phase, ReqId, Status, TableFoldPolicy, VerifyOptions, VerifyReport,
+    VolumeSpec,
 };
 use otap_format::{
     SnapKind, SnapOrigin, Uuid, VolBitSet, BLOCK_SIZE, INTENT_SLOT_SIZE, SUPERBLOCK_SLOT_SIZE,
@@ -60,6 +61,8 @@ pub struct SimConfig {
     pub discard: DiscardPolicy,
     /// When the map folds.
     pub fold: FoldPolicy,
+    /// When the snapshot table and the catalogue fold (format 2.4).
+    pub table_fold: TableFoldPolicy,
     /// The device's completion schedule.
     pub schedule: Schedule,
     /// How a power cut tears unsafe writes.
@@ -102,6 +105,7 @@ impl SimConfig {
                 max_dirty_pages: 8,
                 max_overlay_entries: 1024,
             },
+            table_fold: TableFoldPolicy::default(),
             schedule: Schedule::default(),
             tear: TearPolicy::default(),
             reserve_segments: None,
@@ -159,6 +163,7 @@ impl SimConfig {
                 .collect(),
         );
         cfg.fold = self.fold;
+        cfg.table_fold = self.table_fold;
         cfg.cache_pages = 16;
         // The harness drives virtual time by hand: a delayed
         // acknowledgement would wait for an advance nobody makes. The
@@ -1114,6 +1119,43 @@ impl Sim {
         } else {
             Err(format!("live-block accounting drifted: {drift:?}"))
         }
+    }
+
+    /// Runs a pool verification (`otapctl pool verify`) with `opts` to its
+    /// end, ticking the engine (consistency points go on meanwhile), and
+    /// returns its report.
+    pub fn attest_with(&mut self, opts: VerifyOptions) -> Result<VerifyReport, String> {
+        self.engine()
+            .start_verify(opts)
+            .map_err(|e| format!("start the verification: {e}"))?;
+        self.tick_until(|e| !e.verify_running(), "the verification")?;
+        self.engine()
+            .verify_report()
+            .ok_or_else(|| "the verification left no report".to_string())
+    }
+
+    /// Runs a pool verification with small slices and checks that it found
+    /// nothing at all: the pool's every structure, block and count is what
+    /// the engine committed.
+    pub fn attest_clean(&mut self) -> Result<VerifyReport, String> {
+        let report = self.attest_with(VerifyOptions {
+            units_per_tick: 64,
+            max_ns_per_tick: 0,
+        })?;
+        if report.state != otap_cp::VerifyState::Done
+            || report.verdict != Some(otap_cp::Verdict::Clean)
+        {
+            return Err(format!(
+                "the verification of cp {} ended {:?} {:?} ({} errors, {} warnings): {:?}",
+                report.cp_seq,
+                report.state,
+                report.verdict,
+                report.errors,
+                report.warnings,
+                report.findings
+            ));
+        }
+        Ok(report)
     }
 
     /// Creates a volume and waits until its creation is durable; the model

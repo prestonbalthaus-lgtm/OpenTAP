@@ -85,6 +85,49 @@ fn pool_report() -> PoolReport {
     }
 }
 
+fn verify_report() -> VerifyReport {
+    VerifyReport {
+        state: VerifyState::Done,
+        verdict: Some(VerifyVerdict::Damaged),
+        cp_seq: 42,
+        phase: "finished".into(),
+        progress: 1.0,
+        superblock_slots: 4,
+        regions: 12,
+        map_pages: 30,
+        blocks: 1200,
+        holes: 35,
+        stripes: 40,
+        segments: 12,
+        bytes_read: 5 << 20,
+        errors: 1,
+        warnings: 1,
+        findings: vec![
+            VerifyFinding {
+                kind: "block_crc".into(),
+                severity: FindingSeverity::Error,
+                pba: Some(1234),
+                segment: Some(7),
+                volume_index: Some(0),
+                lba: Some(17),
+                snapshot: None,
+                detail: "the block holds another CRC".into(),
+            },
+            VerifyFinding {
+                kind: "snapshot_quarantined".into(),
+                severity: FindingSeverity::Warning,
+                pba: None,
+                segment: None,
+                volume_index: Some(1),
+                lba: None,
+                snapshot: Some(3),
+                detail: "quarantined".into(),
+            },
+        ],
+        reason: Some("cancelled by the operator".into()),
+    }
+}
+
 fn device(state: DeviceState) -> DeviceReport {
     DeviceReport {
         dev_id: 4,
@@ -151,6 +194,14 @@ fn every_reply_round_trips() {
         Ok(Response::Reaped {
             devices: Vec::new(),
         }),
+        Ok(Response::Verify(verify_report())),
+        Ok(Response::Verify(VerifyReport {
+            state: VerifyState::Running,
+            verdict: None,
+            findings: Vec::new(),
+            reason: None,
+            ..verify_report()
+        })),
         Err(ControlError::new(ErrorCode::NoPool, "no pool is booted")),
         Err(ControlError::new(ErrorCode::Timeout, "")),
     ];
@@ -292,6 +343,9 @@ fn every_request_round_trips() {
             dev_id: None,
             stale: true,
         },
+        Request::PoolVerify {},
+        Request::PoolVerifyStatus {},
+        Request::PoolVerifyCancel {},
     ];
     for request in &requests {
         round_trip(request);

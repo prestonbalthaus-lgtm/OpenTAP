@@ -77,6 +77,18 @@ fn fix_page(sb: &mut Superblock) {
     if sb.open_data_pseg == 0 {
         sb.open_data_idx = 0;
     }
+    // The table heads' CPs (2.4): at or before the commit, and 0 for a
+    // table without a head.
+    sb.snap_head_cp = if sb.snap_table.is_none() {
+        0
+    } else {
+        sb.snap_head_cp % (sb.cp_seq + 1)
+    };
+    sb.catalog_head_cp = if sb.catalog.is_none() {
+        0
+    } else {
+        sb.catalog_head_cp % (sb.cp_seq + 1)
+    };
     if sb.durable_log.kind.is_multiple_of(2) {
         sb.durable_log = DurableLogHdr::NONE;
     } else {
@@ -275,9 +287,11 @@ fn superblock_field_offsets() {
     assert_eq!(offset_of!(Superblock, geom_capacity_bytes), 1720);
     assert_eq!(offset_of!(Superblock, catalog), 1728);
     assert_eq!(offset_of!(Superblock, cp_stripes), 1744);
-    assert_eq!(offset_of!(Superblock, reserved), 1760);
+    assert_eq!(offset_of!(Superblock, snap_head_cp), 1760);
+    assert_eq!(offset_of!(Superblock, catalog_head_cp), 1768);
+    assert_eq!(offset_of!(Superblock, reserved), 1776);
     assert_eq!(offset_of!(Superblock, crc32c), 4092);
-    assert_eq!(1760 + SUPERBLOCK_RESERVED + 4, SUPERBLOCK_SIZE);
+    assert_eq!(1776 + SUPERBLOCK_RESERVED + 4, SUPERBLOCK_SIZE);
 
     assert_eq!(offset_of!(SuperblockSlot, sb), 0);
     assert_eq!(offset_of!(SuperblockSlot, vols), 4096);
@@ -400,9 +414,11 @@ fn stream_field_offsets() {
 
 #[test]
 fn constants_and_magics() {
-    assert_eq!(FORMAT_VERSION, 0x0203);
+    assert_eq!(FORMAT_VERSION, 0x0204);
     assert_eq!(STREAM_VERSION, 0x0100);
     assert_eq!(&SUPERBLOCK_MAGIC.to_le_bytes(), b"OTSB");
+    assert_eq!(&TABLE_LOG_MAGIC.to_le_bytes(), b"OTTL");
+    assert_eq!(&TABLE_HEAD_MAGIC.to_le_bytes(), b"OTTH");
     assert_eq!(&INTENT_MAGIC.to_le_bytes(), b"OTIN");
     assert_eq!(&STRIPE_MAGIC.to_le_bytes(), b"OTST");
     assert_eq!(&STREAM_MAGIC.to_le_bytes(), b"OTSF");
@@ -573,7 +589,7 @@ proptest! {
         prop_assert!(decoded == slot);
         prop_assert_eq!(decoded.as_bytes(), slot.as_bytes());
         prop_assert_eq!(decoded.sb.compute_crc(), decoded.sb.crc32c);
-        prop_assert_eq!(&decoded.sb.reserved[..], &bytes[1760..4092]);
+        prop_assert_eq!(&decoded.sb.reserved[..], &bytes[1776..4092]);
     }
 }
 
@@ -2080,12 +2096,36 @@ const V2_3_NAMES: [&str; 16] = [
     "cp_stripes.bin",
 ];
 
+/// Format 2.4 adds the incremental tables: a head page and a delta region
+/// of each table, and the two head CPs in the superblock.
+const V2_4_NAMES: [&str; 19] = [
+    "superblock_slot.bin",
+    "superblock_slot_minor1.bin",
+    "intent_slot.bin",
+    "stripe_summary.bin",
+    "map_page.bin",
+    "page_index_page.bin",
+    "map_root.bin",
+    "stream_frame.bin",
+    "hole_records.bin",
+    "seg_entries.bin",
+    "snap_records.bin",
+    "cp_log_page.bin",
+    "cp_log_dir.bin",
+    "snap_root_page.bin",
+    "catalog.bin",
+    "cp_stripes.bin",
+    "table_head.bin",
+    "table_log_snap.bin",
+    "table_log_catalog.bin",
+];
+
 /// The stored sets, oldest first. Regenerating a set is a format change:
 /// bump `FORMAT_MINOR` or `STREAM_MINOR`, add a set here with a new
 /// directory, run `cargo test -p otap-format -- --ignored
 /// write_golden_vectors` and pin the value it prints, keeping every previous
 /// directory for the N-1 lane.
-const VECTOR_SETS: [VectorSet; 4] = [
+const VECTOR_SETS: [VectorSet; 5] = [
     VectorSet {
         dir: "v2.0",
         manifest_blake3: "73b1f4d3a6729fe19b0d13f050aaaed33165d7f07584fd26174c7861332b3af6",
@@ -2113,6 +2153,13 @@ const VECTOR_SETS: [VectorSet; 4] = [
         format_version: 0x0203,
         header: "otap-format golden vectors: format 2.3 stream 1.0",
         names: &V2_3_NAMES,
+    },
+    VectorSet {
+        dir: "v2.4",
+        manifest_blake3: "f7862ce3e4c6b8ca4dd8787128adfe8e39995dada9ab8c52630c27c4c1c3c8b9",
+        format_version: 0x0204,
+        header: "otap-format golden vectors: format 2.4 stream 1.0",
+        names: &V2_4_NAMES,
     },
 ];
 
@@ -2155,6 +2202,8 @@ fn golden_slot() -> SuperblockSlot {
     sb.cp_stripes = RootRef::new(801, 1, 0x0577_19E5);
     sb.cp_log_head = RootRef::new(400, 16, 3);
     sb.snap_table = RootRef::new(500, 1, 4);
+    sb.snap_head_cp = 42;
+    sb.catalog_head_cp = 40;
     sb.cluster_state = RootRef::new(600, 8, 5);
     sb.open_data_pseg = 6;
     sb.open_data_idx = 3;
@@ -2451,6 +2500,67 @@ fn golden_cp_stripes() -> Vec<CpStripe> {
     ]
 }
 
+/// Format 2.4: the snapshot table's head at commit 42: a base of two
+/// records written by the fold at CP 30 and three deltas since.
+fn golden_table_head() -> TableHead {
+    TableHead {
+        table: TableKind::Snapshots,
+        cp_seq: 42,
+        base: TableChainEntry::new(RootRef::new(510, 1, 0x0BA5_E000), 30, 2),
+        deltas: vec![
+            TableChainEntry::new(RootRef::new(520, 1, 0xDE17_A001), 35, 3),
+            TableChainEntry::new(RootRef::new(521, 1, 0xDE17_A002), 40, 1),
+            TableChainEntry::new(RootRef::new(522, 2, 0xDE17_A003), 42, 65),
+        ],
+    }
+}
+
+/// Format 2.4: the snapshot table delta of commit 42, two pages: snapshot
+/// 1's pins changed, snapshot 2 recovered uncertain, snapshot 3 deleted,
+/// and 62 snapshots taken.
+fn golden_snap_delta() -> Vec<SnapRecord> {
+    let [user, _, scheduled] = golden_snap_records();
+    let mut pinned = user;
+    pinned.flags = PIN_USER;
+    pinned.seal();
+    let mut uncertain = scheduled;
+    uncertain.flags |= SNAP_UNCERTAIN;
+    uncertain.seal();
+    let mut out = vec![
+        pinned,
+        uncertain,
+        SnapRecord::tombstone(3, uuid(13), 1).unwrap(),
+    ];
+    for id in 10..72u64 {
+        let mut rec = user;
+        rec.snap_id = id;
+        rec.snap_uuid = uuid(id as u8 + 100);
+        rec.map_root_pba = 900 + id;
+        rec.birth_cp = 42;
+        rec.vol = (id % 3) as u32;
+        rec.flags = 0;
+        rec.seal();
+        out.push(rec);
+    }
+    out
+}
+
+/// Format 2.4: the catalogue delta of commit 42, two pages: volume 0
+/// renamed, volume 2's name gone, four volumes named, snapshot `uuid(12)`
+/// of volume 0 gone and `uuid(14)` of volume 2 named.
+fn golden_catalog_delta() -> Vec<CatalogRec> {
+    vec![
+        CatalogRec::volume(0, "data-renamed", 1_759_000_000_000_000_000).unwrap(),
+        CatalogRec::tombstone(CatalogKind::Volume, 2, Uuid::NIL).unwrap(),
+        CatalogRec::volume(3, "logs", 1_760_000_000_000_000_000).unwrap(),
+        CatalogRec::volume(4, "scratch", 1_760_000_000_000_000_000).unwrap(),
+        CatalogRec::volume(5, "web", 1_760_000_000_000_000_000).unwrap(),
+        CatalogRec::volume(6, "db", 1_760_000_000_000_000_000).unwrap(),
+        CatalogRec::tombstone(CatalogKind::Snapshot, 0, uuid(12)).unwrap(),
+        CatalogRec::snapshot(2, uuid(14), "weekly", 1_760_000_000_000_000_000).unwrap(),
+    ]
+}
+
 /// Every golden image, built by the current builders.
 fn golden_images() -> Vec<(&'static str, Vec<u8>)> {
     let (stripe, stripe_len) = golden_stripe();
@@ -2492,6 +2602,22 @@ fn golden_images() -> Vec<(&'static str, Vec<u8>)> {
         (
             "cp_stripes.bin",
             cp_stripes_image(&golden_cp_stripes()).unwrap(),
+        ),
+        (
+            "table_head.bin",
+            golden_table_head()
+                .page(uuid(0))
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "table_log_snap.bin",
+            table_delta_image(uuid(0), 42, GOLDEN_NONCE, &golden_snap_delta()).unwrap(),
+        ),
+        (
+            "table_log_catalog.bin",
+            table_delta_image(uuid(0), 42, GOLDEN_NONCE, &golden_catalog_delta()).unwrap(),
         ),
     ]
 }
@@ -2630,12 +2756,35 @@ fn decode_set(files: &HashMap<String, Vec<u8>>, set: &VectorSet) {
     } else {
         assert!(slot.sb.catalog.is_none() && slot.sb.cp_stripes.is_none());
     }
+    if set.format_version >= 0x0204 {
+        assert_eq!((slot.sb.snap_head_cp, slot.sb.catalog_head_cp), (42, 40));
+    } else {
+        // Reserved, zero, in the earlier minors.
+        assert_eq!((slot.sb.snap_head_cp, slot.sb.catalog_head_cp), (0, 0));
+    }
     assert_eq!(slot.sb.inbound[0].group, 1);
     assert!(slot.sb.inbound[0].is_valid());
     assert!(slot.sb.durable_log.is_none());
 
     let minor1 = SuperblockSlot::read(&files["superblock_slot_minor1.bin"]);
-    if set.format_version == 0x0201 {
+    if set.format_version == 0x0203 {
+        // The 2.3 writer put its demonstration bytes where 2.4 keeps the
+        // CP that wrote the snapshot table's head: a page that claims 2.4
+        // must name a head CP at or before its own, so the 2.4 reader
+        // refuses this image on that field (its CRCs still verify), as the
+        // 2.1 lane shows for the geometry.
+        assert!(
+            matches!(
+                minor1,
+                Err(FormatError::OutOfRange {
+                    field: "snap_head_cp",
+                    value: 0x0403_0201,
+                    max: 42,
+                })
+            ),
+            "{minor1:?}"
+        );
+    } else if set.format_version == 0x0201 {
         // The 2.1 writer put its demonstration bytes where 2.2 keeps the
         // geometry: a page that claims 2.2 must carry a valid geometry, so
         // the 2.2 reader refuses this image on that field (not on its CRC,
@@ -2653,10 +2802,11 @@ fn decode_set(files: &HashMap<String, Vec<u8>>, set: &VectorSet) {
     } else {
         let minor1 = minor1.unwrap();
         assert_eq!(minor1.sb.ver, set.format_version + 1);
-        if set.format_version >= 0x0203 {
+        if set.format_version >= 0x0204 {
             assert_eq!(minor1.sb.reserved[..4], [1, 2, 3, 4]);
             assert_eq!(minor1.sb.geometry(), slot.sb.geometry());
             assert_eq!(minor1.sb.catalog, slot.sb.catalog);
+            assert_eq!(minor1.sb.snap_head_cp, slot.sb.snap_head_cp);
         } else if set.format_version == 0x0202 {
             // The 2.2 writer put its demonstration bytes where 2.3 keeps the
             // catalogue root: a reference with no pages, which names
@@ -2830,5 +2980,48 @@ fn decode_set(files: &HashMap<String, Vec<u8>>, set: &VectorSet) {
         assert_eq!(stripes, golden_cp_stripes());
         assert_eq!(stripes[2].stripe_kind(), Some(StripeKind::Relocate));
         assert_eq!((stripes[0].pseg, stripes[0].idx), (17, 3));
+    }
+
+    // The 2.4 structures exist in the sets written at 2.4 and later.
+    if set.format_version >= 0x0204 {
+        let head =
+            TableHead::decode(&files["table_head.bin"], &uuid(0), TableKind::Snapshots).unwrap();
+        assert_eq!(head, golden_table_head());
+        assert_eq!((head.base_records(), head.delta_records()), (2, 69));
+        assert_eq!(head.regions().count(), 4);
+        let page = TableHeadPage::read(&files["table_head.bin"]).unwrap();
+        assert_eq!(page.ver, set.format_version);
+        // The byte a 2.3 reader takes for a snapshot record's kind.
+        assert_eq!(files["table_head.bin"][56], 0);
+        assert!(matches!(
+            TableHead::decode(&files["table_head.bin"], &uuid(0), TableKind::Catalog),
+            Err(FormatError::IdentityMismatch { field: "table" })
+        ));
+
+        let snaps: TableDelta<SnapRecord> =
+            parse_table_delta(&files["table_log_snap.bin"], &uuid(0)).unwrap();
+        assert_eq!(snaps.records, golden_snap_delta());
+        assert_eq!((snaps.cp_seq, snaps.cp_nonce), (42, GOLDEN_NONCE));
+        assert_eq!(files["table_log_snap.bin"].len(), 2 * TABLE_LOG_PAGE_SIZE);
+        assert!(snaps.records[1].is_uncertain());
+        assert!(snaps.records[2].is_tombstone());
+        assert_eq!(snaps.records[2].snap_id, 3);
+
+        let names: TableDelta<CatalogRec> =
+            parse_table_delta(&files["table_log_catalog.bin"], &uuid(0)).unwrap();
+        assert_eq!(names.records, golden_catalog_delta());
+        assert_eq!(
+            files["table_log_catalog.bin"].len(),
+            2 * TABLE_LOG_PAGE_SIZE
+        );
+        assert!(names.records[1].is_tombstone());
+        assert_eq!(names.records[0].name(), "data-renamed");
+        let first =
+            TableLogPage::read(&files["table_log_catalog.bin"][..TABLE_LOG_PAGE_SIZE]).unwrap();
+        assert_eq!(first.hdr.ver, set.format_version);
+        assert_eq!(
+            (first.hdr.count, first.hdr.table_kind()),
+            (7, Some(TableKind::Catalog))
+        );
     }
 }

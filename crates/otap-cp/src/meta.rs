@@ -140,6 +140,21 @@ impl<'a> MetaStream<'a> {
         stream
     }
 
+    /// `true` when a region of `pages` pages would be placed now: it fits
+    /// what is left of the current run, or a run of free segments long
+    /// enough exists beyond the reserve. Nothing is placed or allocated.
+    #[must_use]
+    pub fn can_place(&self, pages: u64) -> bool {
+        if pages == 0 || self.room() >= pages {
+            return true;
+        }
+        let per_segment = u64::from(self.layout.blocks_per_segment()).max(1);
+        let Ok(count) = u32::try_from(pages.div_ceil(per_segment)) else {
+            return false;
+        };
+        count <= self.segments.segments() && self.segments.has_run(count, self.reserve)
+    }
+
     /// Pages the current run can still take.
     fn room(&self) -> u64 {
         match (self.chunks.last(), self.cursor) {

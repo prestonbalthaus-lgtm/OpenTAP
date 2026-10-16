@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 /// bumps the version. A new request or reply variant does not: a daemon
 /// that does not know a request answers it `BadRequest`, and a reply
 /// variant reaches only a client that sent the request it answers. Step 6B
-/// added `DeviceList` and `DeviceReap` (answered `Devices` and `Reaped`)
-/// that way, under version 1.
+/// added `DeviceList` and `DeviceReap` (answered `Devices` and `Reaped`),
+/// and `PoolVerify`, `PoolVerifyStatus` and `PoolVerifyCancel` (answered
+/// `Verify`), that way, under version 1.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The most blocks one `IoWrite` or `IoRead` moves (1 MiB).
@@ -240,6 +241,118 @@ pub enum Request {
         /// Every stale device.
         stale: bool,
     },
+    /// Starts a verification of the booted pool (Step 6B): the superblock
+    /// ring, every table, tree and live block, and the accounting, as the
+    /// committed CP left them. It runs in slices between the engine's ticks
+    /// (devices keep being served) and is answered at once with its report;
+    /// `PoolVerifyStatus` follows it. A verification already running is
+    /// answered with its own report.
+    PoolVerify {},
+    /// The verification in progress, or the last one since the boot.
+    PoolVerifyStatus {},
+    /// Cancels the verification in progress.
+    PoolVerifyCancel {},
+}
+
+/// Where a pool verification stands (Step 6B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyState {
+    /// In progress.
+    Running,
+    /// Every check ran.
+    Done,
+    /// Cancelled by the operator.
+    Cancelled,
+    /// Given up by the engine (its reason is in the report).
+    Aborted,
+}
+
+/// What a pool verification concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyVerdict {
+    /// Nothing found.
+    Clean,
+    /// Warnings only: leaks, quarantines already in force.
+    Warnings,
+    /// Damage, or accounting that could free referenced data.
+    Damaged,
+    /// The verification did not finish.
+    Incomplete,
+}
+
+/// How bad a verification finding is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingSeverity {
+    /// Damage, or data at risk.
+    Error,
+    /// A leak or a quarantine in force.
+    Warning,
+}
+
+/// One thing a verification found, and where.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyFinding {
+    /// What, as a word (`block_crc`, `map_page`, `live_blocks`, ...).
+    pub kind: String,
+    /// How bad.
+    pub severity: FindingSeverity,
+    /// The block number concerned.
+    pub pba: Option<u64>,
+    /// The segment concerned.
+    pub segment: Option<u64>,
+    /// The volume's index concerned.
+    pub volume_index: Option<u32>,
+    /// The LBA concerned.
+    pub lba: Option<u64>,
+    /// The snapshot's id concerned.
+    pub snapshot: Option<u64>,
+    /// What exactly.
+    pub detail: String,
+}
+
+/// A pool verification as the daemon reports it (Step 6B).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyReport {
+    /// Running, done, cancelled or aborted.
+    pub state: VerifyState,
+    /// Once it ended, what it concluded.
+    pub verdict: Option<VerifyVerdict>,
+    /// The CP attested (0 while it waits to begin).
+    pub cp_seq: u64,
+    /// The part of the work in progress (`waiting`, `tables`, `trees`,
+    /// `reconcile`, `finished`).
+    pub phase: String,
+    /// How far, `0.0..=1.0`.
+    pub progress: f64,
+    /// Superblock slots read.
+    pub superblock_slots: u32,
+    /// Table, chain, index and root page regions checked.
+    pub regions: u64,
+    /// Map pages checked.
+    pub map_pages: u64,
+    /// Distinct live data blocks read and checked.
+    pub blocks: u64,
+    /// Hole entries met.
+    pub holes: u64,
+    /// Stripe summaries checked.
+    pub stripes: u64,
+    /// Segments whose live bytes were reconciled.
+    pub segments: u64,
+    /// Bytes read from the device.
+    pub bytes_read: u64,
+    /// Findings of error severity.
+    pub errors: u64,
+    /// Findings of warning severity.
+    pub warnings: u64,
+    /// The first findings (at most 64).
+    pub findings: Vec<VerifyFinding>,
+    /// Why it was cancelled or aborted.
+    pub reason: Option<String>,
 }
 
 /// How a ublk device on the host stands with the daemon (Step 6B).
@@ -488,6 +601,9 @@ pub enum Response {
         /// The deleted devices; empty when nothing was stale.
         devices: Vec<DeviceReport>,
     },
+    /// A pool verification (`PoolVerify`, `PoolVerifyStatus`,
+    /// `PoolVerifyCancel`).
+    Verify(VerifyReport),
 }
 
 /// Why a request was refused or failed.

@@ -30,7 +30,9 @@
 //! whole; then it writes the CP's metadata through the [`MetaStream`]: the
 //! map's delta regions (one [`otap_format::CpLogRec`] per block written or
 //! hole punched; E22), the pages and indexes of a fold, the snapshot root
-//! pages and table, the roots table, the directory and the segment table,
+//! pages, the changed records of the snapshot table and the catalogue as
+//! delta regions with their heads (or a fold of a table; format 2.4,
+//! [`tables`]), the roots table, the directory and the segment table,
 //! packed into whole stripes of the open metadata segment and into runs of
 //! free segments when a region does not fit; then it flushes the pool and
 //! commits the superblock slot to the `A` location and then the `B`
@@ -71,6 +73,14 @@
 //! trust policy with a structured warning in [`PoolStatus`], or is refused
 //! under the strict one (E21).
 //!
+//! # Verification
+//!
+//! [`Engine::start_verify`] attests the pool as the committed CP left it
+//! ([`verify`]): the superblock ring, every table, tree and live block, and
+//! the live bytes of every segment, in slices between ticks while the
+//! deferred frees are held so the view stays on disk; the report lists
+//! what it found and the pool status carries it.
+//!
 //! # What this step leaves out
 //!
 //! Relocation and the cleaner for data segments (metadata segments are
@@ -95,7 +105,9 @@ pub mod engine;
 pub mod layout;
 pub mod meta;
 pub mod segments;
+pub mod tables;
 pub mod traits;
+pub mod verify;
 
 pub use boot::{BootError, BootSnapshot, BootState, TornReason};
 pub use cleaner::{CleanTarget, CleanerPolicy, RelocBlock, Scan, SkipReason};
@@ -108,8 +120,15 @@ pub use engine::{
 pub use layout::{DiskLayout, LayoutError};
 pub use meta::{MetaError, MetaStream};
 pub use segments::{OpenSegment, SegmentError, SegmentTable};
+pub use tables::{
+    load_table, plan_table, TableChain, TableFoldPolicy, TableLoad, TablePlan, TablePlanInput,
+};
 pub use traits::{
     Backstore, Busy, Clock, DevClass, DiscardPolicy, Done, EndpointId, FlushPolicy, FrontDoor,
     Geometry, IoError, Media, MediaProfile, Net, NetError, NvfailIntent, ReqId, Request,
     RequestKind, Status, Tag,
+};
+pub use verify::{
+    Finding, FindingKind, Severity, Verdict, VerifyCounts, VerifyOptions, VerifyPhase,
+    VerifyReport, VerifyState, VerifySummary, MAX_FINDINGS,
 };

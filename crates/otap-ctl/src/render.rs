@@ -3,8 +3,9 @@
 use std::io::{self, Write};
 
 use otap_control::{
-    decode_hex, format_size, DeviceReport, DeviceState, PoolReport, Response, SnapshotReport,
-    VolumeReport, PIN_CLONE, PIN_REPLICATION, PIN_SCHEDULE, PIN_USER,
+    decode_hex, format_size, DeviceReport, DeviceState, FindingSeverity, PoolReport, Response,
+    SnapshotReport, VerifyReport, VerifyState, VerifyVerdict, VolumeReport, PIN_CLONE,
+    PIN_REPLICATION, PIN_SCHEDULE, PIN_USER,
 };
 
 use crate::args::Command;
@@ -158,7 +159,88 @@ pub fn render(response: &Response, cmd: &Command, out: &mut dyn Write) -> io::Re
             }
             Ok(())
         }
+        Response::Verify(report) => render_verify(report, out),
     }
+}
+
+/// A verification report: the state and verdict, what was checked, and a
+/// table of the findings.
+fn render_verify(r: &VerifyReport, out: &mut dyn Write) -> io::Result<()> {
+    let state = match r.state {
+        VerifyState::Running => "running",
+        VerifyState::Done => "done",
+        VerifyState::Cancelled => "cancelled",
+        VerifyState::Aborted => "aborted",
+    };
+    let verdict = match r.verdict {
+        None => "",
+        Some(VerifyVerdict::Clean) => ", clean",
+        Some(VerifyVerdict::Warnings) => ", warnings",
+        Some(VerifyVerdict::Damaged) => ", DAMAGED",
+        Some(VerifyVerdict::Incomplete) => ", incomplete",
+    };
+    if r.cp_seq == 0 {
+        writeln!(out, "verification: {state} ({}){verdict}", r.phase)?;
+    } else {
+        writeln!(
+            out,
+            "verification of cp {}: {state} ({}, {:.0}%){verdict}",
+            r.cp_seq,
+            r.phase,
+            r.progress * 100.0
+        )?;
+    }
+    if let Some(reason) = &r.reason {
+        writeln!(out, "  reason:    {reason}")?;
+    }
+    writeln!(
+        out,
+        "  checked:   {} superblock slots, {} regions, {} map pages, {} blocks ({} holes), \
+         {} stripe summaries, {} segments",
+        r.superblock_slots, r.regions, r.map_pages, r.blocks, r.holes, r.stripes, r.segments
+    )?;
+    writeln!(out, "  read:      {}", format_size(r.bytes_read))?;
+    let listed = if (r.findings.len() as u64) < r.errors + r.warnings {
+        format!(" (the first {} listed)", r.findings.len())
+    } else {
+        String::new()
+    };
+    writeln!(
+        out,
+        "  findings:  {} error(s), {} warning(s){listed}",
+        r.errors, r.warnings
+    )?;
+    if r.findings.is_empty() {
+        return Ok(());
+    }
+    let opt = |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
+    let mut rows = vec![vec![
+        "SEVERITY".to_string(),
+        "KIND".to_string(),
+        "SEGMENT".to_string(),
+        "PBA".to_string(),
+        "VOLUME".to_string(),
+        "LBA".to_string(),
+        "SNAPSHOT".to_string(),
+        "DETAIL".to_string(),
+    ]];
+    for f in &r.findings {
+        rows.push(vec![
+            match f.severity {
+                FindingSeverity::Error => "error",
+                FindingSeverity::Warning => "warning",
+            }
+            .to_string(),
+            f.kind.clone(),
+            opt(f.segment),
+            opt(f.pba),
+            f.volume_index.map_or("-".to_string(), |v| format!("#{v}")),
+            opt(f.lba),
+            opt(f.snapshot),
+            f.detail.clone(),
+        ]);
+    }
+    write_table(&rows, out)
 }
 
 /// `serving`, `recoverable`, `stale` or `foreign`.

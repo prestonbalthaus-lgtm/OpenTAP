@@ -8,12 +8,13 @@ use std::sync::Arc;
 use otap_arena::{Arena, ArenaError, ArenaSurvey, PlacedSlot, RingRef};
 use otap_format::checksum::crc32c;
 use otap_format::{
-    boot_write_active, catalog_image, cp_stripes_image, map_roots_image, snap_table_image,
-    validate_name, CatalogKind, CatalogRec, CpStripe, FormatError, IntentSlot, IntoBytes, MapEntry,
-    NvCause, PageIndexEntry, RootRef, RunState, SbLocation, SbSlot, SegKind, SegState, SnapKind,
-    SnapOrigin, SnapRecord, SnapRootPage, StripeDescriptor, StripeHdr, StripeKind, Superblock,
-    SuperblockSlot, Uuid, VolBitSet, VolState, BLOCK_SIZE, MAX_CP_SEQ, MAX_LBA, MAX_VOLS, PIN_MASK,
-    SECTORS_PER_BLOCK, VOL_OFFLINE, VOL_PRESENT,
+    boot_write_active, cp_stripes_image, map_roots_image, table_delta_image, validate_name,
+    CatalogKind, CatalogRec, CpStripe, FormatError, IntentSlot, IntoBytes, MapEntry, NvCause,
+    PageIndexEntry, RootRef, RunState, SbLocation, SbSlot, SegKind, SegState, SnapKind, SnapOrigin,
+    SnapRecord, SnapRootPage, StripeDescriptor, StripeHdr, StripeKind, Superblock, SuperblockSlot,
+    TableChainEntry, TableHead, TableKind, TableRecord, Uuid, VolBitSet, VolState, BLOCK_SIZE,
+    MAX_CP_SEQ, MAX_LBA, MAX_VOLS, PIN_MASK, SECTORS_PER_BLOCK, SNAP_UNCERTAIN, VOL_OFFLINE,
+    VOL_PRESENT,
 };
 use otap_index::{DirtyExtent, GenId, Generation, Index, IndexError};
 use otap_map::{
@@ -27,9 +28,13 @@ use crate::cleaner::{self, CleanTarget, CleanerPolicy, SkipReason};
 use crate::layout::{DiskLayout, LayoutError};
 use crate::meta::{MetaError, MetaStream};
 use crate::segments::{OpenSegment, SegmentError, SegmentTable};
+use crate::tables::{plan_table, TableChain, TableFoldPolicy, TablePlan, TablePlanInput};
 use crate::traits::{
     Backstore, Busy, Clock, DevClass, DiscardPolicy, Done, FlushPolicy, FrontDoor, IoError,
     NvfailIntent, Request, RequestKind, Status, Tag,
+};
+use crate::verify::{
+    LiveVolume, SnapshotView, Verdict, VerifyJob, VerifyOptions, VerifyReport, VerifyState, View,
 };
 
 /// The longest read or write the engine serves, in blocks (8 MiB): bounds
@@ -162,6 +167,8 @@ pub struct EngineConfig {
     pub volumes: Vec<VolumeSpec>,
     /// When the map folds.
     pub fold: FoldPolicy,
+    /// When the snapshot table and the catalogue fold (F20).
+    pub table_fold: TableFoldPolicy,
     /// Map pages the engine caches.
     pub cache_pages: usize,
     /// Free segments front-door writes leave alone; [`reserve_for`] the
@@ -191,6 +198,7 @@ impl EngineConfig {
             arena_half: 0.5,
             volumes,
             fold: FoldPolicy::default(),
+            table_fold: TableFoldPolicy::default(),
             cache_pages: boot::CACHE_PAGES,
             reserve_segments: None,
             cleaner: CleanerPolicy::default(),
@@ -325,13 +333,36 @@ pub enum OperatorWarning {
         /// What failed.
         reason: String,
     },
-    /// The name catalogue (F16) did not verify at boot: the pool booted
-    /// with no names, and the next consistency point that names something
-    /// writes a fresh catalogue. A nameless volume is addressed by its
-    /// index until it is named again.
+    /// The name catalogue (F16) did not verify whole at boot: the pool
+    /// booted with the names it could vouch for (none, when the head page
+    /// was lost), and the first consistency point folds the catalogue,
+    /// which repairs it. A nameless volume is addressed by its index until
+    /// it is named again; no volume is ever dropped for a name.
     CatalogDamaged {
         /// What failed.
         reason: String,
+    },
+    /// The snapshot table's chain (format 2.4, F21) did not verify whole
+    /// at boot: a snapshot whose last change may have been lost is kept
+    /// quarantined (`SnapshotDamaged`, its deletion releases nothing), one
+    /// whose record was lost is gone with its blocks still counted, and the
+    /// first consistency point folds the table, which repairs it.
+    SnapshotTableDamaged {
+        /// What failed.
+        reason: String,
+    },
+    /// The last pool verification (`otapctl pool verify`) found something
+    /// wrong in the pool as committed at `cp_seq`; its report lists what
+    /// and where.
+    AttestationFindings {
+        /// The CP the verification attested.
+        cp_seq: u64,
+        /// Findings that mean damage or data at risk.
+        errors: u64,
+        /// Findings that mean a leak or a quarantine already in force.
+        warnings: u64,
+        /// The first finding, for the status line.
+        first: String,
     },
 }
 
@@ -360,8 +391,23 @@ impl fmt::Display for OperatorWarning {
             ),
             Self::CatalogDamaged { reason } => write!(
                 f,
-                "the name catalogue does not verify ({reason}): every volume and snapshot name \
-                 was dropped; address a volume as #<index> and name it again"
+                "the name catalogue does not verify ({reason}): the names it could not vouch for \
+                 were dropped; address such a volume as #<index> and name it again"
+            ),
+            Self::SnapshotTableDamaged { reason } => write!(
+                f,
+                "the snapshot table does not verify ({reason}): snapshots whose last change may \
+                 be lost are quarantined, lost records leave their blocks counted"
+            ),
+            Self::AttestationFindings {
+                cp_seq,
+                errors,
+                warnings,
+                first,
+            } => write!(
+                f,
+                "the verification of cp {cp_seq} found {errors} error(s) and {warnings} \
+                 warning(s); first: {first}"
             ),
         }
     }
@@ -567,6 +613,20 @@ pub enum Event {
         cp_seq: u64,
         /// `true` when the final CP recorded `CleanShutdown`.
         clean: bool,
+    },
+    /// A pool verification ended ([`Engine::start_verify`]): finished,
+    /// cancelled or aborted.
+    VerifyFinished {
+        /// The CP it attested (0 when it never began).
+        cp_seq: u64,
+        /// How it ended.
+        state: VerifyState,
+        /// What it concluded.
+        verdict: Verdict,
+        /// Findings of error severity.
+        errors: u64,
+        /// Findings of warning severity.
+        warnings: u64,
     },
 }
 
@@ -1071,10 +1131,17 @@ pub struct PoolStatus {
     pub volumes: usize,
     /// Names in the catalogue.
     pub catalog_entries: usize,
+    /// Delta regions in the snapshot table's chain since its last fold
+    /// (F20).
+    pub snapshot_table_deltas: usize,
+    /// Delta regions in the catalogue's chain since its last fold.
+    pub catalog_deltas: usize,
     /// Segments the cleaner drained since boot.
     pub cleaned_segments: u64,
     /// Blocks the cleaner relocated since boot.
     pub relocated_blocks: u64,
+    /// The pool verification in progress, or the last one finished.
+    pub verify: Option<crate::verify::VerifySummary>,
 }
 
 /// Which phase the CP state machine is in.
@@ -1264,9 +1331,13 @@ struct PreparedParts {
     map_roots: RootRef,
     seg_table: RootRef,
     cp_log_head: RootRef,
-    snap_table: RootRef,
+    /// The snapshot table's chain after this CP (F20).
+    snap_chain: TableChain,
+    /// The snapshot records after this CP, in id order.
+    snap_records: Vec<SnapRecord>,
     catalog: Vec<CatalogRec>,
-    catalog_ref: RootRef,
+    /// The catalogue's chain after this CP.
+    catalog_chain: TableChain,
     cp_stripes: RootRef,
     new_snapshots: Vec<SnapState>,
     /// Snapshots this CP deletes: `(snap_id, vol, blocks released)`.
@@ -1296,9 +1367,10 @@ impl PreparedParts {
             map_roots: self.map_roots,
             seg_table: self.seg_table,
             cp_log_head: self.cp_log_head,
-            snap_table: self.snap_table,
+            snap_chain: self.snap_chain,
+            snap_records: self.snap_records,
             catalog: self.catalog,
-            catalog_ref: self.catalog_ref,
+            catalog_chain: self.catalog_chain,
             cp_stripes: self.cp_stripes,
             new_snapshots: self.new_snapshots,
             deleted_snapshots: self.deleted_snapshots,
@@ -1324,15 +1396,16 @@ struct Prepared {
     data_live: HashMap<u64, u64>,
     /// Regions this CP stops referencing, freed after the deferral.
     freed: Vec<RootRef>,
-    /// The roots, directory, snapshot table, stripe list and segment table
-    /// regions of this CP.
+    /// The roots, directory, stripe list and segment table regions of this
+    /// CP (replaced by the next CP; the table heads are not among them).
     table_regions: Vec<RootRef>,
     map_roots: RootRef,
     seg_table: RootRef,
     cp_log_head: RootRef,
-    snap_table: RootRef,
+    snap_chain: TableChain,
+    snap_records: Vec<SnapRecord>,
     catalog: Vec<CatalogRec>,
-    catalog_ref: RootRef,
+    catalog_chain: TableChain,
     cp_stripes: RootRef,
     new_snapshots: Vec<SnapState>,
     deleted_snapshots: Vec<(u64, u32, u64)>,
@@ -1500,10 +1573,26 @@ pub struct Engine<B: Backstore, F: FrontDoor, C: Clock> {
     snap_deletes: Vec<u64>,
     /// Pin changes waiting for a CP: `(snap_id, flags)`.
     pin_changes: Vec<(u64, u8)>,
-    /// The committed catalogue and its region (carried forward unchanged
-    /// by a CP that changed no name).
+    /// The committed catalogue, in canonical order, and its chain on disk
+    /// (F20): carried forward by a CP that changes no name.
     catalog: Vec<CatalogRec>,
-    catalog_ref: RootRef,
+    catalog_chain: TableChain,
+    /// The snapshot table's chain on disk (F20); the records are the
+    /// snapshots' own.
+    snap_chain: TableChain,
+    /// The table folds the CP being prepared attempted, and whether each
+    /// was the policy's (and may be put off when it does not fit): read
+    /// when the attempt fails for space.
+    table_folds_tried: Vec<(TableKind, bool)>,
+    /// The slot the last committed CP wrote (its `A` copy): what a
+    /// verification compares the ring with.
+    last_slot: Option<Box<SuperblockSlot>>,
+    /// The regions the last commit's release freed: still counted in the
+    /// live bytes that commit's segment table recorded.
+    last_released: Vec<RootRef>,
+    /// The pool verification in progress or the last one finished
+    /// ([`crate::verify`]).
+    verify: Option<Box<VerifyJob>>,
     /// Free segments front-door writes leave alone.
     reserve: u32,
     /// A clean was requested; the next CP compacts whatever qualifies.
@@ -1888,8 +1977,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             table_regions,
             torn,
             catalog,
-            catalog_ref,
+            mut catalog_chain,
             catalog_damage,
+            mut snap_chain,
+            snapshot_table_damage,
             ..
         } = state;
         let torn: Vec<(u64, String)> = torn
@@ -2058,21 +2149,34 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         }
         // The catalogue: a name for a volume the table has, a name for a
         // snapshot the table has; anything else is noise a crash cannot
-        // have left (names travel with their objects) and is reported.
+        // have left (names travel with their objects) and is reported. A
+        // damaged or adjusted table is folded by the first commit, which
+        // writes it as the engine holds it (F21).
         if let Some(reason) = &catalog_damage {
             let warning = OperatorWarning::CatalogDamaged {
                 reason: reason.clone(),
             };
             events.push(Event::OperatorWarning(warning.clone()));
             warnings.push(warning);
+            catalog_chain.repair = true;
         }
+        if let Some(reason) = &snapshot_table_damage {
+            let warning = OperatorWarning::SnapshotTableDamaged {
+                reason: reason.clone(),
+            };
+            events.push(Event::OperatorWarning(warning.clone()));
+            warnings.push(warning);
+            snap_chain.repair = true;
+        }
+        let snapshot_keys: HashSet<(u32, Uuid)> = snapshots
+            .iter()
+            .map(|s| (s.record.vol, s.record.snap_uuid))
+            .collect();
         let mut catalog_kept = Vec::new();
         for rec in catalog {
             let keep = match rec.catalog_kind() {
                 Some(CatalogKind::Volume) => vols.get(rec.vol as usize).is_some_and(|v| v.present),
-                Some(CatalogKind::Snapshot) => snapshots
-                    .iter()
-                    .any(|s| s.record.snap_uuid == rec.snap_uuid && s.record.vol == rec.vol),
+                Some(CatalogKind::Snapshot) => snapshot_keys.contains(&(rec.vol, rec.snap_uuid)),
                 None => false,
             };
             if keep {
@@ -2081,6 +2185,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 }
                 catalog_kept.push(rec);
             } else {
+                catalog_chain.repair = true;
                 events.push(Event::Internal {
                     what: format!(
                         "the catalogue names {:?} for volume {} which the table lacks; dropped",
@@ -2100,8 +2205,18 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 |BootSnapshot {
                      record,
                      pinned,
-                     damage,
+                     mut damage,
                  }| {
+                    // A record recovered from a damaged table, now or at an
+                    // earlier boot (the bit is persisted), is quarantined:
+                    // its last change may have been lost (F21).
+                    if damage.is_none() && record.is_uncertain() {
+                        damage = Some(
+                            "its record was recovered from a damaged snapshot table; its last \
+                             change may have been lost"
+                                .to_string(),
+                        );
+                    }
                     if let Some(reason) = &damage {
                         let warning = OperatorWarning::SnapshotDamaged {
                             snap_id: record.snap_id,
@@ -2156,7 +2271,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             snap_deletes: Vec::new(),
             pin_changes: Vec::new(),
             catalog: catalog_kept,
-            catalog_ref,
+            catalog_chain,
+            snap_chain,
+            table_folds_tried: Vec::new(),
+            last_slot: None,
+            last_released: Vec::new(),
+            verify: None,
             reserve,
             clean_requested: false,
             cleaner_skip: HashSet::new(),
@@ -2251,7 +2371,242 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         self.maybe_cut()?;
         self.maybe_start_cp()?;
         self.maybe_pump()?;
+        self.tick_verify();
         Ok(())
+    }
+
+    /// Starts a pool verification ([`crate::verify`]): it attests the pool
+    /// as the committed CP left it, advanced by every tick in slices that
+    /// `opts` bounds, while the devices keep being served. A verification
+    /// already running is answered with its report (the options of the
+    /// first stand). Refused while the engine is not serving.
+    ///
+    /// # Errors
+    /// [`EngineError::NotServing`].
+    pub fn start_verify(&mut self, opts: VerifyOptions) -> Result<VerifyReport, EngineError> {
+        if !self.serving || self.stopped {
+            return Err(EngineError::NotServing);
+        }
+        if let Some(job) = self.verify.as_ref().filter(|j| j.is_running()) {
+            return Ok(job.report());
+        }
+        self.verify = Some(Box::new(VerifyJob::new(opts)));
+        self.tick_verify();
+        self.verify
+            .as_ref()
+            .map(|j| j.report())
+            .ok_or_else(|| EngineError::Internal("the verification vanished".into()))
+    }
+
+    /// The verification in progress, or the last one, if any.
+    #[must_use]
+    pub fn verify_report(&self) -> Option<VerifyReport> {
+        self.verify.as_ref().map(|j| j.report())
+    }
+
+    /// `true` while a verification runs.
+    #[must_use]
+    pub fn verify_running(&self) -> bool {
+        self.verify.as_ref().is_some_and(|j| j.is_running())
+    }
+
+    /// Cancels the verification in progress; returns its report, or `None`
+    /// when none runs. The frees it held are released.
+    pub fn cancel_verify(&mut self) -> Option<VerifyReport> {
+        let job = self.verify.as_mut().filter(|j| j.is_running())?;
+        job.stop(
+            VerifyState::Cancelled,
+            "cancelled by the operator".to_string(),
+        );
+        self.finish_verify();
+        self.verify_report()
+    }
+
+    /// A fault injection for tests and support bundles: moves the live
+    /// block count the engine keeps for data segment `pseg` by `delta`, so
+    /// the next consistency point records a wrong `live_bytes` in the
+    /// segment table. A pool verification must report it.
+    pub fn skew_live_blocks(&mut self, pseg: u64, delta: i64) {
+        let live = self.data_live.entry(pseg).or_insert(0);
+        *live = live.saturating_add_signed(delta);
+    }
+
+    /// Advances the verification by one slice: captures its view once no
+    /// superblock write is in flight, aborts it when the pool needs the
+    /// space it holds or is shutting down, and ends it.
+    fn tick_verify(&mut self) {
+        let Some(mut job) = self.verify.take() else {
+            return;
+        };
+        if !job.is_running() {
+            self.verify = Some(job);
+            return;
+        }
+        let abort = if self.shutdown_requested || self.stopped {
+            Some("the pool is shutting down".to_string())
+        } else if self.pool_full {
+            Some("the pool is full and the verification holds deferred frees".to_string())
+        } else if self.pool_tight() && self.verify_holds_something(&job) {
+            Some(format!(
+                "the pool is tight ({} free segments, a reserve of {}) and the verification \
+                 held deferred frees",
+                self.segments.free_count(),
+                self.reserve
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = abort {
+            job.stop(VerifyState::Aborted, reason);
+            self.verify = Some(job);
+            self.finish_verify();
+            return;
+        }
+        if job.needs_view() {
+            // The ring is read when no slot write is in flight, so the pair
+            // of the committed CP is whole and the other pair is its
+            // predecessor.
+            if matches!(self.state, State::CommitA { .. } | State::CommitB { .. }) {
+                self.verify = Some(job);
+                return;
+            }
+            let Some(view) = self.capture_view() else {
+                job.stop(
+                    VerifyState::Aborted,
+                    "no commit of this engine to attest yet".to_string(),
+                );
+                self.verify = Some(job);
+                self.finish_verify();
+                return;
+            };
+            match boot::read_ring(&mut self.backstore, &self.layout) {
+                Ok(ring) => job.begin(view, &ring, &self.layout),
+                Err(e) => {
+                    job.stop(
+                        VerifyState::Aborted,
+                        format!("the superblock ring cannot be read: {e}"),
+                    );
+                    self.verify = Some(job);
+                    self.finish_verify();
+                    return;
+                }
+            }
+            self.verify = Some(job);
+            return;
+        }
+        let finished = {
+            let clock = &self.clock;
+            let now = || clock.mono_ns();
+            job.step(&mut self.backstore, &self.layout, &now)
+        };
+        self.verify = Some(job);
+        if finished {
+            self.finish_verify();
+        }
+    }
+
+    /// `true` when `job` holds a free a later CP made: a region or a data
+    /// segment it keeps from reuse right now (a tight pool then wants it).
+    fn verify_holds_something(&self, job: &VerifyJob) -> bool {
+        job.holds_frees_after().is_some_and(|n| {
+            self.freed_pending.iter().any(|(cp, _)| *cp > n)
+                || self.dead_data_pending.iter().any(|(cp, _)| *cp > n)
+        })
+    }
+
+    /// The pool as the committed CP left it, for a verification.
+    fn capture_view(&self) -> Option<View> {
+        let slot = **self.last_slot.as_ref()?;
+        if slot.sb.cp_seq != self.cp_seq {
+            return None;
+        }
+        Some(View {
+            agg_id: self.cfg.agg_id,
+            cp_seq: self.cp_seq,
+            cp_nonce: self.cp_nonce,
+            slot,
+            vols: self
+                .map
+                .volumes()
+                .map(|(vol, m)| LiveVolume {
+                    vol,
+                    root: *m.root(),
+                    index: m.index().to_vec(),
+                    overlay: m.overlay().collect(),
+                })
+                .collect(),
+            snaps: self
+                .snapshots
+                .iter()
+                .map(|s| SnapshotView {
+                    record: s.record,
+                    pinned: s.pinned.clone(),
+                    damage: s.damage.clone(),
+                })
+                .collect(),
+            delta_roots: self.map.delta_roots().to_vec(),
+            fold_cp: self.map.fold_cp(),
+            snap_chain: self.snap_chain.clone(),
+            catalog_chain: self.catalog_chain.clone(),
+            snap_records: self.snapshot_records(),
+            catalog: self.catalog.clone(),
+            pending: self
+                .freed_pending
+                .iter()
+                .flat_map(|(_, regions)| regions.iter().copied())
+                .chain(self.last_released.iter().copied())
+                .collect(),
+        })
+    }
+
+    /// A verification ended: the repairs it asked for, the pool status
+    /// warning, the event, and the frees it held.
+    fn finish_verify(&mut self) {
+        let Some(job) = self.verify.as_mut() else {
+            return;
+        };
+        let (snapshots, catalog) = job.take_repairs();
+        let report = job.report();
+        if snapshots {
+            self.snap_chain.repair = true;
+        }
+        if catalog {
+            self.catalog_chain.repair = true;
+        }
+        if snapshots || catalog {
+            self.request_cp();
+        }
+        self.warnings
+            .retain(|w| !matches!(w, OperatorWarning::AttestationFindings { .. }));
+        if report.state == VerifyState::Done && report.errors + report.warnings > 0 {
+            let first = report
+                .findings
+                .first()
+                .map(|f| format!("{}: {}", f.kind.as_str(), f.detail))
+                .unwrap_or_default();
+            let warning = OperatorWarning::AttestationFindings {
+                cp_seq: report.cp_seq,
+                errors: report.errors,
+                warnings: report.warnings,
+                first,
+            };
+            self.events.push(Event::OperatorWarning(warning.clone()));
+            self.warnings.push(warning);
+        }
+        self.events.push(Event::VerifyFinished {
+            cp_seq: report.cp_seq,
+            state: report.state,
+            verdict: report.verdict.unwrap_or(Verdict::Incomplete),
+            errors: report.errors,
+            warnings: report.warnings,
+        });
+        // The holds end. A CP past its metadata preparation took its copy
+        // of the counts before this, and its commit releases what is due;
+        // otherwise it is released now.
+        if matches!(self.state, State::Idle | State::Staging(_)) {
+            let cp = self.cp_seq;
+            self.release_freed(cp, false);
+        }
     }
 
     /// Asks for a consistency point at the next tick (even an empty one);
@@ -2622,13 +2977,14 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         Ok(())
     }
 
-    /// The pin flags of `snap_id` once the pending changes land.
+    /// The pin flags of `snap_id` once the pending changes land (the
+    /// `PIN_*` bits only; [`SNAP_UNCERTAIN`] is not a pin).
     fn effective_pins(&self, snap_id: u64, committed: u8) -> u8 {
         self.pin_changes
             .iter()
             .rev()
             .find(|(id, _)| *id == snap_id)
-            .map_or(committed, |(_, f)| *f)
+            .map_or(committed & PIN_MASK, |(_, f)| *f)
     }
 
     /// Sets the `PIN_*` flags of `snap_id`, durable with the next
@@ -2918,14 +3274,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             .snapshots
             .iter()
             .find(|s| s.record.snap_id == snap_id)?;
+        // The catalogue is kept in its canonical (key) order.
+        let key = otap_format::snapshot_name_key(snap.record.vol, snap.record.snap_uuid);
         self.catalog
-            .iter()
-            .find(|c| {
-                c.catalog_kind() == Some(CatalogKind::Snapshot)
-                    && c.vol == snap.record.vol
-                    && c.snap_uuid == snap.record.snap_uuid
-            })
-            .map(CatalogRec::name)
+            .binary_search_by_key(&key, CatalogRec::sort_key)
+            .ok()
+            .map(|i| self.catalog[i].name())
     }
 
     /// The snapshot of `vol` named `name`, if any.
@@ -3079,7 +3433,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 origin: s.record.snap_origin().unwrap_or(SnapOrigin::User),
                 created_wall_ns: s.record.created_wall_ns,
                 damaged: s.damage.is_some(),
-                flags: s.record.flags,
+                flags: s.record.pins(),
                 name: self.snapshot_name(s.record.snap_id).map(str::to_string),
                 deleting: self.snap_deletes.contains(&s.record.snap_id),
             })
@@ -3235,9 +3589,54 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             serving: self.serving,
             volumes: self.vols.iter().filter(|v| v.present).count(),
             catalog_entries: self.catalog.len(),
+            snapshot_table_deltas: self.snap_chain.deltas.len(),
+            catalog_deltas: self.catalog_chain.deltas.len(),
             cleaned_segments: self.stats.cleaned,
             relocated_blocks: self.stats.relocated,
+            verify: self.verify.as_ref().map(|v| v.summary()),
         }
+    }
+
+    /// The committed catalogue, in canonical order: what the catalogue's
+    /// chain on disk replays to.
+    #[must_use]
+    pub fn catalog_records(&self) -> &[CatalogRec] {
+        &self.catalog
+    }
+
+    /// The committed snapshot records, in id order: what the snapshot
+    /// table's chain on disk replays to.
+    #[must_use]
+    pub fn snapshot_records(&self) -> Vec<SnapRecord> {
+        self.snapshots.iter().map(|s| s.record).collect()
+    }
+
+    /// The chains of the snapshot table and the catalogue as the committed
+    /// CP left them (F20).
+    #[must_use]
+    pub fn table_chains(&self) -> (&TableChain, &TableChain) {
+        (&self.snap_chain, &self.catalog_chain)
+    }
+
+    /// The tables the consistency point in flight will commit, once its
+    /// metadata is laid out: `(cp_seq, catalogue, snapshot records)`.
+    /// `None` while no CP is past its staging. What a checker compares a
+    /// boot with when the crash fell between the metadata and the commit
+    /// (the slot may or may not have landed).
+    #[must_use]
+    pub fn in_flight_tables(&self) -> Option<(u64, Vec<CatalogRec>, Vec<SnapRecord>)> {
+        let prep = match &self.state {
+            State::Meta(mw) => &mw.prep,
+            State::Flush { prep, .. }
+            | State::CommitA { prep, .. }
+            | State::CommitB { prep, .. } => prep.as_ref(),
+            State::Idle | State::Staging(_) => return None,
+        };
+        Some((
+            prep.job.cp_seq,
+            prep.catalog.clone(),
+            prep.snap_records.clone(),
+        ))
     }
 
     /// Segments in use over segments.
@@ -4633,7 +5032,28 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                             if job.folds() {
                                 self.fold_blocked_at = Some(self.free_segments());
                             }
-                            Ok(self.fail_cp(&job, "no free segment".into(), !shutdown_fold))
+                            // A table fold the policy asked for is put off
+                            // like the map's (F20), and a CP that is no
+                            // map fold is retried at once without it: a
+                            // policy choice does not make the pool full.
+                            let free = self.free_segments();
+                            let mut table_fold_put_off = false;
+                            for (table, droppable) in std::mem::take(&mut self.table_folds_tried) {
+                                if droppable {
+                                    table_fold_put_off = true;
+                                    let chain = match table {
+                                        TableKind::Snapshots => &mut self.snap_chain,
+                                        TableKind::Catalog => &mut self.catalog_chain,
+                                    };
+                                    chain.fold_blocked_at = Some(free);
+                                }
+                            }
+                            let no_space = if job.folds() {
+                                !shutdown_fold
+                            } else {
+                                !table_fold_put_off
+                            };
+                            Ok(self.fail_cp(&job, "no free segment".into(), no_space))
                         }
                         // A fold had to rewrite a map page that does not
                         // verify: folds stop until the volume is repaired;
@@ -5131,11 +5551,26 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 .min_by_key(|s| s.birth());
             // A damaged newer neighbour (its root cannot be walked) may
             // still name any of these blocks: nothing is released, the
-            // safe direction, and the drift is recorded.
-            let newer_damaged = newer_state.is_some_and(|s| s.pinned.is_none());
+            // safe direction, and the drift is recorded. So does an
+            // uncertain one (F21): the tree it holds may not be its last.
+            let newer_damaged =
+                newer_state.is_some_and(|s| s.pinned.is_none() || s.record.is_uncertain());
             let newer_id = newer_state.map(|s| s.record.snap_id);
             let newer = newer_state.and_then(|s| s.pinned.clone());
-            let walk = if snap.pinned.is_some() && newer_damaged {
+            // An uncertain snapshot (F21) may be one whose deletion or
+            // relocation was lost with a damaged table: its blocks and
+            // pages may already be released and reused, so its deletion
+            // releases and frees nothing (a leak, the safe direction).
+            let uncertain = snap.record.is_uncertain();
+            let walk = if uncertain {
+                self.events.push(Event::Internal {
+                    what: format!(
+                        "snapshot {snap_id} is deleted uncertain (recovered from a damaged \
+                         snapshot table): its blocks and pages stay counted"
+                    ),
+                });
+                DeletionWalk::default()
+            } else if snap.pinned.is_some() && newer_damaged {
                 self.events.push(Event::Internal {
                     what: format!(
                         "snapshot {snap_id} is deleted next to a damaged newer snapshot: its \
@@ -5191,8 +5626,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             }
             let released = walk.released.len() as u64;
             released_blocks.extend(walk.released);
-            freed_other.push(RootRef::new(snap.record.map_root_pba, 1, 0));
-            if let Some(pinned) = &snap.pinned {
+            // Only what the engine counts is freed: the root page, the
+            // index and the pages of a snapshot whose root loaded (a boot
+            // counts them as live; a damaged root's never were, and freeing
+            // them would take bytes from another region's count).
+            if let Some(pinned) = snap.pinned.as_ref().filter(|_| !uncertain) {
+                freed_other.push(RootRef::new(snap.record.map_root_pba, 1, 0));
                 for (page_no, entry) in pinned.index.iter().enumerate() {
                     if !entry.is_none() {
                         freed_candidates.push((
@@ -5203,7 +5642,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                     }
                 }
                 freed_indexes.push((vol, otap_map::index_root_ref(&pinned.root)));
-            } else {
+            } else if !uncertain {
                 self.events.push(Event::Internal {
                     what: format!(
                         "snapshot {snap_id} is deleted damaged: its blocks and pages stay counted"
@@ -5297,6 +5736,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                         RootRef::NONE,
                     )?;
                     let page_ref = stream.place_region(page.as_bytes())?;
+                    // Listed with the CP's pages (F21), so a boot verifies
+                    // it as this commit's own: lost, it tears the commit
+                    // rather than reading as a damaged snapshot.
+                    extra_pages.push(page_ref);
                     let old_root_page = RootRef::new(record.map_root_pba, 1, 0);
                     record.map_root_pba = page_ref.pba;
                     record.seal();
@@ -5321,11 +5764,12 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             }
         }
 
-        // Pins: the changes waiting become the records' flags.
+        // Pins: the changes waiting become the records' flags (an
+        // uncertain record keeps its mark, F21).
         let mut pins: Vec<(u64, u8)> = Vec::new();
         for (snap_id, flags) in &self.pin_changes {
             if let Some(s) = remaining.iter_mut().find(|s| s.record.snap_id == *snap_id) {
-                s.record.flags = *flags;
+                s.record.flags = (s.record.flags & SNAP_UNCERTAIN) | *flags;
                 s.record.seal();
                 pins.push((*snap_id, *flags));
             }
@@ -5374,68 +5818,141 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             .chain(new_snapshots.iter())
             .cloned()
             .collect();
-        let mut records: Vec<SnapRecord> = after.iter().map(|s| s.record).collect();
-        records.sort_by_key(|r| r.snap_id);
-        let snap_table = if records.is_empty() {
-            RootRef::NONE
-        } else {
-            stream.place_region(&snap_table_image(&records)?)?
-        };
+        let mut snap_records: Vec<SnapRecord> = after.iter().map(|s| s.record).collect();
+        snap_records.sort_by_key(|r| r.snap_id);
 
-        // The catalogue (F16): the names of the volumes present after this
-        // CP and of the snapshots after it. Written only when it changed;
-        // otherwise the committed region is carried forward.
-        let mut catalog: Vec<CatalogRec> = Vec::new();
-        for (i, v) in self.vols.iter().enumerate() {
-            let vol = i as u32;
-            if !v.present || deletes.contains(&vol) {
-                continue;
-            }
-            if let Some(name) = &v.name {
-                let created = self
-                    .catalog
-                    .iter()
-                    .find(|c| c.catalog_kind() == Some(CatalogKind::Volume) && c.vol == vol)
-                    .map_or(wall, |c| c.created_wall_ns);
-                catalog.push(CatalogRec::volume(vol, name, created)?);
+        // The snapshot table (F19, F20): this CP's changes are its deletions
+        // (tombstones), its new snapshots, its pin changes and the cleaner's
+        // rewrites (whole records, as they stand after this CP).
+        let mut snap_changes: BTreeMap<u64, SnapRecord> = BTreeMap::new();
+        for (snap_id, _, _) in &deleted_snapshots {
+            if let Some(s) = self.snapshots.iter().find(|s| s.record.snap_id == *snap_id) {
+                snap_changes.insert(
+                    *snap_id,
+                    SnapRecord::tombstone(*snap_id, s.record.snap_uuid, s.record.vol)?,
+                );
             }
         }
-        for s in &after {
-            let existing = self.catalog.iter().find(|c| {
-                c.catalog_kind() == Some(CatalogKind::Snapshot)
-                    && c.vol == s.record.vol
-                    && c.snap_uuid == s.record.snap_uuid
-            });
-            let fresh = job
-                .snaps
-                .iter()
-                .find(|r| r.uuid == s.record.snap_uuid)
-                .and_then(|r| r.name.as_deref());
-            match (existing, fresh) {
-                (Some(c), _) => catalog.push(*c),
-                (None, Some(name)) => catalog.push(CatalogRec::snapshot(
-                    s.record.vol,
-                    s.record.snap_uuid,
+        let changed_ids: Vec<u64> = new_snapshots
+            .iter()
+            .map(|s| s.record.snap_id)
+            .chain(pins.iter().map(|(id, _)| *id))
+            .chain(rewritten.iter().map(|rw| rw.snap_id))
+            .collect();
+        for id in changed_ids {
+            if let Ok(i) = snap_records.binary_search_by_key(&id, |r| r.snap_id) {
+                snap_changes.insert(id, snap_records[i]);
+            }
+        }
+        let snap_changes: Vec<SnapRecord> = snap_changes.into_values().collect();
+
+        // The catalogue (F16, F19): the names of the volumes present after
+        // this CP and of the snapshots after it, derived from the committed
+        // catalogue; this CP's changes are what differs.
+        let mut names: BTreeMap<(u8, u32, [u8; 16]), CatalogRec> =
+            self.catalog.iter().map(|c| (c.sort_key(), *c)).collect();
+        let mut name_changes: BTreeMap<(u8, u32, [u8; 16]), CatalogRec> = BTreeMap::new();
+        for (i, v) in self.vols.iter().enumerate() {
+            let vol = i as u32;
+            let key = (CatalogKind::Volume.as_u8(), vol, *Uuid::NIL.as_array());
+            let existing = names.get(&key).copied();
+            let wanted = match (&v.name, v.present && !deletes.contains(&vol)) {
+                (Some(name), true) => Some(CatalogRec::volume(
+                    vol,
                     name,
-                    wall,
+                    existing.map_or(wall, |c| c.created_wall_ns),
                 )?),
+                _ => None,
+            };
+            match (existing, wanted) {
+                (Some(old), Some(new)) if old == new => {}
+                (_, Some(new)) => {
+                    names.insert(key, new);
+                    name_changes.insert(key, new);
+                }
+                (Some(old), None) => {
+                    names.remove(&key);
+                    name_changes.insert(key, old.tombstone_of()?);
+                }
                 (None, None) => {}
             }
         }
-        catalog.sort_by_key(CatalogRec::sort_key);
-        let catalog_ref = if catalog == self.catalog && !self.catalog_ref.is_none() {
-            self.catalog_ref
-        } else if catalog.is_empty() {
-            if !self.catalog_ref.is_none() {
-                freed_other.push(self.catalog_ref);
+        // Snapshot names change only with the snapshot set (a snapshot is
+        // named when it is taken and its name leaves with it); a repair
+        // checks them all.
+        if !deleted_snapshots.is_empty() || !new_snapshots.is_empty() || self.catalog_chain.repair {
+            let present: HashSet<(u32, Uuid)> = after
+                .iter()
+                .map(|s| (s.record.vol, s.record.snap_uuid))
+                .collect();
+            let gone: Vec<(u8, u32, [u8; 16])> = names
+                .iter()
+                .filter(|(_, c)| {
+                    c.catalog_kind() == Some(CatalogKind::Snapshot)
+                        && !present.contains(&(c.vol, c.snap_uuid))
+                })
+                .map(|(k, _)| *k)
+                .collect();
+            for key in gone {
+                if let Some(old) = names.remove(&key) {
+                    name_changes.insert(key, old.tombstone_of()?);
+                }
             }
-            RootRef::NONE
-        } else {
-            if !self.catalog_ref.is_none() {
-                freed_other.push(self.catalog_ref);
+            for s in &new_snapshots {
+                let Some(name) = job
+                    .snaps
+                    .iter()
+                    .find(|r| r.uuid == s.record.snap_uuid)
+                    .and_then(|r| r.name.as_deref())
+                else {
+                    continue;
+                };
+                let rec = CatalogRec::snapshot(s.record.vol, s.record.snap_uuid, name, wall)?;
+                names.insert(rec.sort_key(), rec);
+                name_changes.insert(rec.sort_key(), rec);
             }
-            stream.place_region(&catalog_image(&catalog)?)?
-        };
+        }
+        let catalog: Vec<CatalogRec> = names.into_values().collect();
+        let name_changes: Vec<CatalogRec> = name_changes.into_values().collect();
+
+        // Each table writes its changes as a delta region and a new head,
+        // or folds, or carries its head forward (F20).
+        // A pool with a name or a snapshot keeps the snapshot table's head
+        // (empty or not), so a format 2.3 reader always meets it and
+        // refuses the pool (F20); a pool with neither writes no table, as
+        // 2.3 did.
+        self.table_folds_tried.clear();
+        let free_now = self.segments.free_count();
+        let snap_chain = table_step(
+            &TableStep {
+                agg_id: self.cfg.agg_id,
+                policy: self.cfg.table_fold,
+                job,
+                free: free_now,
+            },
+            &mut stream,
+            &self.snap_chain,
+            !snap_records.is_empty() || !catalog.is_empty(),
+            &snap_changes,
+            &snap_records,
+            &mut freed_other,
+            &mut self.table_folds_tried,
+        )?;
+        let catalog_chain = table_step(
+            &TableStep {
+                agg_id: self.cfg.agg_id,
+                policy: self.cfg.table_fold,
+                job,
+                free: free_now,
+            },
+            &mut stream,
+            &self.catalog_chain,
+            !catalog.is_empty(),
+            &name_changes,
+            &catalog,
+            &mut freed_other,
+            &mut self.table_folds_tried,
+        )?;
 
         // The stripe list (F17): every data stripe this CP wrote.
         let cp_stripes = if written.is_empty() {
@@ -5599,7 +6116,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         }
         freed.sort_by_key(|r| (r.pba, r.pages));
         freed.dedup_by_key(|r| r.pba);
-        let table_regions = vec![map_roots, cp_log_head, snap_table, cp_stripes, seg_table]
+        let table_regions = vec![map_roots, cp_log_head, cp_stripes, seg_table]
             .into_iter()
             .filter(|r| !r.is_none())
             .collect();
@@ -5636,9 +6153,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             map_roots,
             seg_table,
             cp_log_head,
-            snap_table,
+            snap_chain,
+            snap_records,
             catalog,
-            catalog_ref,
+            catalog_chain,
             cp_stripes,
             new_snapshots,
             deleted_snapshots,
@@ -5889,8 +6407,10 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         sb.seg_table = prep.seg_table;
         sb.cp_log_head = prep.cp_log_head;
         sb.map_roots = prep.map_roots;
-        sb.snap_table = prep.snap_table;
-        sb.catalog = prep.catalog_ref;
+        sb.snap_table = prep.snap_chain.head;
+        sb.snap_head_cp = prep.snap_chain.head_cp;
+        sb.catalog = prep.catalog_chain.head;
+        sb.catalog_head_cp = prep.catalog_chain.head_cp;
         sb.cp_stripes = prep.cp_stripes;
         if let Some(open) = self.open_data {
             sb.open_data_pseg = open.pseg;
@@ -6000,7 +6520,8 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             freed,
             table_regions,
             catalog,
-            catalog_ref,
+            catalog_chain,
+            snap_chain,
             new_snapshots,
             deleted_snapshots,
             pins,
@@ -6008,6 +6529,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
             vol_ops,
             fold,
             fold_pages,
+            slot,
             ..
         } = prep;
         let gen = job.gen.clone();
@@ -6016,7 +6538,9 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         self.map.apply(map_update);
         self.segments = segments;
         self.catalog = catalog;
-        self.catalog_ref = catalog_ref;
+        self.catalog_chain = catalog_chain;
+        self.snap_chain = snap_chain;
+        self.last_slot = slot.map(Box::new);
         // Snapshots: the deleted leave, the rewritten take their new roots,
         // the pins land. The cleaner's skip list is about the snapshot set,
         // which changed if any of these happened.
@@ -6054,7 +6578,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
                 .iter_mut()
                 .find(|s| s.record.snap_id == *snap_id)
             {
-                s.record.flags = *flags;
+                s.record.flags = (s.record.flags & SNAP_UNCERTAIN) | *flags;
                 s.record.seal();
             }
             self.pin_changes
@@ -6250,7 +6774,7 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
         }
         self.pool_full = false;
         self.freed_pending.push_back((job.cp_seq, freed));
-        self.release_freed(job.cp_seq);
+        self.release_freed(job.cp_seq, true);
         self.stats.cps += 1;
         self.last_commit_ns = self.clock.mono_ns();
         self.events.push(Event::CpCommitted {
@@ -6285,29 +6809,41 @@ impl<B: Backstore, F: FrontDoor, C: Clock> Engine<B, F, C> {
     /// dead once `N + 1` committed (one CP later still on a flush-opaque
     /// backstore, C07). A metadata segment with nothing live left, not open
     /// and not protected since the boot, is freed and, when the policy says
-    /// so, discarded (D9).
-    fn release_freed(&mut self, cp_seq: u64) {
+    /// so, discarded (D9). `from_commit` marks the release a commit makes:
+    /// what it releases is what that commit's segment table still counted
+    /// (a verification's view needs it); a release outside a commit (the
+    /// end of a verification's holds) adds to that record.
+    fn release_freed(&mut self, cp_seq: u64, from_commit: bool) {
         let keep = if self.backstore.profile().trusts_opaque_barrier() {
             2
         } else {
             1
         };
         self.boot_protect.retain(|(cp, _)| cp + keep + 1 > cp_seq);
+        // A verification in progress attests the pool as CP `held`
+        // committed it: what a later CP stopped referencing stays where it
+        // is until the verification ends, so the view it walks is intact.
+        let held = self.verify.as_ref().and_then(|v| v.holds_frees_after());
+        let keeps = |cp: u64| cp + keep > cp_seq || held.is_some_and(|n| cp > n);
         // Data segments dead long enough that no rewind reaches a CP that
         // named their blocks.
         let mut dead_now = Vec::new();
         while let Some((cp, _)) = self.dead_data_pending.front() {
-            if cp + keep > cp_seq {
+            if keeps(*cp) {
                 break;
             }
             let (_, segs) = self.dead_data_pending.pop_front().expect("front exists");
             dead_now.extend(segs);
         }
+        if from_commit {
+            self.last_released.clear();
+        }
         while let Some((cp, _)) = self.freed_pending.front() {
-            if cp + keep > cp_seq {
+            if keeps(*cp) {
                 break;
             }
             let (_, regions) = self.freed_pending.pop_front().expect("front exists");
+            self.last_released.extend(regions.iter().copied());
             for region in regions {
                 for (pseg, bytes) in self.layout.segments_of_region(region.pba, region.pages) {
                     match self.meta_live.get_mut(&pseg) {
@@ -6486,6 +7022,113 @@ fn pinned_by(snaps: &[SnapState], vol: u32, birth_cp: u32) -> bool {
     snaps
         .iter()
         .any(|s| s.record.vol == vol && s.record.birth_cp >= birth_cp)
+}
+
+/// What one table's step in a CP's metadata needs from the engine.
+struct TableStep<'a> {
+    agg_id: Uuid,
+    policy: TableFoldPolicy,
+    job: &'a CpJob,
+    /// Free segments in the committed segment table (what a put-off fold
+    /// waits to see grow).
+    free: u32,
+}
+
+/// Lays out one table's part of a CP (F20). A table the pool does not need
+/// (`wanted` false: no record, and for the snapshot table no name either)
+/// has no head: an existing chain is dropped whole. Otherwise: nothing when
+/// the table did not change (its head is carried forward); else a fold (a
+/// base of `full`, the table as it stands after the CP, and an empty chain)
+/// when the table has no head yet, the chain is full, the table needs its
+/// repair, or the policy asks and the fold fits; else a delta region of
+/// `changes` (keys ascending) appended to the chain. Either way a new head.
+/// The regions the CP stops referencing go to `freed` (the old head; on a
+/// fold the old base and deltas too), and a fold is recorded in `tried`
+/// with whether the policy alone asked for it.
+#[allow(clippy::too_many_arguments)]
+fn table_step<R: TableRecord>(
+    step: &TableStep<'_>,
+    stream: &mut MetaStream<'_>,
+    chain: &TableChain,
+    wanted: bool,
+    changes: &[R],
+    full: &[R],
+    freed: &mut Vec<RootRef>,
+    tried: &mut Vec<(TableKind, bool)>,
+) -> Result<TableChain, EngineError> {
+    let job = step.job;
+    let plan = plan_table(
+        chain,
+        &TablePlanInput {
+            wanted,
+            changes: changes.len() as u64,
+            records: full.len() as u64,
+            record_size: R::SIZE,
+            free: step.free,
+        },
+        &step.policy,
+        |pages| stream.can_place(pages),
+    );
+    let (fold, droppable, blocked_at) = match plan {
+        TablePlan::Carry if chain.head.is_none() => return Ok(TableChain::default()),
+        TablePlan::Carry => return Ok(chain.clone()),
+        TablePlan::Drop => {
+            // An empty table names nothing (as in format 2.3): its regions go.
+            freed.extend(chain.regions());
+            return Ok(TableChain::default());
+        }
+        TablePlan::Fold { policy } => (true, policy, None),
+        TablePlan::Delta { put_off: true } => (false, false, Some(step.free)),
+        TablePlan::Delta { put_off: false } => (
+            false,
+            false,
+            chain.fold_blocked_at.filter(|at| step.free <= *at),
+        ),
+    };
+    let mut next = TableChain {
+        head: RootRef::NONE,
+        head_cp: job.cp_seq,
+        base: chain.base,
+        deltas: chain.deltas.clone(),
+        repair: false,
+        fold_blocked_at: blocked_at,
+    };
+    if fold {
+        tried.push((R::TABLE, droppable));
+        let region = if full.is_empty() {
+            RootRef::NONE
+        } else {
+            stream.place_region(&R::base_image(full)?)?
+        };
+        let records = u32::try_from(full.len())
+            .map_err(|_| EngineError::Internal(format!("a table of {} records", full.len())))?;
+        next.base = TableChainEntry::new(region, job.cp_seq, records);
+        next.deltas.clear();
+        freed.extend(chain.regions());
+    } else {
+        let region = stream.place_region(&table_delta_image(
+            step.agg_id,
+            job.cp_seq,
+            job.nonce,
+            changes,
+        )?)?;
+        let records = u32::try_from(changes.len()).map_err(|_| {
+            EngineError::Internal(format!("a table delta of {} records", changes.len()))
+        })?;
+        next.deltas
+            .push(TableChainEntry::new(region, job.cp_seq, records));
+        if !chain.head.is_none() {
+            freed.push(chain.head);
+        }
+    }
+    let head = TableHead {
+        table: R::TABLE,
+        cp_seq: job.cp_seq,
+        base: next.base,
+        deltas: next.deltas.clone(),
+    };
+    next.head = stream.place_region(head.page(step.agg_id)?.as_bytes())?;
+    Ok(next)
 }
 
 /// The `(target, block)` position of flat index `i` over a CP's clean

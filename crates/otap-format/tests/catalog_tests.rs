@@ -47,8 +47,9 @@ fn catalog_and_stripe_list_layouts() {
     assert_eq!(offset_of!(CpStripe, kind), 12);
     assert_eq!(offset_of!(CpStripe, rsvd), 13);
     assert_eq!(VOL_OFFLINE, 2);
-    assert_eq!(SUPERBLOCK_RESERVED, 2332);
-    assert_eq!(FORMAT_VERSION, 0x0203);
+    // Format 2.4 took 16 reserved bytes for the table heads' CPs.
+    assert_eq!(SUPERBLOCK_RESERVED, 2316);
+    assert_eq!(FORMAT_VERSION, 0x0204);
 }
 
 // ---------------------------------------------------------------------------

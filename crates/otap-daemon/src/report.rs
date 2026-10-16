@@ -1,8 +1,64 @@
 //! The engine's state as the protocol reports it.
 
-use otap_control::{PoolReport, SnapshotReport, VolumeReport};
-use otap_cp::{Backstore, Clock, Engine, FrontDoor, SnapshotInfo, VolumeStatus};
+use otap_control::{
+    FindingSeverity, PoolReport, SnapshotReport, VerifyFinding, VerifyState as WireState,
+    VerifyVerdict, VolumeReport,
+};
+use otap_cp::{
+    Backstore, Clock, Engine, FrontDoor, Severity, SnapshotInfo, Verdict, VerifyReport,
+    VerifyState, VolumeStatus,
+};
 use otap_format::{SnapKind, SnapOrigin, BLOCK_SIZE};
+
+/// A pool verification's report as the protocol carries it (Step 6B).
+#[must_use]
+pub fn verify_report(r: &VerifyReport) -> otap_control::VerifyReport {
+    otap_control::VerifyReport {
+        state: match r.state {
+            VerifyState::Running => WireState::Running,
+            VerifyState::Done => WireState::Done,
+            VerifyState::Cancelled => WireState::Cancelled,
+            VerifyState::Aborted => WireState::Aborted,
+        },
+        verdict: r.verdict.map(|v| match v {
+            Verdict::Clean => VerifyVerdict::Clean,
+            Verdict::Warnings => VerifyVerdict::Warnings,
+            Verdict::Damaged => VerifyVerdict::Damaged,
+            Verdict::Incomplete => VerifyVerdict::Incomplete,
+        }),
+        cp_seq: r.cp_seq,
+        phase: r.phase.as_str().to_string(),
+        progress: r.progress,
+        superblock_slots: r.counts.superblock_slots,
+        regions: r.counts.regions,
+        map_pages: r.counts.map_pages,
+        blocks: r.counts.blocks,
+        holes: r.counts.holes,
+        stripes: r.counts.stripes,
+        segments: r.counts.segments,
+        bytes_read: r.counts.bytes_read,
+        errors: r.errors,
+        warnings: r.warnings,
+        findings: r
+            .findings
+            .iter()
+            .map(|f| VerifyFinding {
+                kind: f.kind.as_str().to_string(),
+                severity: match f.severity {
+                    Severity::Error => FindingSeverity::Error,
+                    Severity::Warning => FindingSeverity::Warning,
+                },
+                pba: f.pba,
+                segment: f.pseg,
+                volume_index: f.vol,
+                lba: f.lba,
+                snapshot: f.snap_id,
+                detail: f.detail.clone(),
+            })
+            .collect(),
+        reason: r.reason.clone(),
+    }
+}
 
 /// A volume report from the engine's view and the device path, if any.
 #[must_use]

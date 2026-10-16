@@ -10,7 +10,10 @@
 //!
 //! Exit status: 0 for a reply, 1 when the daemon refused (its message is
 //! on stderr, or in the JSON), 2 for a command line that does not parse,
-//! 3 when the daemon cannot be reached or the stream broke.
+//! 3 when the daemon cannot be reached or the stream broke, 4 when a
+//! `pool verify` that waited for its report (Step 6B) did not conclude
+//! clean. `pool verify` follows the verification job by asking for its
+//! status until it ends; the daemon never holds a request for it.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -20,9 +23,28 @@ pub mod args;
 pub mod render;
 
 use std::io::Write;
+use std::time::Duration;
 
 use otap_control::client::ClientError;
-use otap_control::{Client, ErrorCode, Request};
+use otap_control::{Client, ErrorCode, Request, Response, VerifyState, VerifyVerdict};
+
+/// How often `pool verify` asks for the verification's progress while it
+/// waits for the report.
+const VERIFY_POLL: Duration = Duration::from_millis(100);
+
+/// Follows a verification the daemon started until it ends: asks for its
+/// status every [`VERIFY_POLL`]; returns the final reply.
+fn follow_verify(client: &mut Client, first: Response) -> Result<Response, ClientError> {
+    let mut reply = first;
+    loop {
+        match &reply {
+            Response::Verify(report) if report.state == VerifyState::Running => {}
+            _ => return Ok(reply),
+        }
+        std::thread::sleep(VERIFY_POLL);
+        reply = client.call(&Request::PoolVerifyStatus {})?;
+    }
+}
 
 pub use args::{parse, Command, Parsed, USAGE};
 pub use render::{render, render_json};
@@ -80,7 +102,11 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return 3;
         }
     }
-    match client.call(&cmd.request) {
+    let reply = match client.call(&cmd.request) {
+        Ok(response) if cmd.wait_verify => follow_verify(&mut client, response),
+        other => other,
+    };
+    match reply {
         Ok(response) => {
             if cmd.json {
                 let _ = writeln!(out, "{}", render_json(&response));
@@ -88,7 +114,14 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 let _ = writeln!(err, "otapctl: {e}");
                 return 1;
             }
-            0
+            match &response {
+                Response::Verify(report)
+                    if cmd.wait_verify && report.verdict != Some(VerifyVerdict::Clean) =>
+                {
+                    4
+                }
+                _ => 0,
+            }
         }
         Err(ClientError::Daemon(e)) => {
             if cmd.json {

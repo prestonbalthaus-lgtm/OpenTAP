@@ -15,9 +15,13 @@
 //! # Snapshot catalogue
 //! The `snap_table` root points at an array of [`SnapRecord`]s. A record
 //! pins a volume's map root at a CP (`map_root_pba` is the page that holds
-//! the pinned [`MapRoot`]) and names its deadlist. Names are
-//! control-plane metadata keyed by `snap_uuid`; they are not on disk here.
-//! An all-zero record is an empty slot.
+//! the pinned [`MapRoot`]) and names its deadlist. Names are in the
+//! catalogue (F16), keyed by `snap_uuid`. An all-zero record is an empty
+//! slot. Since format 2.4 the root names a head page and the table is a
+//! base region plus delta regions ([`crate::tables`], F19 to F21): a delta
+//! carries whole records and [tombstones](SnapRecord::tombstone)
+//! ([`SNAP_TOMBSTONE`]), and a record recovered from a damaged table keeps
+//! [`SNAP_UNCERTAIN`].
 //!
 //! # CP log
 //! The CP log is the map's journal (section 1.3): every block written or
@@ -350,6 +354,20 @@ pub const PIN_REPLICATION: u8 = 1 << 2;
 pub const PIN_CLONE: u8 = 1 << 3;
 /// Every defined pin bit.
 pub const PIN_MASK: u8 = PIN_USER | PIN_SCHEDULE | PIN_REPLICATION | PIN_CLONE;
+/// `SnapRecord::flags` bit (format 2.4, F21): the record was recovered
+/// from a snapshot table whose delta chain did not verify, so the last
+/// change to the snapshot may have been lost (a pin, a relocation of its
+/// tree, even its deletion). The snapshot is quarantined: listed, never
+/// read, diffed or rolled back to, and its deletion releases nothing (its
+/// blocks and pages may already belong to others). The bit is persisted
+/// so the next boot keeps the quarantine.
+pub const SNAP_UNCERTAIN: u8 = 1 << 6;
+/// `SnapRecord::flags` bit (format 2.4, F19): in a delta region only, the
+/// record is a tombstone: the snapshot `snap_id` (with its uuid and volume)
+/// left the table. Every other field is zero. A base region refuses it.
+pub const SNAP_TOMBSTONE: u8 = 1 << 7;
+/// Every flag bit a snapshot record in a table base may carry.
+pub const SNAP_FLAGS_MASK: u8 = PIN_MASK | SNAP_UNCERTAIN;
 
 /// The 64-byte snapshot catalogue record.
 #[derive(
@@ -375,7 +393,8 @@ pub struct SnapRecord {
     pub kind: u8,
     /// A [`SnapOrigin`] byte.
     pub origin: u8,
-    /// The `PIN_*` bits.
+    /// The `PIN_*` bits; since format 2.4 also [`SNAP_UNCERTAIN`], and
+    /// [`SNAP_TOMBSTONE`] in a delta region.
     pub flags: u8,
     /// Reserved, zero.
     pub rsvd: u8,
@@ -429,9 +448,43 @@ impl SnapRecord {
         SnapOrigin::from_u8(self.origin)
     }
 
+    /// The `PIN_*` bits alone.
+    #[must_use]
+    pub const fn pins(&self) -> u8 {
+        self.flags & PIN_MASK
+    }
+
+    /// `true` for a record recovered from a damaged table
+    /// ([`SNAP_UNCERTAIN`], format 2.4).
+    #[must_use]
+    pub const fn is_uncertain(&self) -> bool {
+        self.flags & SNAP_UNCERTAIN != 0
+    }
+
+    /// `true` for a delta region's tombstone ([`SNAP_TOMBSTONE`]).
+    #[must_use]
+    pub const fn is_tombstone(&self) -> bool {
+        self.flags & SNAP_TOMBSTONE != 0
+    }
+
+    /// A sealed tombstone (format 2.4, F19): snapshot `snap_id` of `vol`,
+    /// identity `snap_uuid`, left the table. Refused for an empty id, a nil
+    /// uuid or a volume out of range.
+    pub fn tombstone(snap_id: u64, snap_uuid: Uuid, vol: u32) -> Result<Self, FormatError> {
+        let mut rec = Self::EMPTY;
+        rec.snap_id = snap_id;
+        rec.snap_uuid = snap_uuid;
+        rec.vol = vol;
+        rec.flags = SNAP_TOMBSTONE;
+        rec.validate_delta()?;
+        rec.seal();
+        Ok(rec)
+    }
+
     /// Checks the fields: an empty slot is all zero; a record has a defined
-    /// kind and origin, known pin bits, a volume in range, a birth, a
-    /// non-nil uuid and a map root.
+    /// kind and origin, known flag bits ([`SNAP_FLAGS_MASK`]: a tombstone
+    /// is refused), a volume in range, a birth, a non-nil uuid and a map
+    /// root.
     pub fn validate(&self) -> Result<(), FormatError> {
         if self.is_empty() {
             if *self != Self::EMPTY {
@@ -445,7 +498,7 @@ impl SnapRecord {
         if self.snap_origin().is_none() {
             return Err(bad_field("origin", u64::from(self.origin)));
         }
-        if self.flags & !PIN_MASK != 0 {
+        if self.flags & !SNAP_FLAGS_MASK != 0 {
             return Err(bad_field("flags", u64::from(self.flags)));
         }
         if self.vol > MAX_VOL {
@@ -473,6 +526,57 @@ impl SnapRecord {
         if self.is_empty() {
             return Ok(());
         }
+        check_crc("snapshot record", self.compute_crc(), self.crc32c)
+    }
+
+    /// Checks a record of a delta region (format 2.4, F19): never empty;
+    /// either a record [`validate`](Self::validate) accepts, or a tombstone
+    /// whose id, uuid and volume are set and whose every other field
+    /// (`rsvd` aside, which readers ignore) is zero.
+    pub fn validate_delta(&self) -> Result<(), FormatError> {
+        if self.is_empty() {
+            return Err(bad_field("snap_id", 0));
+        }
+        if !self.is_tombstone() {
+            return self.validate();
+        }
+        if self.flags != SNAP_TOMBSTONE {
+            return Err(bad_field("flags", u64::from(self.flags)));
+        }
+        if self.snap_uuid.is_nil() {
+            return Err(bad_field("snap_uuid", 0));
+        }
+        if self.vol > MAX_VOL {
+            return Err(FormatError::OutOfRange {
+                field: "vol",
+                value: u64::from(self.vol),
+                max: u64::from(MAX_VOL),
+            });
+        }
+        if self.map_root_pba != 0 {
+            return Err(bad_field("map_root_pba", self.map_root_pba));
+        }
+        if self.deadlist_pba != 0 {
+            return Err(bad_field("deadlist_pba", self.deadlist_pba));
+        }
+        if self.created_wall_ns != 0 {
+            return Err(bad_field("created_wall_ns", self.created_wall_ns));
+        }
+        if self.birth_cp != 0 {
+            return Err(bad_field("birth_cp", u64::from(self.birth_cp)));
+        }
+        if self.kind != 0 {
+            return Err(bad_field("kind", u64::from(self.kind)));
+        }
+        if self.origin != 0 {
+            return Err(bad_field("origin", u64::from(self.origin)));
+        }
+        Ok(())
+    }
+
+    /// [`validate_delta`](Self::validate_delta) and the CRC.
+    pub fn verify_delta(&self) -> Result<(), FormatError> {
+        self.validate_delta()?;
         check_crc("snapshot record", self.compute_crc(), self.crc32c)
     }
 }
@@ -848,7 +952,9 @@ pub struct CpLogDirHdr {
     /// deltas): the pages `cp_seq` wrote. Before format 2.3 these were a
     /// fold's pages only and the field was non-zero only when
     /// `cp_seq == fold_cp_seq`; a 2.3 writer lists the pages a relocation
-    /// wrote for a snapshot tree in any CP.
+    /// wrote for a snapshot tree in any CP, and a 2.4 writer also the new
+    /// root pages of the snapshots so rewritten (F21), so a boot verifies
+    /// them as the commit's own.
     pub page_entries: u32,
     /// The page's position in the directory region, from 0.
     pub page_seq: u32,
@@ -1001,7 +1107,8 @@ pub struct CpLogDir {
     /// without changes has none; a CP may have several).
     pub deltas: Vec<RootRef>,
     /// The map pages `cp_seq` wrote: a fold's rewritten pages, and the
-    /// pages a relocation wrote for a snapshot's tree (format 2.3).
+    /// pages a relocation wrote for a snapshot's tree (format 2.3) with the
+    /// snapshot root pages it rewrote (format 2.4).
     pub pages: Vec<RootRef>,
 }
 

@@ -11,8 +11,8 @@
 
 use otap_cp::{Backstore, Event, FoldPolicy, PeekSource, Phase, Status};
 use otap_format::{
-    parse_snap_table, SbSlot, SnapKind, SnapOrigin, SuperblockSlot, Uuid, BLOCK_SIZE,
-    MAP_ENTRIES_PER_PAGE, SUPERBLOCK_SLOT_SIZE,
+    SbSlot, SnapKind, SnapOrigin, SuperblockSlot, Uuid, BLOCK_SIZE, MAP_ENTRIES_PER_PAGE,
+    SUPERBLOCK_SLOT_SIZE,
 };
 use otap_sim::{BootInfo, Schedule, Sim, SimConfig, SplitMix64, TearPolicy};
 
@@ -574,12 +574,21 @@ fn one_damaged_snapshot_root_page_does_not_stop_the_boot() {
     ok(&mut s, 1, 8, 1);
     s.request_cp().unwrap();
     s.request_cp().unwrap();
-    // Find the snapshot's root page through the newest slot's table.
+    // Find the snapshot's root page through the newest slot's table (since
+    // format 2.4, Step 6B, the root names the table's head page and the
+    // table is its base and deltas replayed: the scenario is unchanged).
     let slot = newest_slot(&mut s);
-    let table = slot.sb.snap_table;
-    let mut bytes = vec![0u8; table.bytes() as usize];
-    s.disk().read(table.pba, &mut bytes).unwrap();
-    let records = parse_snap_table(&bytes).unwrap();
+    let layout = *s.engine().layout();
+    let records = otap_cp::load_table::<otap_format::SnapRecord, _>(
+        s.disk(),
+        &layout,
+        &slot.sb.agg_id,
+        slot.sb.cp_seq,
+        slot.sb.snap_table,
+        slot.sb.snap_head_cp,
+    )
+    .unwrap()
+    .records;
     let rec = records.iter().find(|r| r.snap_id == snap).unwrap();
     s.crash_daemon().unwrap();
     s.disk()

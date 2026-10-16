@@ -423,7 +423,7 @@ fn format_2_1_sizes_alignments_and_offsets() {
     assert_eq!(offset_of!(SnapRootPage, crc32c), 4092);
     assert_eq!(CPDIR_MAGIC, u32::from_le_bytes(*b"OTCD"));
     assert_eq!(SNAPROOT_MAGIC, u32::from_le_bytes(*b"OTSR"));
-    assert_eq!(FORMAT_VERSION, 0x0203);
+    assert_eq!(FORMAT_VERSION, 0x0204);
 }
 
 fn root_ref(i: u64) -> RootRef {

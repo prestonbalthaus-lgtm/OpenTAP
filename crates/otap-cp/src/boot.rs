@@ -19,6 +19,10 @@
 //! Damage to the root page or pinned index of a snapshot an older CP took
 //! is not a torn CP either: the snapshot is reported damaged and the boot
 //! goes on; only a snapshot the candidate itself wrote makes it torn.
+//! The snapshot table and the catalogue are chains since format 2.4
+//! ([`crate::tables`]): a head, base or delta the candidate wrote itself
+//! that does not verify tears it; an older one is damage to the table,
+//! reported, with the affected records resolved conservatively (F21).
 //!
 //! The walk also tells the engine which metadata segments the candidate
 //! references (live bytes per segment), and the same walk over the other
@@ -30,15 +34,16 @@ use std::collections::HashMap;
 
 use otap_format::checksum::crc32c;
 use otap_format::{
-    parse_catalog, parse_cp_stripes, parse_map_roots, parse_snap_table, BlockKind, CatalogRec,
-    CpLogDir, CpStripe, FormatError, FromBytes, FromZeros, IntentSlot, MapRoot, RootRef, SbSlot,
-    SegKind, SegState, SnapRecord, SnapRootPage, StripeId, StripeSummary, SuperblockSlot, Uuid,
-    BLOCK_SIZE, INTENT_SLOT_SIZE, SNAP_ROOT_PAGE_SIZE, SUPERBLOCK_SLOTS, SUPERBLOCK_SLOT_SIZE,
+    parse_cp_stripes, parse_map_roots, BlockKind, CatalogRec, CpLogDir, CpStripe, FormatError,
+    FromBytes, FromZeros, IntentSlot, MapRoot, RootRef, SbSlot, SegKind, SegState, SnapRecord,
+    SnapRootPage, StripeId, StripeSummary, SuperblockSlot, Uuid, BLOCK_SIZE, INTENT_SLOT_SIZE,
+    SNAP_ROOT_PAGE_SIZE, SUPERBLOCK_SLOTS, SUPERBLOCK_SLOT_SIZE,
 };
 use otap_map::{index_root_ref, volume_regions, MapError, MapSet, PinnedRoot};
 
 use crate::layout::DiskLayout;
 use crate::segments::{OpenSegment, SegmentError, SegmentTable};
+use crate::tables::{finish_catalog, finish_snapshots, load_table, TableChain};
 use crate::traits::{Backstore, IoError};
 
 /// Map pages the engine's cache holds (16 MiB).
@@ -52,10 +57,11 @@ pub enum BootError {
     NoSuperblock(FormatError),
     /// A slot was written by a newer format: a hard stop (F7).
     NewerFormat(FormatError),
-    /// The newest slot was written by a format before 2.3: 2.0's
+    /// The newest slot was written by a format before 2.4: 2.0's
     /// `cp_log_head` held a whole-map dump (E14), 2.1 recorded no geometry
-    /// (F15) and 2.2 no stripe list (F17); no release wrote any of them.
-    /// Re-format the pool.
+    /// (F15), 2.2 no stripe list (F17) and 2.3 kept its tables whole (2.4
+    /// names chains, F20); no release wrote any of them. Re-format the
+    /// pool.
     OldLayout {
         /// The `ver` field found.
         ver: u16,
@@ -86,7 +92,7 @@ impl fmt::Display for BootError {
             Self::NewerFormat(e) => write!(f, "{e}"),
             Self::OldLayout { ver } => write!(
                 f,
-                "the pool was written by format {}.{}; this release reads 2.3 and later",
+                "the pool was written by format {}.{}; this release reads 2.4 and later",
                 ver >> 8,
                 ver & 0xff
             ),
@@ -131,6 +137,9 @@ pub enum TornReason {
     /// The snapshot table, a snapshot root page or a pinned index does not
     /// verify.
     Snapshot(String),
+    /// A head, base or delta region of the snapshot table or the catalogue
+    /// that the candidate wrote itself does not verify (format 2.4, F21).
+    Table(String),
     /// A stripe the CP wrote fails its summary check.
     Stripe {
         /// The segment.
@@ -155,6 +164,7 @@ impl fmt::Display for TornReason {
             Self::SegmentTable(s) => write!(f, "segment table: {s}"),
             Self::Map(s) => write!(f, "map: {s}"),
             Self::Snapshot(s) => write!(f, "snapshot: {s}"),
+            Self::Table(s) => write!(f, "table: {s}"),
             Self::Stripe { lseg, idx, reason } => {
                 write!(f, "stripe {idx} of segment {lseg}: {reason}")
             }
@@ -228,21 +238,25 @@ pub struct BootState {
     /// The snapshots on disk, in id order.
     pub snapshots: Vec<BootSnapshot>,
     /// The regions behind the selected slot's `map_roots`, `cp_log_head`,
-    /// `snap_table`, `cp_stripes` and `seg_table` roots, which the next CP
-    /// replaces.
+    /// `cp_stripes` and `seg_table` roots, which the next CP replaces (the
+    /// table heads are carried forward and replaced only by a CP that
+    /// changes their table).
     pub table_regions: Vec<RootRef>,
     /// Consistency points since the fold that wrote a delta.
     pub cps_since_fold: u64,
-    /// The catalogue (F16) as the selected CP wrote it, or empty when it
-    /// did not verify.
+    /// The catalogue (F16) as the selected CP's chain replays it, without
+    /// the names the replay could not vouch for.
     pub catalog: Vec<CatalogRec>,
-    /// Its region, carried forward by a CP that changes no name; `NONE`
-    /// when the catalogue did not verify, so the next naming CP writes a
-    /// fresh one.
-    pub catalog_ref: RootRef,
-    /// Why the catalogue was dropped, when it did not verify: the engine
-    /// reports it as an operator warning.
+    /// The catalogue's chain (F20).
+    pub catalog_chain: TableChain,
+    /// Why the catalogue is not whole, when it is not: the engine reports
+    /// it as an operator warning and folds the catalogue at its first CP.
     pub catalog_damage: Option<String>,
+    /// The snapshot table's chain (F20).
+    pub snap_chain: TableChain,
+    /// Why the snapshot table is not whole, when it is not: the engine
+    /// reports it and folds the table at its first CP.
+    pub snapshot_table_damage: Option<String>,
 }
 
 impl BootState {
@@ -274,7 +288,7 @@ pub fn evaluate<B: Backstore>(
             other => BootError::NoSuperblock(other),
         })?;
     if let Some(newest) = ranked.first() {
-        if (newest.sb.ver & 0xff) < 3 {
+        if (newest.sb.ver & 0xff) < 4 {
             return Err(BootError::OldLayout { ver: newest.sb.ver });
         }
         let profile = (
@@ -333,8 +347,10 @@ pub fn evaluate<B: Backstore>(
         table_regions,
         cps_since_fold,
         catalog,
-        catalog_ref,
+        catalog_chain,
         catalog_damage,
+        snap_chain,
+        snapshot_table_damage,
     } = loaded;
     Ok(BootState {
         slot: *ranked[index],
@@ -350,8 +366,10 @@ pub fn evaluate<B: Backstore>(
         table_regions,
         cps_since_fold,
         catalog,
-        catalog_ref,
+        catalog_chain,
         catalog_damage,
+        snap_chain,
+        snapshot_table_damage,
     })
 }
 
@@ -365,8 +383,10 @@ struct Loaded {
     table_regions: Vec<RootRef>,
     cps_since_fold: u64,
     catalog: Vec<CatalogRec>,
-    catalog_ref: RootRef,
+    catalog_chain: TableChain,
     catalog_damage: Option<String>,
+    snap_chain: TableChain,
+    snapshot_table_damage: Option<String>,
 }
 
 /// Everything a slot's roots reach: the regions, the parsed tables, the
@@ -381,11 +401,14 @@ struct Walk {
     table_regions: Vec<RootRef>,
     /// The stripes the CP wrote (F17), to be verified.
     stripes: Vec<CpStripe>,
-    /// The catalogue and its region.
+    /// The catalogue and its chain.
     catalog: Vec<CatalogRec>,
-    catalog_ref: RootRef,
-    /// Why the catalogue was dropped, when it did not verify.
+    catalog_chain: TableChain,
+    /// Why the catalogue is not whole, when it is not.
     catalog_damage: Option<String>,
+    /// The snapshot table's chain, and why it is not whole.
+    snap_chain: TableChain,
+    snapshot_table_damage: Option<String>,
 }
 
 /// Reads every region a slot's map and snapshot roots name and verifies
@@ -471,39 +494,30 @@ fn walk_cp<B: Backstore>(
         table_regions.push(sb.cp_stripes);
         parse_cp_stripes(&bytes).map_err(|e| TornReason::Map(format!("stripe list: {e}")))?
     };
-    // The catalogue (F16), carried forward unchanged by most CPs. One that
-    // does not verify is damage to the names, not to the candidate: every
-    // candidate of the ring names the same region, so tearing on it would
-    // make the pool unbootable for a name. The boot goes on with no names,
-    // reports it, and the next CP that names something writes a fresh
-    // region. A read error is the device's, and fails the candidate as
-    // every other root's does.
-    let (catalog, catalog_ref, catalog_damage) = if sb.catalog.is_none() {
-        (Vec::new(), RootRef::NONE, None)
-    } else {
-        match read_root(b, layout, &sb.catalog, "catalog") {
-            Err(TornReason::Io(e)) => return Err(TornReason::Io(e)),
-            Err(reason) => (Vec::new(), RootRef::NONE, Some(reason.to_string())),
-            Ok(bytes) => match parse_catalog(&bytes) {
-                Ok(records) => {
-                    regions.push(sb.catalog);
-                    (records, sb.catalog, None)
-                }
-                Err(e) => (Vec::new(), RootRef::NONE, Some(format!("catalogue: {e}"))),
-            },
-        }
-    };
-    // The snapshots: the table, each root page, each pinned index. Damage
-    // to a snapshot an older CP took is the snapshot's, not the
-    // candidate's: it is reported and the boot goes on; a root page or
-    // index this CP wrote itself tears the candidate.
+    // The catalogue (F16) and the snapshot table, chains since format 2.4
+    // (F20): carried forward by the CPs that change neither, so a region
+    // an older CP wrote is shared by every candidate of the ring and its
+    // damage is the table's, not the candidate's (the W4 rule of E39): the
+    // boot goes on with what verifies, reports it, and the first CP folds
+    // the table. A region this candidate wrote itself tears it. A read
+    // error is the device's and fails the candidate as every root's does.
+    let catalog_load =
+        load_table::<CatalogRec, B>(b, layout, agg_id, sb.cp_seq, sb.catalog, sb.catalog_head_cp)?;
+    regions.extend(catalog_load.regions.iter().copied());
+    let (catalog, catalog_damage) = finish_catalog(&catalog_load);
+    let catalog_chain = catalog_load.chain;
+    let snap_load =
+        load_table::<SnapRecord, B>(b, layout, agg_id, sb.cp_seq, sb.snap_table, sb.snap_head_cp)?;
+    regions.extend(snap_load.regions.iter().copied());
+    let (records, snapshot_table_damage) = finish_snapshots(&snap_load);
+    let snap_chain = snap_load.chain;
+    // The snapshots: each root page, each pinned index. Damage to a
+    // snapshot an older CP took is the snapshot's, not the candidate's: it
+    // is reported and the boot goes on; a root page or index this CP wrote
+    // itself tears the candidate (a root page a relocation rewrote is in
+    // the directory's pages, verified above).
     let mut snapshots = Vec::new();
-    if !sb.snap_table.is_none() {
-        let bytes = read_root(b, layout, &sb.snap_table, "snap_table")?;
-        regions.push(sb.snap_table);
-        table_regions.push(sb.snap_table);
-        let records = parse_snap_table(&bytes)
-            .map_err(|e| TornReason::Snapshot(format!("snapshot table: {e}")))?;
+    {
         for record in records {
             let own = u64::from(record.birth_cp) == sb.cp_seq;
             match load_snapshot(b, layout, agg_id, &record) {
@@ -535,8 +549,10 @@ fn walk_cp<B: Backstore>(
         table_regions,
         stripes,
         catalog,
-        catalog_ref,
+        catalog_chain,
         catalog_damage,
+        snap_chain,
+        snapshot_table_damage,
     })
 }
 
@@ -702,10 +718,19 @@ fn load_cp<B: Backstore>(
             next_idx: sb.open_data_idx,
         })
     };
-    // Metadata liveness per segment.
+    // Metadata liveness per segment, each region counted once: a region
+    // two trees share (a map page the live map and a snapshot both name,
+    // an index two snapshots share) is listed by each, and counting it
+    // twice would keep its segment from ever reaching zero until the next
+    // boot recounted it (the Step 4 review's hazard 12, closed in 6B).
     let mut meta_live: HashMap<u64, u64> = HashMap::new();
+    let mut distinct: HashMap<u64, u32> = HashMap::new();
     for region in &regions {
-        for (pseg, bytes) in layout.segments_of_region(region.pba, region.pages) {
+        let pages = distinct.entry(region.pba).or_insert(0);
+        *pages = (*pages).max(region.pages);
+    }
+    for (pba, pages) in &distinct {
+        for (pseg, bytes) in layout.segments_of_region(*pba, *pages) {
             *meta_live.entry(pseg).or_insert(0) += bytes;
         }
     }
@@ -774,8 +799,10 @@ fn load_cp<B: Backstore>(
         },
         cps_since_fold: delta_cps.len() as u64,
         catalog: walk.catalog,
-        catalog_ref: walk.catalog_ref,
+        catalog_chain: walk.catalog_chain,
         catalog_damage: walk.catalog_damage,
+        snap_chain: walk.snap_chain,
+        snapshot_table_damage: walk.snapshot_table_damage,
     })
 }
 

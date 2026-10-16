@@ -479,7 +479,9 @@ pub struct Superblock {
     pub reloc_index: RootRef,
     /// The head of the CP log.
     pub cp_log_head: RootRef,
-    /// The snapshot table.
+    /// The snapshot table: before format 2.4 the whole table region (F14);
+    /// since 2.4 the snapshot table's head page (F20), which names the
+    /// base region and the delta regions since the table's last fold.
     pub snap_table: RootRef,
     /// The `ClusterState` snapshot region (R59).
     pub cluster_state: RootRef,
@@ -503,12 +505,21 @@ pub struct Superblock {
     /// bytes.
     pub geom_capacity_bytes: u64,
     /// Format 2.3: the name catalogue region (F16), or none. Carried
-    /// forward unchanged by a commit that changed no name.
+    /// forward unchanged by a commit that changed no name. Since format
+    /// 2.4 the catalogue's head page (F20).
     pub catalog: RootRef,
     /// Format 2.3: the list of data stripes this commit wrote (F17), or
     /// none when it wrote no data stripe. What the boot verifies by summary
     /// before it trusts the commit.
     pub cp_stripes: RootRef,
+    /// Format 2.4: the CP that wrote the snapshot table's head page (F20),
+    /// at most `cp_seq`; 0 while `snap_table` is none. A head this commit
+    /// wrote itself (`snap_head_cp == cp_seq`) that does not verify tears
+    /// the commit; an older one is damage to the table (F21).
+    pub snap_head_cp: u64,
+    /// Format 2.4: the CP that wrote the catalogue's head page, by the
+    /// same rules.
+    pub catalog_head_cp: u64,
     /// Reserved, zero.
     pub reserved: [u8; SUPERBLOCK_RESERVED],
     /// CRC-32C over bytes `0..4092`.
@@ -640,6 +651,25 @@ impl Superblock {
             }
             if self.geom_capacity_bytes < u64::from(segment) {
                 return Err(bad_field("geom_capacity_bytes", self.geom_capacity_bytes));
+            }
+        }
+        if minor_of(self.ver) >= 4 {
+            // Format 2.4: a table head was written by this commit or an
+            // earlier one, and a table without a head names no CP.
+            for (field, head, cp) in [
+                ("snap_head_cp", &self.snap_table, self.snap_head_cp),
+                ("catalog_head_cp", &self.catalog, self.catalog_head_cp),
+            ] {
+                if cp > self.cp_seq {
+                    return Err(FormatError::OutOfRange {
+                        field,
+                        value: cp,
+                        max: self.cp_seq,
+                    });
+                }
+                if head.is_none() && cp != 0 {
+                    return Err(bad_field(field, cp));
+                }
             }
         }
         self.durable_log.validate()
@@ -1049,7 +1079,9 @@ const _: () = {
     assert!(offset_of!(Superblock, geom_capacity_bytes) == 1720);
     assert!(offset_of!(Superblock, catalog) == 1728);
     assert!(offset_of!(Superblock, cp_stripes) == 1744);
-    assert!(offset_of!(Superblock, reserved) == 1760);
+    assert!(offset_of!(Superblock, snap_head_cp) == 1760);
+    assert!(offset_of!(Superblock, catalog_head_cp) == 1768);
+    assert!(offset_of!(Superblock, reserved) == 1776);
     assert!(offset_of!(Superblock, crc32c) == SUPERBLOCK_CRC_OFFSET);
 
     assert!(size_of::<SuperblockSlot>() == SUPERBLOCK_SLOT_SIZE);

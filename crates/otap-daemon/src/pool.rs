@@ -34,7 +34,7 @@ use crate::clock::SystemClock;
 use crate::config::Overrides;
 use crate::device::{destroy_device, volume_device, HostRef, VolumeDevice};
 use crate::frontdoor::{blocks_of, DaemonFrontDoor, IoCompletion, IoHandle};
-use crate::report::{pool_report, snapshot_report, volume_report};
+use crate::report::{pool_report, snapshot_report, verify_report, volume_report};
 
 /// The engine as the daemon runs it.
 pub type PoolEngine = Engine<Box<dyn Backstore>, DaemonFrontDoor, SystemClock>;
@@ -515,6 +515,16 @@ impl Pool {
                 "stopped at cp {cp_seq}, {}",
                 if *clean { "clean" } else { "without a clean shutdown record" }
             ),
+            Event::VerifyFinished {
+                cp_seq,
+                state,
+                verdict,
+                errors,
+                warnings,
+            } => format!(
+                "verification of cp {cp_seq} ended {state:?}: {verdict:?}, {errors} error(s), \
+                 {warnings} warning(s)"
+            ),
             _ => return,
         };
         self.log(line);
@@ -526,9 +536,12 @@ impl Pool {
         self.engine
             .tick()
             .map_err(|e| ControlError::new(ErrorCode::Engine, format!("engine tick: {e}")))?;
+        // A verification in progress is work in hand: the loop ticks again
+        // at once, each tick one bounded slice of it.
         Ok(self.engine.stats() != before
             || !self.engine.is_quiet()
-            || self.engine.front_door().in_engine() > 0)
+            || self.engine.front_door().in_engine() > 0
+            || self.engine.verify_running())
     }
 
     /// One tick with its events noted; `true` when the engine has work in
@@ -1005,6 +1018,9 @@ impl Pool {
             } => self.io_punch(volume, *lba, *blocks),
             Request::DeviceList {} => self.device_list(),
             Request::DeviceReap { dev_id, stale } => self.device_reap(*dev_id, *stale),
+            Request::PoolVerify {} => self.verify_start(),
+            Request::PoolVerifyStatus {} => self.verify_status(),
+            Request::PoolVerifyCancel {} => self.verify_cancel(),
             Request::Ping
             | Request::PoolFormat { .. }
             | Request::PoolBoot { .. }
@@ -1023,6 +1039,43 @@ impl Pool {
             self.cp_interval_secs,
             &self.last_boot,
         )))
+    }
+
+    /// Starts a verification of the pool (Step 6B) and answers at once with
+    /// its report: it runs as a job, a bounded slice per engine tick, so a
+    /// verification of any size never holds the request loop beyond one
+    /// slice and never meets the operation timeout; the client follows it
+    /// with [`verify_status`](Self::verify_status). A verification already
+    /// running is answered with its own report.
+    pub fn verify_start(&mut self) -> Reply {
+        let report = self
+            .engine
+            .start_verify(otap_cp::VerifyOptions::default())
+            .map_err(engine_error)?;
+        Ok(Response::Verify(verify_report(&report)))
+    }
+
+    /// The verification in progress, or the last one since the boot.
+    pub fn verify_status(&self) -> Reply {
+        let report = self.engine.verify_report().ok_or_else(|| {
+            ControlError::new(
+                ErrorCode::NotFound,
+                "no verification has run since the pool booted; start one with `pool verify`",
+            )
+        })?;
+        Ok(Response::Verify(verify_report(&report)))
+    }
+
+    /// Cancels the verification in progress.
+    pub fn verify_cancel(&mut self) -> Reply {
+        let report = self
+            .engine
+            .cancel_verify()
+            .ok_or_else(|| ControlError::new(ErrorCode::NotFound, "no verification is running"))?;
+        for ev in self.engine.take_events() {
+            self.note(&ev);
+        }
+        Ok(Response::Verify(verify_report(&report)))
     }
 
     /// A consistency point now.

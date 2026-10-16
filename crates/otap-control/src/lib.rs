@@ -28,9 +28,9 @@ pub mod wire;
 
 pub use client::{Client, Endpoint};
 pub use protocol::{
-    ArenaKind, ControlError, DeviceReport, DeviceState, ErrorCode, IoResultReport, MediaKind,
-    PoolReport, Reply, Request, Response, SnapshotReport, VolumeReport, MAX_IO_BLOCKS,
-    PROTOCOL_VERSION,
+    ArenaKind, ControlError, DeviceReport, DeviceState, ErrorCode, FindingSeverity, IoResultReport,
+    MediaKind, PoolReport, Reply, Request, Response, SnapshotReport, VerifyFinding, VerifyReport,
+    VerifyState, VerifyVerdict, VolumeReport, MAX_IO_BLOCKS, PROTOCOL_VERSION,
 };
 pub use units::{
     check_arena_bytes, check_cp_interval, format_size, parse_size, ARENA_PAGE_BYTES,

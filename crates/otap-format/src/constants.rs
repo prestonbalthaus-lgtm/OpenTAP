@@ -12,7 +12,7 @@ pub const FORMAT_MAJOR: u8 = 2;
 /// Minor version of the on-disk format. A later minor may only give meaning to
 /// bytes that this minor writes as zero; readers accept any minor of their own
 /// major.
-pub const FORMAT_MINOR: u8 = 3;
+pub const FORMAT_MINOR: u8 = 4;
 /// The `ver` field written into every on-disk structure: `major << 8 | minor`.
 pub const FORMAT_VERSION: u16 = ((FORMAT_MAJOR as u16) << 8) | FORMAT_MINOR as u16;
 
@@ -46,8 +46,9 @@ pub const SUPERBLOCK_SLOTS: usize = 4;
 /// Bytes of the superblock page that precede the trailing CRC.
 pub const SUPERBLOCK_CRC_OFFSET: usize = SUPERBLOCK_SIZE - 4;
 /// Reserved bytes at the end of the superblock page, written as zero and
-/// covered by the CRC.
-pub const SUPERBLOCK_RESERVED: usize = 2332;
+/// covered by the CRC (2,332 in format 2.3; 2.4 took 16 for the CPs that
+/// wrote the two table heads).
+pub const SUPERBLOCK_RESERVED: usize = 2316;
 
 /// Volumes per aggregate. A volume index is below this bound everywhere: in
 /// the bitsets, the volume table, descriptors and hole records (F8).
@@ -160,6 +161,27 @@ pub const SNAP_ROOT_CRC_OFFSET: usize = SNAP_ROOT_PAGE_SIZE - 4;
 /// Reserved bytes at the end of the snapshot root page.
 pub const SNAP_ROOT_RESERVED: usize = 3972;
 
+/// Size of one table log page (format 2.4, F19): a delta region of the
+/// snapshot table or the catalogue is a run of these.
+pub const TABLE_LOG_PAGE_SIZE: usize = 4096;
+/// Size of the table log page header.
+pub const TABLE_LOG_HDR_SIZE: usize = 64;
+/// Bytes of records a table log page carries after its header: 63 snapshot
+/// records or 7 catalogue records.
+pub const TABLE_LOG_PAYLOAD: usize = TABLE_LOG_PAGE_SIZE - TABLE_LOG_HDR_SIZE;
+/// Size of one table head page (format 2.4, F20).
+pub const TABLE_HEAD_PAGE_SIZE: usize = 4096;
+/// Size of one entry of a table head: a region with the CP that wrote it
+/// and its record count.
+pub const TABLE_CHAIN_ENTRY_SIZE: usize = 32;
+/// Delta regions one table head lists at most: the hard bound on a table's
+/// chain, whatever the fold policy says.
+pub const TABLE_HEAD_DELTAS: usize = 124;
+/// Reserved bytes before the trailing CRC of a table head page.
+pub const TABLE_HEAD_RESERVED: usize = 28;
+/// Bytes of a table head page that precede its trailing CRC.
+pub const TABLE_HEAD_CRC_OFFSET: usize = TABLE_HEAD_PAGE_SIZE - 4;
+
 /// Size of the stream frame header.
 pub const STREAM_HEADER_SIZE: usize = 64;
 /// Bytes of the stream header that precede `hdr_crc`.
@@ -186,6 +208,10 @@ pub const CPLOG_MAGIC: u32 = u32::from_le_bytes(*b"OTCL");
 pub const CPDIR_MAGIC: u32 = u32::from_le_bytes(*b"OTCD");
 /// Snapshot root page magic: `OTSR` (format 2.1).
 pub const SNAPROOT_MAGIC: u32 = u32::from_le_bytes(*b"OTSR");
+/// Table log page magic: `OTTL` (format 2.4, F19).
+pub const TABLE_LOG_MAGIC: u32 = u32::from_le_bytes(*b"OTTL");
+/// Table head page magic: `OTTH` (format 2.4, F20).
+pub const TABLE_HEAD_MAGIC: u32 = u32::from_le_bytes(*b"OTTH");
 
 /// Bits of the volume index field in a stripe descriptor. The field is wider
 /// than [`MAX_VOL`] needs; only values below [`MAX_VOLS`] are valid.
@@ -217,7 +243,7 @@ pub const MAX_PLEN: u16 = (1 << PLEN_BITS) - 1;
 pub const NULL_LSEG: u64 = 0;
 
 const _: () = {
-    assert!(FORMAT_VERSION == 0x0203);
+    assert!(FORMAT_VERSION == 0x0204);
     assert!(STREAM_VERSION == 0x0100);
     assert!(VOL_BITSET_BYTES == 128);
     assert!(VOL_TABLE_SIZE == 16384);
@@ -238,4 +264,11 @@ const _: () = {
     assert!(SNAP_ROOT_RESERVED + 120 + 4 == SNAP_ROOT_PAGE_SIZE);
     assert!(MAX_SEG_BYTES == 256 * 1024 * 1024);
     assert!(32 + CATALOG_NAME_MAX + CATALOG_RESERVED + 4 == CATALOG_RECORD_SIZE);
+    assert!(TABLE_LOG_PAYLOAD == 4032);
+    assert!(TABLE_LOG_PAYLOAD / SNAP_RECORD_SIZE == 63);
+    assert!(TABLE_LOG_PAYLOAD / CATALOG_RECORD_SIZE == 7);
+    assert!(
+        96 + TABLE_HEAD_DELTAS * TABLE_CHAIN_ENTRY_SIZE + TABLE_HEAD_RESERVED + 4
+            == TABLE_HEAD_PAGE_SIZE
+    );
 };

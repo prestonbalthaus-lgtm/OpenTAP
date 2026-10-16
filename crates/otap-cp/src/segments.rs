@@ -301,4 +301,33 @@ impl SegmentTable {
     pub fn is_free(&self, pseg: u64) -> bool {
         self.entry(pseg).is_ok_and(SegEntry::is_free)
     }
+
+    /// `true` when [`allocate_run`](Self::allocate_run) of `count`
+    /// segments keeping `reserve` free would succeed now (nothing is
+    /// allocated): how a consistency point decides whether a table fold
+    /// fits before it places it.
+    #[must_use]
+    pub fn has_run(&self, count: u32, reserve: u32) -> bool {
+        match count {
+            0 => false,
+            1 => self.free_count() > reserve,
+            _ => {
+                if self.free_count() < count.saturating_add(reserve) {
+                    return false;
+                }
+                let mut run_len = 0u32;
+                for (_, entry) in self.iter() {
+                    if entry.is_free() {
+                        run_len += 1;
+                        if run_len == count {
+                            return true;
+                        }
+                    } else {
+                        run_len = 0;
+                    }
+                }
+                false
+            }
+        }
+    }
 }
