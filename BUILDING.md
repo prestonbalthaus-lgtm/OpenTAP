@@ -45,7 +45,7 @@ and `clippy`.
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-PROPTEST_CASES=10000 cargo test --workspace             # the gate before a commit, about three hours
+PROPTEST_CASES=10000 cargo test --workspace             # the gate before a commit, about four hours
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo build --release -p otap-daemon -p otap-ctl        # target/release/dbladed and otapctl
 

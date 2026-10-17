@@ -147,8 +147,8 @@ parallel builds. Rules:
 - Temporary files, extracted sources and toolchains go to the session
   scratchpad, never into the tree.
 - The 10,000-case gate (`PROPTEST_CASES=10000 cargo test --workspace`)
-  takes about three hours (116 minutes after Step 4, 180 after Step 5; the
-  figures are in `06`, section 5) and runs in the background with its
+  takes about four hours (116 minutes after Step 4, 180 after Step 5,
+  about 241 after Step 6; the figures are in `06`, section 5) and runs in the background with its
   output captured to a file; nothing else uses cargo meanwhile. The
   variable overrides an explicit `cases` in a `proptest!` configuration,
   so no property test is exempt from the gate. The simulator random walks

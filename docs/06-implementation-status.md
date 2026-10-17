@@ -470,7 +470,9 @@ simulator; the physical re-attach test is a Linux item.
 On the development PC every cargo command is prefixed with
 `export PATH="$HOME/.cargo/bin:$HOME/.cargo/mingw-tools/bin:$PATH"` (see the
 Windows notes in `BUILDING.md`) and runs with `-j 3`; tests use `--test-threads=6`.
-Every gate ran on the committed tree `758adb8` (the review commit).
+Every gate ran on the committed tree `758adb8` (the review commit), except
+the second run of the full 10,000-case gate, which ran on `80c9423` (the
+docs commit after it; the same code).
 
 | Gate | Result |
 |---|---|
@@ -482,7 +484,7 @@ Every gate ran on the committed tree `758adb8` (the review commit).
 | `bash -n scripts/wsl2-prep.sh scripts/linux-smoke.sh` | clean |
 | `cargo test --workspace` | 760 tests and 2 doctests passed, 0 failed, 1 ignored (the vector writer), in 3 min 43 s |
 | `PROPTEST_CASES=10000`, the Step 6 property suites one at a time | all passed: `step6c_replication_sim_tests` 10 min 0 s, `step6b_catalogue_sim_tests` 10 min 11 s, `step6b_verify_sim_tests` 7 min 25 s, `adversarial_arena_tests` (6A's walk with kills inside fills) 3 min 58 s, `step6c_transport_wire_tests` 5 s, `step6b_catalogue_format_tests` 1 s |
-| `PROPTEST_CASES=10000 cargo test --workspace` | interrupted, not concluded: started 17:02:28 on `758adb8`; at about 20:15 the session harness stopped the wrapper shell for low system memory, by which point 58 test binaries had reported 496 tests passed and none failed (`sim_tests` 17 min, `step4_sim_tests` 63 min), and the orphaned test run was still going on in `step5_sim_tests`; its end, if it finished, is in `OpenTAP-local/step6/gate-10k-2026-10-16/workspace.log` and is to be recorded here once read |
+| `PROPTEST_CASES=10000 cargo test --workspace` | all passed, over two runs: 760 tests and 2 doctests passed, 0 failed, 1 ignored, in about 241 min of test wall time. The first run (17:02:28 to 20:20:04, 197 min 36 s, on `758adb8`) completed 58 test binaries, 496 tests passed, 0 failed, 1 ignored, and ended when `step5_sim_tests` aborted with Windows status 0xc0000409 after "memory allocation of 12779520 bytes failed": system memory stood at 92% from an unrelated foreground application (about 17 GB; the test process used about 30 MB), not a code defect. The second run (20:22:09 to 21:05:30, 43 min 21 s, on `80c9423`, with 25 GB free) ran only what had not completed: `step5_sim_tests`, `step6a_sim_tests`, `step6b_catalogue_sim_tests`, `step6b_verify_sim_tests`, `step6c_replication_engine_tests`, `step6c_replication_sim_tests`, `step6c_transport_simnet_tests`, all of `otap-stream`, `otap-sys` and `otap-ublk`, and the doctests: 264 tests and the 2 doctests passed, 0 failed. Slowest: `step4_sim_tests` 62 min 48 s, `review_step5_sim_tests` 50 min 51 s, `adversarial_sim_tests` 20 min 41 s, `map_tests` 20 min 31 s, `sim_tests` 17 min 12 s, `step5_sim_tests` 13 min 5 s, `step6c_replication_sim_tests` 11 min 2 s, `step6b_catalogue_sim_tests` 10 min 16 s, `step6b_verify_sim_tests` 8 min 6 s; every other suite under six minutes. Logs in `OpenTAP-local/step6/gate-10k-2026-10-16/` |
 
 The Step 5 figures for comparison: 541 tests and 2 doctests in 3 min 13 s;
 the 10,000-case gate in 179 min 46 s.

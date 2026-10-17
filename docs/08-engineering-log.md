@@ -811,6 +811,15 @@ private folder was removed.
   failure.
 - (Step 6) A test names an event; assert that the event happened. A wait on
   the wrong job's counter let a rollback test pass without a rollback.
+- (Step 6) A long gate on this PC shares memory with the owner's foreground
+  applications: an allocation failure in a test (Windows status
+  0xc0000409, "memory allocation of N bytes failed") under 90%+ system
+  memory use is environmental, not a defect; the harness also kills
+  background wrapper shells at that point while the cargo process
+  survives. Keep the gate's own log and stamps files so the run can be
+  judged without the shell, and re-run only the binaries that did not
+  complete (cargo runs test binaries in package order, then target name
+  order, so the unfinished set is determinable from the log).
 
 ## 2026-10-14: Phase C Step 5, snapshot deletion, the cleaner, `dbladed` and `otapctl`
 
@@ -1288,7 +1297,9 @@ default from 5 s to 35 s (E48, E60).
 
 ### Gates
 
-On the committed and pushed review commit `758adb8`:
+On the committed and pushed review commit `758adb8`, except the second run
+of the full 10,000-case gate, on `80c9423` (the docs commit after it; the
+same code):
 
 | Gate | Result |
 |---|---|
@@ -1305,11 +1316,16 @@ On the committed and pushed review commit `758adb8`:
 | 10,000 cases, `adversarial_arena_tests` (with 6A's `KillInsideFill`) | passed, 3 min 58 s |
 | 10,000 cases, `step6c_transport_wire_tests` | passed, 5 s |
 | 10,000 cases, `step6b_catalogue_format_tests` | passed, 1 s |
-| `PROPTEST_CASES=10000 cargo test --workspace` | interrupted, not concluded: started 17:02:28 on `758adb8`; at about 20:15 the session harness stopped the wrapper shell for low system memory, by which point 58 test binaries had reported 496 tests passed and none failed (`sim_tests` 17 min, `step4_sim_tests` 63 min), and the orphaned test run was still going on in `step5_sim_tests`; its end, if it finished, is in `OpenTAP-local/step6/gate-10k-2026-10-16/workspace.log` and is to be recorded here once read |
+| `PROPTEST_CASES=10000 cargo test --workspace -j 3 -- --test-threads=6`, first run, `758adb8`, 17:02:28 to 20:20:04 (197 min 36 s) | 58 test binaries completed: 496 tests passed, 0 failed, 1 ignored. It ended when `step5_sim_tests` aborted with Windows status 0xc0000409 (cargo names it `STATUS_STACK_BUFFER_OVERRUN`; it is how a Rust abort exits) after "memory allocation of 12779520 bytes failed": system memory was at 92% from an unrelated foreground application (about 17 GB), not from the tests (the test process used about 30 MB). The session harness had also stopped the worker's wrapper shell for low system memory at about 20:15; the cargo process survived it. Not a code defect |
+| the same, second run, `80c9423`, only the unfinished part, 20:22:09 to 21:05:30 (43 min 21 s), after the application was closed (25 GB free) | `step5_sim_tests`, `step6a_sim_tests`, `step6b_catalogue_sim_tests`, `step6b_verify_sim_tests`, `step6c_replication_engine_tests`, `step6c_replication_sim_tests`, `step6c_transport_simnet_tests`, then all of `otap-stream`, `otap-sys` and `otap-ublk`, then `cargo test --workspace --doc`: 264 tests passed, 0 failed, and the 2 doctests; no failures, panics or allocation errors |
+| the full 10,000-case gate, both runs together | 760 tests passed, 0 failed, 1 ignored, 2 doctests passed, in about 241 min of test wall time (Step 5: 180 min). Slowest: `step4_sim_tests` 62 min 48 s, `review_step5_sim_tests` 50 min 51 s, `adversarial_sim_tests` 20 min 41 s, `map_tests` 20 min 31 s, `sim_tests` 17 min 12 s, `step5_sim_tests` 13 min 5 s, `step6c_replication_sim_tests` 11 min 2 s, `step6b_catalogue_sim_tests` 10 min 16 s, `step6b_verify_sim_tests` 8 min 6 s, `arena_tests` 5 min 52 s, `adversarial_arena_tests` 4 min 21 s, `lifecycle_map_tests` 3 min 19 s; every other suite under four minutes |
 
 The Step 6 suites ran one at a time before the full gate, so a failure
-would have shown within the hour; none failed. The full gate runs them
-again with new seeds.
+would have shown within the hour; none failed. The full gate ran them
+again with new seeds, and none failed there either. The logs, stamps and
+timings are in `OpenTAP-local/step6/gate-10k-2026-10-16/`
+(`workspace.log`, `workspace-remainder.log`, `timings.txt`,
+`remainder.stamps`).
 
 ### The Linux work
 
