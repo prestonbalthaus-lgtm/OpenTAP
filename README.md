@@ -57,24 +57,39 @@ the background. A segment cleaner moves the live blocks out of mostly dead
 segments and frees them, keeping a reserve so a full pool can still delete
 a snapshot or compact itself. The daemon, `dbladed`, hosts the engine,
 exposes one block device per volume through ublk, and answers the
-command-line client `otapctl` over a control socket.
+command-line client `otapctl` over a control socket. When the daemon is
+killed, the next one re-attaches the arena and the same block devices, and
+the kernel hands it the requests the dead one had not answered. A
+verification job reads the whole pool back against its own records while
+it keeps serving, and replication ships the blocks that changed between two
+snapshots to a second pool, which commits them as the same snapshot only
+once every block is on its disk.
 
 ## Status
 
-Phase C (v0.1, a single node) is in progress. Steps 1 to 5 of the
-implementation plan are done: the on-disk format, the replication stream
-format, the kernel boundary, the write cache, the dirty index, the
+Phase C (v0.1, a single node) is in progress. Steps 1 to 6 of the
+implementation plan are done: the on-disk format (now 2.4), the replication
+stream format, the kernel boundary, the write cache, the dirty index, the
 consistency-point engine with snapshots, folds, snapshot deletion, rollback
 and the segment cleaner, geometry discovery, the Linux backstore, the ublk
-front door, and the daemon `dbladed` with its command-line client `otapctl`,
-each step with its independent review.
+front door, the daemon `dbladed` with its command-line client `otapctl`,
+and since Step 6: a restarted daemon re-attaching the same `/dev/ublkbN`
+devices after a crash (`UBLK_F_USER_RECOVERY`) with a reaper for stale
+devices (`otapctl device list|reap`), an incremental snapshot table and name
+catalogue, a verification of the whole pool while it runs (`otapctl pool
+verify`), and asynchronous snapshot replication between two pools over TCP
+(`otapctl replicate push|pull|status|cursor|cancel|release`; loopback by
+default, no TLS yet). Each step had its independent review; Step 6's found
+and fixed twenty defects, eleven of them able to lose or misplace data.
 
 The whole lifecycle (format, boot, volumes, writes and reads, snapshots,
-their deletion, rollback, the cleaner, a clean restart) runs end to end over
-a plain file, which is how it is tested on the Windows development host.
-Nothing has executed on a Linux host yet: the io_uring backstore and the
-ublk devices compile for Linux and wait for the first smoke test (below).
-OpenTAP is not usable as storage yet.
+their deletion, rollback, the cleaner, the verification, a clean restart,
+replication between two daemons over loopback TCP) runs end to end over
+plain files, which is how it is tested on the Windows development host,
+with 760 tests. Nothing has executed on a Linux host yet: the io_uring
+backstore, the ublk devices and their re-attach compile for Linux and wait
+for the first smoke test (below), on WSL 2 on the development PC. OpenTAP
+is not usable as storage yet.
 
 `docs/06-implementation-status.md` has the current state in detail, the
 test gates and what comes next.
@@ -85,7 +100,8 @@ test gates and what comes next.
 |---|---|
 | `crates/` | the Cargo workspace, fourteen crates (listed in `BUILDING.md`) |
 | `fuzz/` | libFuzzer targets for the on-disk and on-wire parsers |
-| `scripts/linux-smoke.sh` | the first-run smoke test for a Debian 13 host (below) |
+| `scripts/linux-smoke.sh` | the first-run smoke test for a Linux host: Debian 13, or WSL 2 (below) |
+| `scripts/wsl2-prep.sh` | probes a WSL 2 distribution, installs the packages, builds a WSL 2 kernel with ublk |
 | `docs/00` to `05` | the project briefs and the three design rounds, with their full records |
 | `docs/06` to `10` | status, engineering decisions, the engineering log, working agreements, the step briefs |
 | `docs/reviews/` | the independent review reports, as the reviewers handed them back |
@@ -104,17 +120,27 @@ cargo build --release -p otap-daemon -p otap-ctl   # target/release/dbladed and 
 `BUILDING.md` has the full set of gates, the Linux cross-check and the
 Windows host notes.
 
-## Running the smoke test on Debian 13
+## Running the smoke test on Debian 13 or WSL 2
 
 The first live run is `scripts/linux-smoke.sh`. It has never been executed
 yet (the development host is Windows), so expect it to find things; what it
 finds goes into `docs/08-engineering-log.md`.
 
-Requirements: Debian 13 (Trixie) with kernel 6.12 or later; root; the ublk
-driver (`modprobe ublk_drv`; Debian's kernel ships it as a module);
-`util-linux` (`losetup`, `blkdiscard`), `diffutils` and `coreutils`;
-optionally `fio` and `jq`; stable Rust 1.89 or later from rustup for the
-user who builds.
+Requirements: Debian 13 (Trixie) with kernel 6.12 or later, or a WSL 2
+distribution with a kernel that has ublk; root; the ublk driver (`modprobe
+ublk_drv`; Debian's kernel ships it as a module, Microsoft's WSL 2 kernel
+does not); `util-linux` (`losetup`, `blkdiscard`), `diffutils` and
+`coreutils`; optionally `fio` and `jq`; stable Rust 1.89 or later from
+rustup for the user who builds (under `sudo` the script builds as that
+user).
+
+On WSL 2, `scripts/wsl2-prep.sh` gets there first: `--probe` (the default)
+reports what is missing, `sudo scripts/wsl2-prep.sh --install-deps` installs
+the packages, and `scripts/wsl2-prep.sh --build-kernel` builds Microsoft's
+6.18 WSL kernel with ublk and dm-log-writes as modules, stages it under
+`E:\WSL\kernel` and prints the `.wslconfig` line and the steps that follow
+(`wsl --shutdown`, the modules, `--probe` again). It changes no firmware
+setting and reboots nothing.
 
 ```sh
 git clone https://github.com/prestonbalthaus-lgtm/OpenTAP.git
@@ -131,11 +157,15 @@ waits for its `/dev/ublkbN`, writes 64 MiB and reads it back (and runs a
 20-second fio verify when fio is installed), takes a snapshot, overwrites
 and discards part of the volume, rolls back and verifies, deletes the
 snapshot, runs the cleaner, stops the daemon with `SIGTERM` and restarts it
-(a clean boot), kills it with `SIGKILL` and restarts it (a dirty boot whose
-hugetlbfs arena re-attaches, so no acknowledged write is lost; with
-`--heap-arena` the volume is held by nvfail and cleared), verifies once
-more and tears everything down. It prints `SMOKE TEST PASSED` or stops at
-the first failed step with the daemon's log.
+(a clean boot), kills it with `SIGKILL` while a writer is in flight and
+restarts it (the hugetlbfs arena re-attaches and the restarted daemon takes
+over the same `/dev/ublkbN`, so the writer finishes without an error and
+nothing is lost; with `--heap-arena` the volume is held by nvfail and
+cleared instead), orphans a device on purpose and finds it with `device
+list` and `device reap --stale`, runs `pool verify`, pushes two snapshots
+over 127.0.0.1 to a second `dbladed` and compares the released mirror with
+the source byte for byte, and tears everything down. It prints `SMOKE TEST
+PASSED` or stops at the first failed step with the daemon's log.
 
 The same by hand, on a device you can wipe:
 

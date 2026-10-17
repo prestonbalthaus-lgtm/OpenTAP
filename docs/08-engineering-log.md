@@ -793,6 +793,24 @@ private folder was removed.
   durability defects of the Step 4 review were all in the boot, which
   the lead's own suites exercised through the simulator's crashes but
   never with a fold as the newest CP.
+- (Step 5) Every decision a CP makes about shared state is made against one
+  view, or refused until the view settles; a cited finding earns the same
+  scrutiny as a reproduced one (the Step 5 entry has the rest).
+- (Step 6) A git worktree that shares the main tree's target directory
+  corrupts the main build: cargo's artifact hashes ignore the checkout's
+  path. One tree, or a target per worktree.
+- (Step 6) A session decides like a CP: what a replication sink commits
+  must be named by the state it committed, never by the latest handshake,
+  a record the pool may have rewound under, or an index a deletion
+  recycles.
+- (Step 6) Damage tolerance in a boot must ask what the dropped record was
+  holding: dropping a name loses a name, dropping a snapshot record frees
+  its blocks.
+- (Step 6) When real code applies a policy to an error, the mock must call
+  the same policy, or a refusal the mock never makes hides a boot-wide
+  failure.
+- (Step 6) A test names an event; assert that the event happened. A wait on
+  the wrong job's counter let a rollback test pass without a rollback.
 
 ## 2026-10-14: Phase C Step 5, snapshot deletion, the cleaner, `dbladed` and `otapctl`
 
@@ -1164,3 +1182,176 @@ Lessons:
 - A reader that writes its file first keeps its work when it is cut off
   (the 2026-10-14 lesson, confirmed: all four maps were complete on disk
   when the limit struck, and the run was continued rather than restarted).
+
+## 2026-10-16: Phase C Step 6, ublk recovery, incremental tables, the verification, replication
+
+The owner re-issued the Step 6 brief with its missing transport scope (now
+in `10`, with the note on how it was read) and asked for it in a strict
+thin-orchestrator mode: the lead, on Fable, kept the plan and the
+decisions and delegated every read, change, test run and checkpoint commit
+to Opus 5.5 workers that return short reports; no multi-round verifier
+loops; everything on the Windows host that day. `09` section 1 now
+describes the mode.
+
+### The execution model
+
+Five Opus 5.5 workers ran one after another, each committing its own
+checkpoint on `main` and writing what it decided and left open to
+`step6/notes/` (each note under 150 lines):
+
+| Commit | Worker | Scope |
+|---|---|---|
+| `217dad3` | Opus-Defect-Fixer | the five candidate defects of the Step 6 audit (`step6/README.md` section 2), all reproduced first and all real |
+| `8e34b4a` | Opus-Ublk-Recovery | scope A: `USER_RECOVERY` re-attach, the device record, the reaper, `otapctl device` |
+| `4f34e17` | Opus-Storage-Catalogue | scope B: format 2.4 incremental snapshot table and catalogue, `otapctl pool verify` |
+| `1637340` | Opus-Fabrics-Transport | scope C: replication over `SimNet` and TCP, `otapctl replicate`, the WSL 2 scripts |
+| `758adb8` | Opus-QA-Gatekeeper | one bounded adversarial review, its fixes; then the gates and these documents |
+
+6A found that a git worktree sharing the main tree's target directory
+overwrites the main tree's artifacts (cargo's hashes ignore the checkout
+path), so the next main build linked them; the rest of the step ran in the
+main tree, one worker at a time (`09` section 6 now says so).
+
+### What each worker built
+
+- **6A** (E41 to E45). The dirty boot's arena writes wait for the boot
+  commit's `A` slot, so no number of kills during the boot loses the hold;
+  the re-attach judges a stale-sealed slot by its neighbours and drops a
+  torn place whole; a damaged snapshot map page no longer wedges the CPs
+  (the deletion walk is tolerant, the snapshot quarantined); `START_DEV`
+  is begun and polled between engine ticks, since the kernel's partition
+  scan reads through the queue only the engine thread serves; an arena of
+  another size is refused unless nothing can be lost, and
+  `--discard-arena` is the override. No format, layout or wire change.
+- **6B-1** (E40, E46 to E49). The 6.12 driver's recovery rules read from the
+  saved source and modelled by `MockKernel`; devices created with
+  `USER_RECOVERY_REISSUE` (required) and a stamp in `ublksrv_flags`; a
+  host-local binding record in `--state-dir`; the recovery stepped in
+  turn with engine ticks between; standings and a reaper that never
+  deletes silently; `otapctl device list|reap`. 5 sys, 4 control, 15 ublk,
+  15 daemon and 3 ctl tests.
+- **6B-2** (E50 to E53). Format 2.4: the snapshot table and the catalogue as
+  a base and up to 124 deltas behind a head page (F19 to F21, vectors
+  `v2.4/`), a fold policy (64 deltas, 256 records) and its reserve rule,
+  damage tolerated as uncertainty with `SNAP_UNCERTAIN` persisted, the
+  Step 4 review's hazard 12 (a shared metadata region counted twice at
+  boot) and the Step 5 review's hazard 9 (rewritten root pages unlisted)
+  closed; the verification job, its 17 kinds of finding, its holds on the
+  deferred frees, `otapctl pool verify`. At 1,000 cases: the catalogue walk
+  59 s, the verification walk 43 s.
+- **6C** (E54 to E59). `otap_cp::repl`: the source (a stable view without
+  held frees, chunks rebuilt on demand, an anchor chunk for an empty
+  delta), the sink (lands on a committed CP, cursor in `--state-dir`, the
+  destination snapshot as the commit record, rollback to the base),
+  `SimNet` and `MemStore` in the simulator, `TcpReplicationTransport` in
+  the daemon (loopback by default, no TLS), `otapctl replicate
+  push|pull|status|cursor|cancel|release`; `scripts/wsl2-prep.sh` and the
+  extended `scripts/linux-smoke.sh`. No new crate and no new dependency.
+
+### The review
+
+One bounded pass (the report, verbatim, is
+`reviews/2026-10-16-step6-qa-adversarial.md`): six read-only Opus readers
+over six areas returned 38 candidate findings; the gatekeeper reproduced
+each it took up with a failing test, fixed it, and looked for the same
+pattern nearby. 28 tests in eight `review_step6_*` files; four existing
+tests changed (three ported for D9, one whose wait read the wrong job).
+
+| # | Class | Finding | Fix |
+|---|---|---|---|
+| D1 | loss | a block failing its CRC was relocated; an unclean boot then rewound past a sound CP (the Step 5 hazard 8) | verified before it moves; its segment skipped |
+| D2 | loss | a later handshake renamed the delta that landed: old content under the new snapshot's identity | the snapshot takes the landing's identity |
+| D3 | loss | the sink's rewind guard never fired; landed chunks a lost CP carried were skipped | the record keeps the CP nonce; checked at attach |
+| D4 | loss | a rollback of the mirror wiped chunks its record still claimed; operators could roll back or resize a mirror | landing forgotten first; both refused on a mirror |
+| D5 | loss | an existing offline volume named as destination was deleted and recreated | refused unless a record or the pool names it a mirror |
+| D6 | exposure | a mirror whose record was lost (tmpfs) could be brought online half-landed | a pinned transfer base keeps it marked |
+| D7 | misdirection | a sink record outlived its volume and took the next one at the index | forgotten at deletion |
+| D8 | exposure | a cleaning CP lifted a snapshot's quarantine | kept through the rewrite |
+| D9 | loss | a snapshot table that lost records booted without them, and the cleaner freed their blocks | the boot is refused, as 2.3 did |
+| D10 | loss | a damaged placed word of a one-block write was released as an interrupted fill | judged at its implied position; `Fills::Serial` |
+| D11 | misdirection | a ublk device was re-attached to another volume (index reused after `--no-ublk`; twin stamps) | record kept on every boot; twins left stale |
+| W1 | wedge | a target held by another volume of the sink pool wedged both jobs | refused at the handshake |
+| W2 | wedge | a device live under a reused pid was refused, or handed to `STOP_DEV` | the earlier process's: waited for, never reaped |
+| W3 | wedge | a clean resize killed after `A` could not boot at either size | the new arena written at once |
+| R1 | protocol | field-less requests and `Ok` accepted unknown fields | empty struct variants |
+| R2 | CLI | `--switch=value` turned the switch on (`--force=no`, `--stale=false`) | refused, `otapctl` and `dbladed` |
+| R3 | liveness | a full pool could not be verified | only holding something aborts |
+| R4 | contract | one unprivileged ublk device failed the listing and every boot | left out on `EINVAL`; the mock answers as the kernel |
+| R5 | robustness | a rewritten damaged slot could move the next attach's head by laps | rewritten under its implied lap |
+| R6 | security | peer text reached the terminal unescaped | escaped |
+
+Seventeen cited items were not reproduced and are recorded as such (C1 to
+C17 in the report); the one the gatekeeper tried hardest to reproduce, a
+verification giving way to a full pool, recovered by itself (C1, pinned by
+a test, no code changed). The review also raised `--recovery-timeout`'s
+default from 5 s to 35 s (E48, E60).
+
+### Gates
+
+On the committed and pushed review commit `758adb8`:
+
+| Gate | Result |
+|---|---|
+| fmt (workspace and fuzz) | clean |
+| clippy, host | clean |
+| clippy, `x86_64-unknown-linux-gnu` | clean |
+| clippy, fuzz (`--no-default-features`) | clean |
+| rustdoc, warnings denied | clean |
+| `bash -n` on both scripts | clean |
+| `cargo test --workspace` | 760 tests and 2 doctests passed, 0 failed, 1 ignored, in 3 min 43 s (Step 5: 541 and 2) |
+| 10,000 cases, `step6c_replication_sim_tests` | passed, 10 min 0 s (60 s at 1,000) |
+| 10,000 cases, `step6b_catalogue_sim_tests` | passed, 10 min 11 s (59 s at 1,000) |
+| 10,000 cases, `step6b_verify_sim_tests` | passed, 7 min 25 s (43 s at 1,000) |
+| 10,000 cases, `adversarial_arena_tests` (with 6A's `KillInsideFill`) | passed, 3 min 58 s |
+| 10,000 cases, `step6c_transport_wire_tests` | passed, 5 s |
+| 10,000 cases, `step6b_catalogue_format_tests` | passed, 1 s |
+| `PROPTEST_CASES=10000 cargo test --workspace` | interrupted, not concluded: started 17:02:28 on `758adb8`; at about 20:15 the session harness stopped the wrapper shell for low system memory, by which point 58 test binaries had reported 496 tests passed and none failed (`sim_tests` 17 min, `step4_sim_tests` 63 min), and the orphaned test run was still going on in `step5_sim_tests`; its end, if it finished, is in `OpenTAP-local/step6/gate-10k-2026-10-16/workspace.log` and is to be recorded here once read |
+
+The Step 6 suites ran one at a time before the full gate, so a failure
+would have shown within the hour; none failed. The full gate runs them
+again with new seeds.
+
+### The Linux work
+
+Nothing kernel-facing has run. The WSL 2 features were enabled on
+2026-10-14; firmware virtualization (BIOS "SVM Mode") is still off and the
+inbox `wsl.exe` is the stub, so the owner's switch and a reboot come
+first. Tomorrow's order, from the 6C notes: BIOS SVM on and reboot;
+`wsl --install --no-distribution`; Debian (its VHDX on E:); `sudo
+scripts/wsl2-prep.sh --install-deps`; `scripts/wsl2-prep.sh
+--build-kernel` (Microsoft's `linux-msft-wsl-6.18.54.1` with
+`BLK_DEV_UBLK=m`, `DM_LOG_WRITES=m` and the rest); the `.wslconfig` kernel
+line and `wsl --shutdown`; the staged modules copied and `depmod`;
+`scripts/wsl2-prep.sh --probe` all PASS; `sudo scripts/linux-smoke.sh`,
+then `--heap-arena`; every finding into this log. The 6.18 driver must be
+saved and read against E40 before the re-attach is trusted on it; and the
+smoke test's dd keeps one request in flight, so the every-tag-held path
+(the 35 s wait) needs fio with a deep queue.
+
+### Lessons
+
+- A git worktree that shares the main tree's target directory corrupts the
+  main build: cargo's artifact hashes do not include the checkout's path.
+  Give a worktree its own target, or work in one tree, one worker at a
+  time.
+- A replication session decides like a CP and fails like one: every sink
+  defect the review found was an action taken against a newer or older
+  view than the one it committed (a target from the latest handshake over
+  the old delta's content, a record trusted against a pool that rewound
+  under it, an identity read from an index a deletion recycled). What a
+  session commits must be named by the state it committed.
+- Tolerance in a boot is only safe when what it drops cannot be pinning
+  data. Dropping unreadable names (the catalogue) loses names; dropping
+  unreadable snapshot records lets the cleaner free their blocks. Damage
+  tolerance has to ask what the lost record was holding.
+- A mock that never refuses hides the refusals: the ublk host model listed
+  every device, so no test could see one unprivileged device fail every
+  boot. When the real code applies a policy to an error, put the policy in
+  one function both the real host and the mock call.
+- A test's wait condition needs its own oracle: the 6C rollback test waited
+  on a counter of the previous job, passed, and never rolled anything back.
+  Assert that the event the test is named for happened.
+- An invariant that holds for today's only writer (one fill at a time) is
+  not a library's contract: the arena's own random walk legitimately
+  interleaves reservations, so the stronger rule became the writer's
+  declaration (`Fills::Serial`) rather than an assumption.

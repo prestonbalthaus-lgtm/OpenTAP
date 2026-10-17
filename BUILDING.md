@@ -16,24 +16,24 @@ Phase C (v0.1, single-node foundation) is one Cargo workspace.
 
 | Crate | Step | Purpose |
 |---|---|---|
-| `crates/otap-format` | 1, 2, 4, 5 | On-disk format v2.3 and the stream frame header v1: zerocopy layouts, CRC-32C sealing and verification, the superblock ring, stripe summaries, map pages and roots, segment and snapshot records, the CP log and its directory, the snapshot root page, the name catalogue and the commit's stripe list. No I/O, no `unsafe`. |
+| `crates/otap-format` | 1, 2, 4, 5, 6 | On-disk format v2.4 and the stream frame header v1: zerocopy layouts, CRC-32C sealing and verification, the superblock ring, stripe summaries, map pages and roots, segment and snapshot records, the CP log and its directory, the snapshot root page, the name catalogue, the commit's stripe list, and the table log and head pages of the incremental snapshot table and catalogue. No I/O, no `unsafe`. |
 | `crates/otap-stream` | 2 | Stream v1 over the frame header: typed frames, the codec (CRC-checked frames with zero-copy `Bytes` payloads, 8 MiB bound), the resumable landing cursor and its persisted page, credit windows. No sockets. |
-| `crates/otap-sys` | 2, 4 | The system boundary and the only crate with `unsafe`: hugetlbfs arenas, the ublk UAPI mappings, command encodings, control ring and queue mapping, io_uring buffer registration and cloning, the block-device ring behind the Linux backstore, the startup capability probe. Linux implementations with portable fallbacks. |
-| `crates/otap-arena` | 3, 4 | The write-cache arena over `otap-sys` memory: a bump allocator handing out slot runs with lap counters, the per-slot state table, hole records for discards, and re-attach after `kill -9` with no acknowledged write or punch lost. |
+| `crates/otap-sys` | 2, 4, 6 | The system boundary and the only crate with `unsafe`: hugetlbfs arenas, the ublk UAPI mappings, command encodings, the control ring (waited for, or begun and polled) and queue mapping, `DEL_DEV_ASYNC` and the device class listing, io_uring buffer registration and cloning, the block-device ring behind the Linux backstore, the startup capability probe. Linux implementations with portable fallbacks. |
+| `crates/otap-arena` | 3, 4, 6 | The write-cache arena over `otap-sys` memory: a bump allocator handing out slot runs with lap counters, the per-slot state table, hole records for discards, and re-attach after `kill -9` with no acknowledged write or punch lost, its writes deferred until the boot commit lands. |
 | `crates/otap-index` | 3, 4 | The volatile dirty index: per-volume B-trees of dirty extents (data and holes) that coalesce writes into slot runs, and the epoch-flip cut (`arc-swap`) that freezes a generation without stalling writers. |
-| `crates/otap-map` | 4, 5 | The persistent two-level map: per-volume roots and page indexes, an in-memory overlay of changes since the last fold, delta regions and the CP log directory, copy-on-write folds, snapshot pinning and the `birth_cp` walk, the rollback, resize and deletion of volumes, the rewrite of a pinned tree. No I/O: pages come through a reader, regions go through a writer. |
-| `crates/otap-cp` | 3, 4, 5 | The consistency-point engine and the `Backstore`, `FrontDoor`, `Clock` and `Net` traits: the write, read and punch paths, the flusher that assembles full stripes and packs the CP's metadata regions into whole stripes, the fold policy, snapshots and their deletion, pins and the replication base, rollback, resize and offline volumes, the segment cleaner with its reserve, the admission rule and pacing, segment liveness and deferred frees, boot with replay, torn-CP rewind and nvfail, the E19 flush policy. |
+| `crates/otap-map` | 4, 5, 6 | The persistent two-level map: per-volume roots and page indexes, an in-memory overlay of changes since the last fold, delta regions and the CP log directory, copy-on-write folds, snapshot pinning and the `birth_cp` walk (strict and tolerant), the rollback, resize and deletion of volumes, the rewrite of a pinned tree. No I/O: pages come through a reader, regions go through a writer. |
+| `crates/otap-cp` | 3, 4, 5, 6 | The consistency-point engine and its traits (`Backstore`, `FrontDoor`, `Clock`, `Net`, and for replication `Link`, `Dialer`, `LinkListener`, `SinkStore`): the write, read and punch paths, the flusher that assembles full stripes and packs the CP's metadata regions into whole stripes, the fold policy, snapshots, their deletion and quarantine, pins and the replication base, rollback, resize and offline volumes, the snapshot table and catalogue as chains, the segment cleaner with its reserve, the admission rule and pacing, segment liveness and deferred frees, the pool verification, boot with replay, torn-CP rewind and nvfail, the E19 flush policy; the replication sessions (`repl`). |
 | `crates/otap-geom` | 4 | Geometry discovery: sysfs queue facts (mockable), device classification, the stripe and segment plan aligned to md or hardware RAID, the media profile with its flush and discard policies, operator overrides. |
 | `crates/otap-backstore` | 4 | The real `Backstore`s: `UringBackstore` over a block device on io_uring (Linux: `O_DIRECT`, staged writes, `fsync` barriers, `BLKDISCARD`) and `FileBackstore`, a synchronous file-backed fallback that runs the engine on any host. |
-| `crates/otap-ublk` | 4 | The ublk front door: the tag state machine from queue descriptors to engine requests and back to results (watermarks, offline and nvfail rejection, stale-completion defence), a mock transport for tests on any host, and on Linux the device lifecycle and runner over `otap-sys`. |
-| `crates/otap-sim` | 3, 4, 5 | The deterministic simulator: fake device (pending, cached, durable layers; sector-level tears; discards; a controller cache that may or may not survive a power cut), fake client, virtual clock, loopback network, the checker model (writes, punches, rollbacks and resizes), and the harness that crashes and reboots the engine, takes and deletes snapshots, rolls back, resizes and deletes volumes, runs the cleaner, and checks the images, the diffs and the liveness accounting. |
-| `crates/otap-control` | 5 | The control protocol between `dbladed` and `otapctl`: the request and reply types as tagged JSON, length-prefixed frames, the endpoint syntax (a Unix socket on Linux, loopback TCP anywhere), a blocking client, the shared size and bound helpers. No sockets opened except by the client. |
-| `crates/otap-daemon` | 5 | `dbladed`: one engine thread over a block device (io_uring on Linux) or a file, the CP ticker and the cleaner inside the tick, a ublk device per online volume on Linux, the control server, a clean shutdown on `SIGTERM`, `SIGINT` and `daemon stop`. Runs in process in the tests. |
-| `crates/otap-ctl` | 5 | `otapctl`: the ONTAP-style command line (`daemon`, `pool`, `volume`, `snapshot` and `io` groups), text or JSON output, exit codes for refusals and unreachable daemons. |
+| `crates/otap-ublk` | 4, 6 | The ublk front door: the tag state machine from queue descriptors to engine requests and back to results (watermarks, offline and nvfail rejection, stale-completion defence), a mock transport for tests on any host; the host-independent device control, the `USER_RECOVERY` re-attach and the standings of the reaper, `MockKernel` (the 6.12 driver's rules in memory); on Linux the device lifecycle, `LinuxHost` and the runner over `otap-sys`. |
+| `crates/otap-sim` | 3, 4, 5, 6 | The deterministic simulator: fake device (pending, cached, durable layers; sector-level tears; discards; a controller cache that may or may not survive a power cut), fake client, virtual clock, loopback network, `SimNet` (byte pipes with seeded drops, cuts, corruption and refused dials) and `MemStore`, the checker model (writes, punches, rollbacks and resizes), and the harness that crashes and reboots the engine, takes and deletes snapshots, rolls back, resizes and deletes volumes, runs the cleaner and the verification, and checks the images, the diffs and the liveness accounting. |
+| `crates/otap-control` | 5, 6 | The control protocol between `dbladed` and `otapctl`: the request and reply types as tagged JSON (unknown fields refused everywhere), length-prefixed frames, the endpoint syntax (a Unix socket on Linux, loopback TCP anywhere), a blocking client, the shared size and bound helpers. No sockets opened except by the client. |
+| `crates/otap-daemon` | 5, 6 | `dbladed`: one engine thread over a block device (io_uring on Linux) or a file, the CP ticker and the cleaner inside the tick, a ublk device per online volume on Linux with its re-attach after a crash and a binding record in `--state-dir`, the replicator and its TCP transport, the control server, a clean shutdown on `SIGTERM`, `SIGINT` and `daemon stop`. Runs in process in the tests. |
+| `crates/otap-ctl` | 5, 6 | `otapctl`: the ONTAP-style command line (`daemon`, `pool`, `volume`, `snapshot`, `io`, `device` and `replicate` groups), text or JSON output, exit codes for refusals, unreachable daemons and waited jobs that did not end well. |
 | `fuzz/` | 2 | cargo-fuzz targets for the superblock ring, stripe summaries and frame demuxing (its own workspace; nightly). |
 
 The format crate's root documentation (`crates/otap-format/src/lib.rs`) is
-the layout specification and records the format rulings F1 to F18.
+the layout specification and records the format rulings F1 to F21.
 
 ## Building and testing
 
@@ -147,8 +147,8 @@ fields, a byte-at-a-time stream, hostile bodies, the frame bound).
 
 ### Golden vectors
 
-`crates/otap-format/tests/vectors/v2.0/`, `v2.1/`, `v2.2/` and `v2.3/` hold byte-exact images
-of every structure as formats 2.0 to 2.3 (stream 1.0) wrote them, each with
+`crates/otap-format/tests/vectors/v2.0/` to `v2.4/` hold byte-exact images
+of every structure as formats 2.0 to 2.4 (stream 1.0) wrote them, each with
 a BLAKE3 manifest whose hash is pinned in `format_tests.rs`. The decode lane
 reads every set with the current reader on every run, so a later release
 proves it still reads what an earlier one wrote. Regenerating a set is a
@@ -165,19 +165,30 @@ snapshot and CP log records; Step 4's 2.1 set was the first minor bump,
 for the CP log directory, the snapshot root page and the superblock's
 open-data fields, and its review's 2.2 set the second, for the recorded
 geometry; Step 5's 2.3 set the third, for the catalogue, the stripe list
-and the offline flag.)
+and the offline flag; Step 6's 2.4 set the fourth, for the table log and
+head pages and the superblock's head CPs.)
 
-### The smoke test on Debian 13
+### The smoke test on Debian 13 or WSL 2
 
 `scripts/linux-smoke.sh` is the first-run test of the Linux halves: a loop
 device (or `--device /dev/sdX`, which is wiped), a hugetlbfs arena (or
 `--heap-arena`), `dbladed` with one volume on `/dev/ublkbN`, dd and fio,
-a snapshot, a rollback, the cleaner, a `SIGTERM` restart and a `SIGKILL`
-restart. It needs root, kernel 6.12 or later with `ublk_drv`, `util-linux`,
-`diffutils`, optionally `fio` and `jq`; `--release` builds the release
-profile, `--keep` leaves the work directory. The README's "Running the
-smoke test on Debian 13" has the exact steps and the manual equivalent.
-It has not been run yet.
+a snapshot, a rollback, the cleaner, a `SIGTERM` restart, a `SIGKILL`
+restart under I/O that must re-attach the same `/dev/ublkbN`, an orphaned
+device listed and reaped, `pool verify`, and a push to a second `dbladed`
+over 127.0.0.1 compared byte for byte. It needs root, kernel 6.12 or later
+with `ublk_drv`, `util-linux`, `diffutils`, optionally `fio` and `jq`;
+`--release` builds the release profile, `--keep` leaves the work
+directory, `--repl-port` names the second daemon's port. Under `sudo` it
+builds as the calling user with that user's rustup toolchain, and a
+repository on a Windows drive builds into a target directory on the Linux
+file system. `scripts/wsl2-prep.sh` prepares a WSL 2 distribution: `--probe`
+(the default) checks the kernel, io_uring, hugetlbfs, `/dev/ublk-control`,
+the dm targets, the tools and the toolchain; `--install-deps` installs the
+packages; `--build-kernel [tag]` builds Microsoft's WSL kernel (6.18 by
+default) with ublk and dm-log-writes as modules. The README's "Running the
+smoke test" has the exact steps and the manual equivalent. Neither script
+has run yet.
 
 ### Windows development hosts (x86_64-pc-windows-gnu)
 
@@ -197,6 +208,12 @@ there over the simulator's device and over a plain file, and `dbladed` and
 
 Keep heavy work polite on the shared desktop: `cargo build -j 3`, tests with
 `--test-threads=6`.
+
+A git worktree needs its own target directory (`CARGO_TARGET_DIR`): cargo's
+artifact hashes do not include the checkout's path, so a worktree that
+shares the main tree's `target/` overwrites the main tree's artifacts with
+a build of its own sources, and the next build in the main tree links them
+without rebuilding (`docs/09-working-agreements.md`, section 6).
 
 ## Source control
 

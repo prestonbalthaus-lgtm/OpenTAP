@@ -575,14 +575,15 @@ The message pasted the following:
   halves are type-checked for `x86_64-unknown-linux-gnu` and have not
   executed.
 
-## Step 6 brief (received 2026-10-14)
+## Step 6 brief (received 2026-10-14, completed 2026-10-16)
 
 The owner pasted the brief into the session; the paste ended mid-sentence
 in the "Dual Transport Backends" list of the third worker (at "1"), so
 everything after that point (the rest of the transport scope, the fourth
 worker, and any later sections) did not reach the lead. The text below is
-what arrived, verbatim; the note at the end of this entry says how the
-missing part was read.
+what arrived, verbatim; the owner sent the rest on 2026-10-16, saved
+verbatim after it, and the note at the end of this entry says how the
+whole was read.
 
 > # OpenTAP Step 6 Implementation Brief: `USER_RECOVERY` Re-Attach, Incremental Catalogue & Snapshot Tables, Pool Attestation, and Replication Transport (Windows Host Execution)
 >
@@ -626,8 +627,99 @@ missing part was read.
 
 (The paste ends here.)
 
-### Status (2026-10-14)
+### The rest of the brief (received 2026-10-16)
 
-Step 6 was paused before the design, at the owner's request; its state and
-the remaining work are in `step6/README.md`. The note on how the brief was
-read follows when the step ends.
+The owner sent the rest of the brief on 2026-10-16, from "Dual Transport
+Backends: 1" on. It continues the list above and is saved verbatim:
+
+> Dual Transport Backends: 1. Deterministic In-Memory `Net` Implementation in `otap-sim`: Supports seeded packet drops, partial frame disconnects, and re-handshakes using `otap-stream` (`CursorPage` and `ResumeBitmap`). 2. Cross-Platform Framed TCP Transport (`TcpReplicationTransport`): Runs natively on both Windows and Linux (`std::net::TcpListener` / `std::net::TcpStream` over `127.0.0.1` or LAN), enabling two pools or `dbladed` instances to execute live incremental snapshot delta shipping (`DeltaBegin` -> `Chunk`/`Holes`/`VolEvent` -> `DeltaEnd` -> `Landed` -> `Committed`) and mid-stream resume on Windows today. CLI Integration: Add `otapctl replicate push/pull/status/cursor` commands so replication can be driven end-to-end through `dbladed`. Opus-QA-Adversarial: Perform a single bounded adversarial review across the Step 6 code (Lesson E39: reproduce every finding with a test before recording it as a defect). Author `scripts/wsl2-prep.sh` and update `scripts/linux-smoke.sh` so the workspace is ready once the user enables BIOS SVM and boots WSL 2.0. Gates: cargo fmt --check; cargo clippy --workspace --all-targets -- -D warnings (host Windows and --target x86_64-unknown-linux-gnu) and fuzz clippy; cargo doc -D warnings; cargo test --workspace; PROPTEST_CASES=10000 on the new Step 6 suites or the full workspace, committing code before the long gate; update docs/06, 07, 08 and push to main.
+
+### How Step 6 was read
+
+- **How it ran.** The brief arrived on 2026-10-14 cut off in the transport
+  scope; the understanding phase (thirteen maps of the code, four of them
+  verified by agents) is in `step6/` and the `08` entries of 2026-10-14
+  and 2026-10-15. On 2026-10-16 the owner re-issued the brief, its rest
+  included, in a strict thin-orchestrator mode: the lead (Fable) kept the
+  plan and delegated every read, change, test run and checkpoint commit to
+  Opus 5.5 workers returning short reports, with no multi-round verifier
+  loops and with execution on the Windows host that day (`09`, section 1).
+  Five workers ran in sequence, each committing its own
+  checkpoint on `main`: Opus-Defect-Fixer (`217dad3`, the five candidate
+  defects of the audit), Opus-Ublk-Recovery (`8e34b4a`, scope A),
+  Opus-Storage-Catalogue (`4f34e17`, scope B), Opus-Fabrics-Transport
+  (`1637340`, scope C and the scripts), and Opus-QA-Gatekeeper (`758adb8`,
+  the review, then the gates and these documents). Each construction
+  worker wrote what it decided and what it left open in
+  `step6/notes/`, which the decisions E40 to E59 in `07` are taken from.
+- **"Direct four specialized Opus 5.5 worker agents"**: the three
+  construction scopes were three workers in sequence rather than four in
+  parallel, because scopes B and C both change the CP's `prepare_meta`,
+  `finalize` and the boot, and git worktrees sharing the target directory
+  were found to corrupt each other's builds (6A's tooling finding, `09`
+  section 6). A fifth worker went first and fixed the audit's five
+  candidate defects (E41 to E45), which the brief did not name but every
+  scope stood on. The fourth named worker, "Opus-QA-Adversarial", is the
+  gatekeeper's review.
+- **"Opus-Ublk-Recovery"**: `UBLK_CMD_START_USER_RECOVERY` and
+  `UBLK_CMD_END_USER_RECOVERY` with the state machine in `otap-ublk`
+  (`Recovery`), the coordination with the arena re-attach in `Pool::boot`
+  (the devices are recovered after the boot commit, before any new
+  device), and the reaper with `otapctl device list` and `device reap`
+  (E40, E46 to E49). "Reconcile in-flight tags without duplicating or
+  dropping acknowledged writes" is `UBLK_F_USER_RECOVERY_REISSUE`, on and
+  required, with the idempotency argument of E46; "resume serving within
+  the 2-second recovery budget" holds on the simulated clock for a device
+  the driver has quiesced, and cannot hold for one whose daemon died
+  holding every tag, which the driver quiesces only at the block layer's
+  30 s request timeout (E48). "Test deterministically on Windows via the
+  mock transport" is `MockKernel`, an in-memory model of the 6.12
+  driver's rules.
+- **"Opus-Storage-Catalogue"**, the tables: "logging deltas in `CpLogPage`
+  or CoW catalogue pages" became new page types (format 2.4, F19 to F21):
+  a `CpLogPage` record cannot hold a snapshot record or a name. "O(1) CP
+  metadata overhead" holds on disk (an unchanged table writes nothing, a
+  changed one a delta of its changed keys and a head); in memory the
+  tables are still compared in O(n) (E50). "Backward/forward format
+  clarity": the engine boots 2.4 only, the older vector sets keep decoding,
+  and the downgrade hazard of a 2.3 binary is recorded (`06` section 8).
+- **"End-to-End Pool Attestation"** is `otapctl pool verify`, an engine job
+  in slices (E53). "Bounds and LBA continuity" were defined nowhere; they are
+  read as the per-page and per-block checks E53 lists (entries, births and
+  bounds of every page, the address and descriptor of every block); the
+  design's "attestation" (the operator's statement about a RAID cache) is
+  a different item and stays unwritten. "Without panicking on corrupted
+  sectors" holds: every kind of injected damage is reported with its kind
+  and address.
+- **"Opus-Fabrics-Transport"**: the sender and receiver are `otap_cp::repl`
+  over the `Link` traits (E54 to E58). "Pinning a `ReplicationBase`
+  snapshot" and "advancing the base only upon `Committed`" are the
+  `PIN_REPLICATION` bit moved on `Committed` (E57); "staging incoming
+  chunks, enforcing credit windows, maintaining the `CursorPage` /
+  `ResumeBitmap` across disconnects" are the sink's window and its record
+  in `--state-dir` (E56); "committing the received delta as an atomic CP"
+  is the destination snapshot, taken under the source's identity only
+  after every chunk landed in a committed CP. The deterministic `Net` is
+  `otap_sim::SimNet` (drops, cuts, corruption, refused dials, a pulled
+  cable); the TCP transport is `TcpReplicationTransport`, run on Windows
+  between two in-process daemons; "127.0.0.1 or LAN" is loopback by
+  default and LAN with `--allow-remote-replication`, since there is no TLS
+  or authentication yet (E58). "`otapctl replicate push/pull/status/cursor`"
+  grew `cancel` and `release`.
+- **"Opus-QA-Adversarial"**: one bounded review, every finding reproduced by
+  a failing test before it was recorded as a defect and fixed (eleven
+  data-loss defects, three wedges, six robustness defects), seventeen cited
+  items recorded as cited and untested, the report in
+  `reviews/2026-10-16-step6-qa-adversarial.md`, the decisions in E60.
+- **The WSL 2 tooling**: `scripts/wsl2-prep.sh` probes, installs the
+  packages and builds a WSL 2 kernel with `CONFIG_BLK_DEV_UBLK=m` (the
+  brief says `=y`; a module serves the same purpose and keeps the stock
+  configuration otherwise) from Microsoft's 6.18 tree, the line WSL ships,
+  rather than 6.12 (the saved driver sources are 6.12; 6.18's must be read
+  before the Linux run is trusted). `scripts/linux-smoke.sh` gained the
+  re-attach under I/O, the orphan and the reaper, the verification and a
+  push between two daemons. Neither has run: the WSL host waits for the
+  owner's BIOS switch.
+- **The gates** ran as `09` section 3 lists them, the code committed and
+  pushed before the 10,000-case run, which ran the new Step 6 suites one
+  at a time and then the full workspace (`06`, section 5).

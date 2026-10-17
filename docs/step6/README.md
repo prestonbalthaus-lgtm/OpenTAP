@@ -1,5 +1,12 @@
 # Step 6: work in progress
 
+**Done (2026-10-16).** Step 6 was built in four worker commits (`217dad3`,
+`8e34b4a`, `4f34e17`, `1637340`), reviewed and gated; what each worker did
+and decided is in `notes/`, the review in
+`../reviews/2026-10-16-step6-qa-adversarial.md`, the decisions in `07`
+(E40 onward) and the account in the 2026-10-16 entry of `08`. The rest of
+this file is the handoff as it stood before the work, kept as the record.
+
 Begun on 2026-10-14; the understanding phase ended on 2026-10-15, when the
 four readers that had been cut off were run again and their maps verified.
 **No source file has changed**: the code is Step 5's commit `5114866`; only
@@ -63,7 +70,10 @@ documents were added. Nothing is decided yet and nothing is recorded in
   not decisions.
 - **Tooling, tested once**: a git worktree per worker under
   `E:\Coding\otap-wt\` that shares the main tree's target directory builds
-  in seconds and leaves the main cache valid; a wrapper lets only one cargo
+  in seconds and leaves the main cache valid (wrong, found by Step 6A: the
+  shared target collides, because cargo's artifact hashes ignore the
+  checkout's path, so a worktree's build overwrote the main tree's
+  artifacts; a worktree needs its own target, `09` section 6); a wrapper lets only one cargo
   process run at a time on the PC. The workspace test gate was run again on
   2026-10-15 on the unchanged tree: 541 tests and 2 doctests passed, 1
   ignored, in 2 min 49 s.

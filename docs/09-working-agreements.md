@@ -1,7 +1,7 @@
 # OpenTAP working agreements
 
 How the implementation work is done. Living document; last updated
-2026-10-13. Change it when a rule changes, and record why in
+2026-10-16. Change it when a rule changes, and record why in
 `08-engineering-log.md`.
 
 ## 1. Roles
@@ -19,6 +19,19 @@ How the implementation work is done. Living document; last updated
   the files its brief names, never the sources it reviews; it reports
   defects, and the lead fixes them. A worker's report is read in full and
   every finding is either fixed and pinned by a test or refused in writing.
+  Workers run on Opus 5.5, never on the lead's model (the owner's rule of
+  2026-10-15).
+- **The thin-orchestrator mode**, when a brief asks for it (Step 6, re-issued
+  on 2026-10-16): the lead keeps the plan and the decisions but delegates
+  every read, change, test run and checkpoint commit to Opus 5.5 workers
+  that return short reports, run one at a time, and each commit their own
+  checkpoint on `main` with their decisions written to a notes file
+  (`docs/step6/notes/`); no multi-round verifier loops. A final worker, the
+  QA gatekeeper, then makes one bounded adversarial review in which it
+  fixes what it reproduces (tests first), runs the gates, and writes the
+  step's documents from the notes. The rule that a reviewer never fixes
+  the sources it reviews is suspended for that worker, and its report
+  says so.
 - **Personas for design rounds** (Opus-Storage, Opus-Protocols, Opus-Fabrics,
   Opus-Consensus, plus the critics) are kept for any further design round;
   they are not used for implementation steps.
@@ -125,6 +138,12 @@ parallel builds. Rules:
   jobs at once, and never a stress test in parallel with a build.
 - A worker touches only its own files and runs only the test binaries it
   owns; it never runs a workspace-wide gate while the lead may be building.
+- A git worktree needs its own `CARGO_TARGET_DIR`. Cargo's artifact hashes
+  do not include the checkout's path, so a worktree that shares the main
+  tree's target directory overwrites the main tree's artifacts with a
+  build of its own sources, and the next build in the main tree links
+  them without rebuilding (Step 6A saw it; a `touch` forced the rebuild).
+  The rest of Step 6 ran in the main tree, one worker at a time.
 - Temporary files, extracted sources and toolchains go to the session
   scratchpad, never into the tree.
 - The 10,000-case gate (`PROPTEST_CASES=10000 cargo test --workspace`)
@@ -134,10 +153,15 @@ parallel builds. Rules:
   variable overrides an explicit `cases` in a `proptest!` configuration,
   so no property test is exempt from the gate. The simulator random walks
   (`sim_tests`, `adversarial_sim_tests`, `step4_sim_tests`,
-  `step5_sim_tests`) are single property tests, so more test threads do
-  not shorten them; after one build they can be run as separate test
-  processes at once to cut the wall time. Their seeds differ per run, so
-  the gate is repeated over time rather than treated as final once.
+  `step5_sim_tests`, and since Step 6 `step6b_catalogue_sim_tests`,
+  `step6b_verify_sim_tests` and `step6c_replication_sim_tests`) are single
+  property tests, so more test threads do not shorten them; after one
+  build they can be run as separate test processes at once to cut the wall
+  time (on a machine with the cores to spare: one at a time on the
+  development PC). Their seeds differ per run, so the gate is repeated over
+  time rather than treated as final once. Step 6 ran its new suites one at
+  a time at 10,000 cases before the full gate, so a failure shows within
+  the hour rather than after four.
 - Scripted edits of source files (perl, sed) are limited to one-line,
   literal replacements, never with `|` as the perl delimiter when the
   pattern holds a `\|`, and `cargo check` runs right after; multi-line

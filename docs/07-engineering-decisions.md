@@ -1533,3 +1533,769 @@ E38; nothing here changes the format.
   in-flight snapshot at the commit) and nothing stopped a request that
   landed in between. Every decision a CP makes about shared state must be
   made against the same view, or refused until the view settles.
+
+## E40. What the 6.12 ublk driver does when its server dies, and what a recovery must meet
+
+2026-10-16. Accepted (Step 6B-1; read in the saved 6.12 `ublk_drv.c` and
+`ublk_cmd.h`, kept outside the tree, as E28 recorded its facts, before the
+mock models them).
+
+- **A server that dies with a fetch pending.** io_uring cancels the fetch
+  (`ublk_uring_cmd_cancel_fn`), the abort runs (`ublk_abort_requests`,
+  `ublk_abort_queue`) and the device is quiesced (`__ublk_quiesce_dev`,
+  state `QUIESCED`). A request the dead server held is failed through
+  `__ublk_fail_req`: requeued under `USER_RECOVERY_REISSUE`, `EIO`
+  without it; a request dispatched but not yet delivered is requeued
+  either way.
+- **A server that dies holding every tag.** Nothing is pending, so nothing
+  is cancelled: the device stays `LIVE` with a dead pid until the block
+  layer's request timeout fires `ublk_timeout`, and the driver sets no
+  timeout of its own, so blk-mq's default of 30 s applies.
+- **`START_USER_RECOVERY`** answers `EINVAL` without `USER_RECOVERY` or
+  with no ready queue, and `EBUSY` while the old character device is still
+  open (`UB_STATE_OPEN`, cleared when the dead process's file is released)
+  or the device is not `QUIESCED`; then it reinitialises the queues. The
+  new server opens `/dev/ublkcN` (exclusive), maps the descriptors and
+  issues a `FETCH_REQ` per tag.
+- **`END_USER_RECOVERY`** waits for those fetches (`EINTR` if interrupted),
+  answers `EBUSY` unless `QUIESCED`, records the new pid, unquiesces,
+  kicks the requeue list and returns the device to `LIVE` under the same
+  number. A server killed after `START` and before its last fetch leaves no
+  ready queue, so `START` answers `EINVAL` from then on: that device can
+  only be reaped. One killed after its fetches and before `END` leaves the
+  device `QUIESCED` with a ready queue, and the next `START` works.
+- **`STOP_DEV`** on a `QUIESCED` device unquiesces with a forced abort (held
+  I/O fails); on a `LIVE` one it quiesces first, waiting for started
+  requests, so a device still quiescing blocks it for up to 30 s.
+  `DEL_DEV` with its wait blocks while any `/dev/ublkcN` is open;
+  `DEL_DEV_ASYNC` does not. Neither checks an owner.
+- **Identity.** The driver lists no devices (they appear in the `ublk-char`
+  class); `GET_DEV_INFO` needs `CAP_SYS_ADMIN`; `ublksrv_flags` is copied
+  at `ADD_DEV` and never read, so it is the only identity a device keeps
+  across its server's death. `ublks_max` (64) counts every device until its
+  `DEL_DEV`.
+- **Consequences.** The recovery (E48) waits for `QUIESCED`, retries `EBUSY`,
+  fetches every tag from the serving thread before `END`, and gives up on
+  a device that will not quiesce within its budget; the reaper (E49) never
+  stops a device that is still quiescing. `MockKernel` in `otap-ublk`
+  models these rules and is what the Windows host tests run against.
+
+## E41. A dirty boot writes nothing to the arena until its commit has landed
+
+2026-10-16. Accepted (Step 6A, candidate 1 of `step6/README.md`; reproduced
+before the fix, three causes).
+
+- **Context.** A dirty boot's hold on the write-active volumes becomes
+  durable only with the boot commit's `A` slot (the volume table's
+  `nvfail_cause` rows and `sb.nvfail`). `Engine::boot` had already written
+  the arena by then: the attach rewrote damaged, filled and reserved slots
+  `Committed`, and `Arena::create` formatted a blank or lost arena. A
+  second `kill -9`, an `--op-timeout` in `Pool::boot`'s wait or a failed
+  boot commit before `A` landed left the next boot a whole arena and no
+  cause to hold, so it served volumes that had lost acknowledged writes,
+  without nvfail.
+- **Decision.** The order, not the layout: `otap-arena` gained
+  `attach_deferred` and `create_deferred` (which write nothing),
+  `apply_pending_writes`, `has_pending_writes` and `release_after_attach`
+  (the replay's releases join the pending writes); `reserve` answers
+  `ArenaError::Pending` meanwhile. The boot uses them, defers the replay's
+  orphan, superseded and unreplayable releases as well, and `step_commit`
+  applies the pending writes when the boot commit's `A` slot completes. A
+  boot stopped at any point leaves the memory as it found it, so any
+  number of kills keeps the hold. A kill between `A` and the apply only
+  holds again, which is harmless.
+- **Rejected.** The arena map's "pending hold" word in the arena header: a
+  layout change (arena 1.3) for state the evidence already carries, since
+  the damaged slots themselves survive untouched until the hold is
+  durable.
+- **Enforced by** `step6a_sim_tests`
+  (`a_boot_killed_before_its_commit_keeps_the_hold_a_{damaged_slot,blank_arena,lost_arena}_calls_for`,
+  `consecutive_kills_during_the_boot_never_lose_the_hold`,
+  `kills_during_the_boot_of_a_whole_arena_lose_nothing_and_hold_nothing`)
+  and `step6a_arena_tests` (`a_deferred_{attach,create}_writes_nothing_until_it_is_applied`,
+  `a_release_during_a_deferred_attach_waits_for_the_apply`).
+
+## E42. The re-attach judges a slot by its neighbours of the same write
+
+2026-10-16. Accepted, amended by E60 (the review's D10 and R5) (Step 6A, candidate 2; reproduced: the ring stalled
+`Full` at write 125 of the first lap).
+
+- **Context.** A fill stores a slot's fields, then its sealed word. A kill
+  between the two left a `Free` slot under the reservation's stale seal,
+  which the attach neither released nor reported; behind a kept `Placed`
+  slot the tail stopped there and every write within a lap stalled while
+  `damaged_slots` read 0. And a kill inside `place` left a `Placed` prefix
+  of a write whose later slots were still `Filled`, which the replay
+  served: the torn prefix of a write that was never acknowledged.
+- **Decision (run continuity).** A stale-sealed `Free` slot is judged by
+  its neighbours of the same write (sequence, volume, kind, lap, adjacent
+  LBA): a `Placed` slot before it, or any slot after it that is not
+  `Free`, means the fill went past it, so it is damage
+  (`Damage::Descriptor`, and the boot holds; this case was a silent loss
+  before). Otherwise it is an interrupted fill, released `Committed` on
+  its lap when it lies below the head and never noted (an unverified lap
+  must not move the head), counted in `Reattach::interrupted_fills`; at
+  or past the head it waits for the next `reserve`. A `Placed` slot whose
+  write still has a verifying `Filled` slot is dropped with the whole
+  write (`Reattach::torn_places`).
+- **Consequences.** The replay no longer serves a torn prefix: a write the
+  kill caught inside `place` is either whole or absent, both within the
+  contract, since it was never acknowledged. The arena walk's
+  `KillMidPlace` model in `adversarial_arena_tests` changed to expect the
+  prefix dropped, and the walk gained `KillInsideFill`.
+- **Enforced by** `step6a_arena_tests`
+  (`a_fill_killed_{between_a_slots_fields_and_its_word,on_its_first_slot}_does_not_stall_the_ring`,
+  `a_fill_killed_on_its_last_slot_is_left_to_the_next_reservation`,
+  `a_placed_word_damaged_to_read_free_is_reported_as_damage`,
+  `a_place_killed_midway_drops_the_whole_write`) and the arena walk.
+
+## E43. A damaged snapshot is quarantined, not fatal; deleting it releases only what can be read
+
+2026-10-16. Accepted, amended by E60 (the review's D8) (Step 6A, candidate 3, worse than the handoff said;
+extended by Step 6B-2's `SNAP_UNCERTAIN`, E51).
+
+- **Context.** The boot verifies a snapshot's root page and index only, so
+  `damaged: false` said nothing about its map pages. The deletion walk's
+  `pinned_diff(...)?` failed on a page that did not verify: in a plain CP
+  the error escaped `tick()` every tick and no CP of any volume committed
+  again; in a fold CP it would have set `fold_damaged` and stopped folds
+  pool-wide.
+- **Decision.** `MapSet::pinned_diff_tolerant` skips and returns damaged
+  pages. `Engine::deletion_walk` releases the blocks of the pages it can
+  read, keeps the damaged pages' blocks counted live (the safe direction,
+  as E36 did for a damaged root), and the deletion commits; a read error
+  defers that one deletion to the next CP instead of failing the CP. A
+  snapshot found damaged is quarantined in memory (`SnapState.damage`,
+  `OperatorWarning::SnapshotDamaged`, `damaged` in the snapshot list):
+  reads, diffs, new rollbacks and replication refuse it; it stays
+  deletable and keeps pinning. The deletion, the cleaner's
+  `DamagedSnapshot` skip, `snapshot_read`, `snapshot_diff` and
+  `audit_liveness` set it; the warning leaves with the snapshot.
+- **Rejected.** A `CORRUPT` bit in `SnapRecord.flags`: a format change with
+  the forward hazard of E50 for state the next walk finds again. (Step 6B-2
+  then added a persisted mark for a different cause, a record recovered
+  from a damaged table chain, E51.) And dropping a rollback accepted before
+  the quarantine: E32 contains the page, and dropping it would make
+  `finalize` report a rollback that did not happen.
+- **Enforced by** `step6a_sim_tests`
+  (`deleting_a_snapshot_with_a_damaged_map_page_does_not_wedge_the_pool`,
+  own page and a page shared with the live map;
+  `a_snapshot_found_damaged_is_quarantined_and_the_pool_goes_on`).
+
+## E44. `START_DEV` is begun, then polled between engine ticks
+
+2026-10-16. Accepted (Step 6A, candidate 4; the ordering deadlock
+reproduced on a mock; one kernel link unverified).
+
+- **Context (the saved 6.12 `ublk_drv.c`).** For a privileged server
+  (`CAP_SYS_ADMIN` at the last fetch) partition scanning stays on, and
+  `add_disk` runs inside `START_DEV`; control commands run in io-wq; the
+  scan's read reaches the server as task work on the fetching task, which
+  was the engine thread, blocked waiting for `START_DEV`. Unverified,
+  because `genhd.c` was not saved: that `add_disk` reads the partition
+  table synchronously. If it does, a root `dbladed` could not create any
+  device, and every Linux lane presupposed the fix. The same map found
+  `create_device`'s failure path deleting the device while the front door
+  still held `/dev/ublkcN`, so `DEL_DEV` waited forever.
+- **Decision.** `UblkControlRing::begin` and `poll` (bufferless, not waited
+  for; `execute` refuses meanwhile; one new entry in the unsafe
+  inventory); `UblkDevice::begin_start` and `poll_start`;
+  `otap_ublk::start` (`DeviceControl`, `start_while_serving`,
+  `StartError`): the fetches are submitted, the front door joins the
+  engine, `START_DEV` is begun, and the engine ticks with polls between.
+  The daemon's `create_device` no longer starts; `Pool::start_device` does,
+  under the operation timeout and the stop flag; `Pool::abandon_device`
+  drops the front door before `DEL_DEV`. The re-attach uses the same loop
+  for `END_USER_RECOVERY` (E48).
+- **Consequences.** After a timeout `abandon_device` waits up to 5 s for the
+  start, then logs a device left to the operator (the reaper lists it,
+  E49); unmeasured on Linux.
+- **Enforced by** `step6a_ublk_tests` over `MockStart` (the linked queue,
+  then a read of LBA 0 that must be answered):
+  `start_dev_completes_while_its_queue_is_served`,
+  `start_dev_waited_for_on_the_serving_thread_never_completes`, and five
+  edge cases.
+
+## E45. An arena of another size is refused unless nothing can be lost; `--discard-arena` is the operator's override
+
+2026-10-16. Accepted, amended by E60 (the review's W3) (Step 6A, candidate 5; both causes reproduced on the
+engine as it was).
+
+- **Context.** `map_file` grew the arena file, `verify` then failed
+  `BadGeometry`, and the boot recreated the arena over its placed writes; and
+  `can_attach` checked the geometry before the aggregate, so another
+  pool's arena file under a larger size was formatted over rather than
+  refused.
+- **Decision.** One rule, `otap_cp::check_arena_resize`: an arena is
+  resized only when nothing in it is placed and the pool's newest CP is a
+  clean shutdown with nothing rewound (`BootState::is_clean`), or when the
+  operator discards it; otherwise `EngineError::ArenaResize`, with the
+  memory untouched. `map_file` refuses a length change of a non-empty
+  file (`map_file_resizing` is the explicit form); `can_attach` checks
+  identity, then aggregate, then geometry; `Arena::survey` reads an arena
+  under its recorded geometry without touching it. The daemon's
+  `open_pool_arena` maps a mismatched file at its own length, judges it
+  (never another pool's arena; memory that holds no arena freely; the
+  superblock's clean state through `boot::evaluate`), then resizes.
+  `dbladed --discard-arena` (it needs `--device`; `PoolBoot` over the
+  control socket never discards) recreates the arena, reports
+  `arena_lost` and holds the write-active volumes.
+- **Consequences.** "Dirty" is the pool's superblock, so an empty arena of a
+  pool that stopped uncleanly is refused too; the operator restarts at the
+  old size, stops cleanly, then resizes. A command-line flag rather than a
+  protocol field, which would have been a wire change.
+- **Enforced by** `step6a_sim_tests`
+  (`a_larger_arena_over_placed_writes_is_refused_not_recreated`,
+  `a_larger_arena_after_an_unclean_stop_is_refused`,
+  `a_larger_arena_after_a_clean_shutdown_is_recreated`,
+  `a_discarded_arena_is_recreated_and_its_volumes_held`,
+  `another_pools_arena_under_another_size_is_refused`), four survey tests
+  in `step6a_arena_tests` and nine in `step6a_daemon_tests`.
+
+## E46. Devices are created with `UBLK_F_USER_RECOVERY_REISSUE`, and it is required
+
+2026-10-16. Accepted (Step 6B-1).
+
+- **Context.** Without `REISSUE` every request the dead daemon had fetched
+  and not answered fails with `EIO` when the device is quiesced (E40); with
+  it the kernel requeues them for the next server. The flag is fixed at
+  `ADD_DEV`.
+- **Decision.** `REQUIRED_UBLK_FEATURES` includes `USER_RECOVERY_REISSUE`,
+  `create` asks for it, and a driver that does not grant every required
+  flag is refused at create. The argument that re-executing is safe:
+  every request the front door serves is idempotent at the block level. A
+  re-executed write puts the same bytes at the same LBAs under a sequence
+  above every replayed one (`Placed` is set before
+  `FrontDoor::complete`, so an acknowledged write replays from a
+  re-attached arena; a reissued one is placed again and wins its range;
+  any write it overtakes was concurrent with it, so either order was
+  allowed); reads, flushes, discards and writes of zeros are harmless
+  twice. No request identity fits arena layout 1.2, and none could be
+  matched anyway: the kernel redispatches with no marker and possibly on
+  another tag.
+- **Rejected.** Running without `REISSUE`: a write durable in the arena
+  whose completion had not reached the kernel would fail `EIO`, which
+  aborts a filesystem, for a request the engine had in fact kept.
+- **Consequences.** Devices made by Step 5 binaries (no `REISSUE`, no
+  stamp) list as stale and are never re-attached (E49). On a heap-arena
+  restart the volumes are held (S5-1), so reissued requests get `EIO`,
+  delivered once.
+- **Enforced by** `step6b_recovery_sys_tests` (REISSUE required) and
+  `step6b_recovery_ublk_tests` (reissued writes land once, none lost,
+  through the engine over a kept arena).
+
+## E47. A device's identity: a stamp in `ublksrv_flags`, and a host-local binding file in `--state-dir`
+
+2026-10-16. Accepted, amended by E60 (the review's D11: the record is kept on every boot) (Step 6B-1).
+
+- **Context.** The driver lists no devices, and `ublksrv_flags` (64 bits
+  copied at `ADD_DEV` and never read) is the only identity it keeps
+  across a crash (E40). Device numbers are host-local and meaningless in
+  another host's kernel, so they do not belong in the pool.
+- **Decision.** The stamp is `0x07A9 << 48 | crc32c(agg_id) << 16 | vol`.
+  The record is `<state-dir>/ublk-<agg_id>.bindings`, by default under
+  `/run/opentap` (tmpfs: it dies with the kernel whose numbers it
+  records): a 40-byte header (`OTAPBIND`, version, entry size 32, at most
+  2,048 entries, the aggregate, the writer's pid), 32-byte entries keyed by
+  device number (device, volume, size, bound or stale, a reason code) and a
+  CRC-32C, verified before use, written by temporary file, `fsync`,
+  rename and directory `fsync`; an empty record removes the file; an
+  unreadable one is logged and rebuilt from the stamps. It is written at
+  create (before `START_DEV`), at recovery, teardown, when a device turns
+  stale, and at reap. `dbladed --state-dir` names the directory.
+- **Consequences.** The stamps are the authority and the record a hint; a
+  host reboot loses the record and, with it, nothing a stamp cannot
+  rebuild. A volume index above 65,535 cannot be stamped; the engine's
+  volume table holds 1,024.
+- **Enforced by** `step6b_recovery_daemon_tests` (the record codec, the
+  record file, a stamp without a record, a recorded volume gone, a reused
+  number left alone).
+
+## E48. The re-attach at boot: refuse a second server, recover each device in turn, give up after `--recovery-timeout` (35 s)
+
+2026-10-16. Accepted (Step 6B-1; the default and two rules amended by the
+Step 6 review, E60).
+
+- **Decision.** `otap_ublk::Recovery`, driven by `Pool::boot`:
+  1. Before the pool is opened, the boot is refused if a live process other
+     than this one serves a device stamped with this pool (a second daemon
+     on it).
+  2. After the boot commit and before any new device: the host is listed;
+     record entries whose device is gone, or whose number now carries
+     another stamp, are forgotten; a bound device of a volume that is not
+     online becomes stale.
+  3. Each online volume with a device (its binding, else the one device
+     that carries its stamp; two or more unrecorded claimants are all left
+     stale, E60) gets a `Recovery`: `GET_DEV_INFO` and its checks (the
+     flag, the stamp, one queue, the size equal to the volume's, a request
+     bound within the arena's, not `DEAD`, no live server; a device naming
+     this process's pid is an earlier process's, E60), then for a
+     `QUIESCED` device `START_USER_RECOVERY` (`EBUSY` retried at least
+     10 ms apart, the attempt at the budget's end never held back), for a
+     `LIVE` one with a dead server a wait; then the re-attach (open, map,
+     fetch every tag), the front door into the engine, and `END` through
+     `start_while_serving` (E44). The recoveries are stepped in turn with
+     engine ticks between rounds, so the devices already re-attached are
+     served meanwhile.
+  4. A device gone means a new device; any other failure, `TimedOut` after
+     `--recovery-timeout` included, records the old device stale and gives
+     the volume a new one. Nothing is deleted at boot. A success logs the
+     time to serving since the arena re-attach began, flagged beyond the
+     2 s target.
+- **The timeout.** 35 s by default (1 to 300). A dead server's device with a
+  fetch pending is quiesced at once; one whose server held every tag is
+  quiesced only by `ublk_timeout` at the block layer's request timeout,
+  30 s by default since the driver sets none. 6B-1 chose 5 s, which made
+  every such volume lose its device number (every mount and open file of
+  the old one broken); the review raised it so that only that case waits,
+  and long enough for it (E60). Unmeasured until a Linux run; writing
+  `queue/io_timeout` after `START_DEV` would shorten the wait and is left
+  for the WSL run.
+- **Rejected.** Deleting and recreating every device at boot (the device
+  number changes, which is what the recovery exists to avoid) and a
+  recovery that waits without bound (a device that never quiesces would
+  hold the boot).
+- **Enforced by** `step6b_recovery_ublk_tests` (15 tests over `MockKernel`),
+  `step6b_recovery_daemon_tests` (15, among them a restart that keeps every
+  device number within the 2 s target on the simulated clock) and
+  `review_step6_recovery_daemon_tests::the_recovery_timeout_outlasts_the_block_layers_request_timeout`.
+
+## E49. Device standings and the reaper: listed, never silently deleted
+
+2026-10-16. Accepted, amended by E60 (the review's W2: a device naming this
+process's pid that it does not serve has a dead server) (Step 6B-1).
+
+- **Decision.** `otap_ublk::classify` gives every ublk device on the host
+  one standing. *Serving*: this daemon's. *Foreign*: a live server that
+  is not this process (checked before any record), another pool's stamp
+  while a pool is booted, or an unstamped device with pid 0. *Recoverable*:
+  stamped, its server dead, and its pool not booted here (or its online
+  volume has no device yet). *Stale*: recorded stale (this pool's stamp
+  only); this pool's stamp on a volume that is gone, offline or served
+  elsewhere; `DEAD`; unstamped with no live server. `otapctl device list`
+  shows them all, with or without a booted pool. `device reap <id>`
+  deletes a stale or recoverable device; `device reap --stale` every
+  stale one; neither ever touches a serving, foreign or still-quiescing
+  device (`STOP_DEV` on a `LIVE` device waits for its started requests,
+  E40, and would block the engine thread). A reap is `STOP_DEV` then
+  `DEL_DEV_ASYNC`. Nothing is deleted at boot.
+- **Rejected.** Deleting stale devices automatically at boot: a device
+  another pool, another daemon or other software owns is indistinguishable
+  from an orphan by anything but its stamp and server, and deleting it
+  destroys someone's block device under them; an orphan costs one of
+  `ublks_max` (64) until the operator reaps it.
+- **Enforced by** `reap_check` and `classify` in `step6b_recovery_ublk_tests`,
+  and the daemon's and `otapctl`'s listing and refusal tests
+  (`step6b_recovery_daemon_tests`, `step6b_recovery_ctl_tests`).
+
+## E50. Format 2.4: the snapshot table and the catalogue become a base and a chain of deltas behind a head page
+
+2026-10-16. Accepted (Step 6B-2; F19 to F21 in the format crate's root;
+vectors `v2.4/`).
+
+- **Context.** The snapshot table was rewritten in every CP that had a
+  snapshot, changed or not, and the catalogue in every CP that named
+  anything: over 270,000 records per naming CP at 1,024 volumes with 271
+  snapshots each (`06`, section 8, after Step 5). A CP log page cannot
+  carry those records, so the change needs new page types.
+- **Decision.** F19, the table log page (`OTTL`, 4,096 bytes): a 64-byte
+  header naming the aggregate, the CP and its nonce, the page's position
+  and the table, then 63 snapshot records or 7 catalogue records, each with
+  its own CRC; a delta region is whole pages of one CP with keys strictly
+  ascending; upserts are whole records, deletions tombstones
+  (`SNAP_TOMBSTONE`, `CATALOG_TOMBSTONE`); a base keeps the 2.3 image and
+  refuses tombstones. F20, the table head page (`OTTH`): the base entry and
+  up to 124 delta entries (region, CP, records), with the rules of order
+  between them. The superblock (minor 4) records each head's CP
+  (`snap_head_cp`, `catalog_head_cp`); `snap_table` and `catalog` name the
+  heads. An unchanged table carries its head and writes nothing; a changed
+  one writes a delta of the changed keys and a new head, or folds (a new
+  base, an empty chain, a head). `TableFoldPolicy` (`EngineConfig::table_fold`):
+  a fold is due when the chain would pass `max_deltas` (64, clamped 1 to
+  124) or the deltas' records plus this CP's would pass the larger of the
+  base's records and `min_fold_records` (256), so a boot replays at most 64
+  regions per table and at most twice the table plus 256 records; a
+  missing head, a full chain and a repair force one. The decision is pure
+  (`plan_table`: carry, drop, delta, fold). Freed regions (the old head; on
+  a fold the old base and deltas) follow the deferred-free rule like every
+  metadata region (E24).
+- **The 2.3-reader guard.** Byte 56 of a head page is always zero, and a
+  2.3 reader takes the snapshot head for its table, reads record kind 0,
+  refuses it and the whole ring before writing anything. So the snapshot
+  head stays, empty or not, while any name or snapshot exists; an empty
+  table otherwise has no head. A 2.4 pool with neither names nor
+  snapshots has no head to trip on (E60 records what the review found
+  about that case).
+- **Rejected.** Logging the records in `CpLogPage` (126 records of 32 bytes
+  cannot hold a 64-byte snapshot record or a 512-byte name) and
+  copy-on-write catalogue pages (a B-tree for tables that fit a few pages
+  at typical sizes, with a fold in every CP that touches it).
+- **Consequences.** The engine boots 2.4 pools only (minor below 4 is
+  `OldLayout`): nothing was released at 2.3. In memory the snapshot set and
+  the catalogue are still cloned and compared, O(n), in each CP that
+  changes them; only the disk cost is incremental.
+- **Enforced by** `step6b_catalogue_format_tests` (with the properties
+  `every_head_bit_is_covered` and `every_delta_bit_is_covered`), the v2.4
+  lane of `format_tests`, and `step6b_catalogue_sim_tests` (the property
+  `random_table_changes_with_folds_and_crashes_boot_to_the_engines_tables`).
+
+## E51. Damage in a table chain: torn when the booted commit wrote it, otherwise uncertain keys, quarantine and a refold
+
+2026-10-16. Accepted, partly reversed by E60 (the review's D9: a snapshot table that lost records refuses the boot) (Step 6B-2).
+
+- **Decision.** A region the booted commit wrote (the head's CP or an
+  entry's CP equal to the candidate's) that does not verify tears that
+  commit (`TornReason::Table`) and the boot falls back. An older region
+  that does not verify is shared damage: tolerant scans keep every record
+  that verifies alone (a delta page needs a verifying header naming the
+  aggregate, the table, the CP and its position), and a key is uncertain
+  when its last readable record precedes the last damaged region.
+  Uncertain or clashing names are dropped; uncertain or duplicate-uuid
+  snapshots get `SNAP_UNCERTAIN` (bit 6 of `SnapRecord.flags`, persisted;
+  `SNAP_FLAGS_MASK` admits it with the pins), which quarantines them like
+  E43; a pin keeps the mark. An unreadable older head boots without the
+  table. Each case warns (`SnapshotTableDamaged`, `CatalogDamaged`) and sets
+  `repair`, so the first commit after the boot folds the table into a
+  clean chain. Deleting an uncertain snapshot, or one whose root did not
+  load at boot, frees nothing (the second was a latent defect, fixed with a
+  test).
+- **Also.** The Step 4 review's hazard 12 is fixed: the boot dedupes
+  `meta_live` by address, so a region the live tree and a snapshot share
+  is counted once. And a rewritten snapshot root page is listed in the CP
+  log directory (the Step 5 review's hazard 9), so a lost one tears its CP
+  rather than reading as a damaged snapshot.
+- **Rejected.** Failing the boot on any damaged table region: one bad
+  sector in a region every candidate shares would stop the pool, as W4 of
+  the Step 5 review showed for the catalogue.
+- **Enforced by** `step6b_catalogue_sim_tests`.
+
+## E52. A policy fold of a table that does not fit is put off; a forced fold is not
+
+2026-10-16. Accepted (Step 6B-2).
+
+- **Decision.** The reserve numbers are unchanged (boot 0, shutdown 1,
+  others 2 segments); table regions are placed by the CP's metadata stream
+  under that reserve. A policy fold is planned only if
+  `MetaStream::can_place(base pages + 1)` (`SegmentTable::has_run`); one
+  that still meets `NoSpace` sets the chain's `fold_blocked_at` (the free
+  segment count then) and the CP is retried at once as a delta CP without
+  marking the pool full; the policy stays quiet until free segments rise
+  above the mark. A forced fold (no head, a full chain of 124, a repair)
+  never waits.
+- **Rejected.** Letting a policy fold fail the CP like any `NoSpace`: the
+  fold is an optimisation of the next boot, and a full pool that could
+  still commit a delta would have been marked full for it.
+- **Enforced by** `step6b_catalogue_sim_tests`.
+
+## E53. The pool attestation is an engine job that holds one committed CP readable
+
+2026-10-16. Accepted, amended by E60 (the review's R3) (Step 6B-2).
+
+- **Context.** The brief's "pool attestation" is not the design's
+  attestation (the operator's statement about a hardware RAID cache, `05`
+  section 7.3); the nearest design item is the engine scrub, deferred past
+  v0.1. "Bounds" and "LBA continuity" are defined nowhere. Every public map
+  walk stopped at the first damaged page, and a whole-pool pass stalls the
+  data path unless it is sliced.
+- **Decision.** `otap_cp::verify`: `start_verify(VerifyOptions)`; each tick
+  advances at most `units_per_tick` (256: a block is one unit, a map page
+  four, a summary its pages) and `max_ns_per_tick` (2 ms). The job captures
+  CP N when no superblock write is in flight, then holds the deferred frees
+  of every later CP so N's view stays on disk while writes, CPs, folds,
+  deletions and the cleaner go on. It checks the ring (four slots, CRCs,
+  the aggregate, locations; N's pair against the engine's slot; the other
+  pair one CP older; monotone `owner_epoch`, `intent_seq_seen`,
+  `opened_stamp`), the map roots, the segment table, the CP log
+  directory, deltas and pages, the stripe list and its summaries, both
+  table chains replayed against the engine's tables, every tree (index
+  against the engine, page CRC, `max_birth`, entries, births, bounds, the
+  overlay, each snapshot root's identity, the quarantine), every distinct
+  live block (address, a data segment in use, payload CRC, summary CRC and
+  identity, the descriptor against the entry), and the accounting (data
+  `live_bytes` against the blocks reached: more found is an error, fewer
+  a warning; metadata against the referenced regions plus pending frees).
+  Seventeen kinds of finding; 64 kept, the counts complete. It aborts,
+  releasing its holds, at shutdown, or when the pool is full or the free
+  segments reach the reserve while it holds anything (a full pool that it
+  holds nothing of is verified, E60); it repairs only table chains (a
+  finding sets `repair`, the next CP refolds).
+  `dbladed`'s `PoolVerify` starts it or returns the running job's report,
+  `PoolVerifyStatus` and `PoolVerifyCancel` follow it, and `otapctl pool
+  verify` waits (100 ms polls) and exits 4 on a verdict that is not clean.
+- **Rejected.** A verification under a quiet engine (the data path would
+  stop for the length of a whole-pool read) and a lock-free read of the
+  live state (a CP in flight would move what the job reads).
+- **Consequences** (limits, `06` section 8): about 1 TiB of reads per TiB
+  of live data, plus map pages and summaries (about 4 GiB each per TiB);
+  about 1 MiB per tick at the defaults; held frees grow with the run, so a
+  long verify of a nearly full pool aborts. It cannot see blocks under a
+  tree that fails to load (the accounting then drifts and is reported as a
+  warning), stripes and regions nothing references (only through
+  `live_bytes`), free space, slots older than N-1, or the arena and ublk
+  side. A table chain is checked in one slice (up to 126 region reads).
+- **Enforced by** `step6b_verify_sim_tests` (the property
+  `random_workloads_with_crashes_always_attest_clean`; every kind of
+  injected damage found with its kind and address; slicing under writes;
+  the holds; giving way to space; cancel), `step6b_verify_daemon_tests`,
+  `step6b_verify_ctl_tests` and `step6b_verify_control_tests`.
+
+## E54. Replication: the engines speak a `Link`; TCP lives in the daemon, the simulated network in the simulator
+
+2026-10-16. Accepted (Step 6C).
+
+- **Context.** Sockets stay out of `otap-stream` (`09`, section 4), and the
+  Step 3 `Net` and `LoopbackNet` cannot lose a connection, which every
+  resume test needs. The daemon hosts one pool where a loopback harness
+  needs two.
+- **Decision.** `Link`, `Dialer`, `LinkListener` and `SinkStore` are traits
+  in `otap_cp::traits` beside the other four (E13). The sessions
+  (`otap_cp::repl`: `Replicator`, `SourceJob`, `SinkJob`, the link framing
+  and the sink's record) are engine-side code stepped on the engine thread
+  after every tick, with no I/O of their own. `otap_sim::SimNet` carries
+  the same frames over byte pipes with delay in ticks and seeded faults
+  (drop, cut, corrupt, refused dials, a queue limit, a pulled cable), and
+  `MemStore` is a state directory that survives a simulated crash.
+  `otap_daemon::TcpReplicationTransport` is `std::net` with a reader and a
+  writer thread per connection and bounded channels (64) to the engine
+  thread. No new crate: `otap-cp` uses the workspace's `otap-stream` and
+  `bytes`, and `Cargo.lock` gained no package.
+- **Rejected.** An `otap-repl` crate (the sessions need the engine's
+  private snapshot and apply calls, and a crate boundary would have
+  widened the engine's public surface for one caller) and an async runtime
+  (one engine thread, `09`).
+- **Enforced by** `step6c_transport_wire_tests` (otap-cp),
+  `step6c_transport_simnet_tests`, `step6c_transport_tcp_tests`.
+
+## E55. The source: a stable view without held frees, a delta identity every process agrees on, and an anchor chunk
+
+2026-10-16. Accepted (Step 6C).
+
+- **Decision.** Every engine call a source makes (`snapshot_delta_scan`,
+  `snapshot_read_blocks`) takes the snapshot's current tree, walks or reads,
+  and returns within one call on the engine thread: a snapshot is
+  immutable and relocation keeps births and CRCs, so nothing is held
+  between calls and no deferred free is pinned (unlike E53). A transfer
+  plans first (pass 1 counts data blocks in page-sized slices, records
+  each chunk's start LBA and the hole runs), then streams chunk *i* rebuilt
+  on demand from its start as a stripe image (`StripeHdr` with the
+  aggregate, the target's birth CP, the nonce, `lseg = i + 1`,
+  `stripe_idx = i`; descriptors with LBA, birth and CRC). The delta's
+  identity: `cp_seq` the target's birth CP, `base` the base's, and the nonce
+  BLAKE3 over the two snapshots' identities, so the same delta has the same
+  identity in every connection and process, and a resumed sink matches it.
+  An increment is `Increment {from, to}`; a first transfer is `Steady` with
+  base 0 and the target in the `SnapTag`. A delta with no data block sends
+  one anchor chunk (block 0 as the target reads it), because the stream
+  refuses a delta of no chunks.
+- **Consequences.** The plan costs 8 bytes per chunk and 12 per hole run,
+  and the whole delta is walked before `DeltaBegin`. Quarantined snapshots
+  (E43, E51) are refused as source and as base at both ends.
+- **Enforced by** `step6c_replication_engine_tests` and
+  `step6c_replication_sim_tests`.
+
+## E56. The sink: a chunk lands when a committed CP carries it; the cursor lives in `--state-dir`; the destination snapshot is the commit record
+
+2026-10-16. Accepted, amended by E60 (the review's D2 to D7 and W1) (Step 6C).
+
+- **Decision.** The sink verifies each chunk (credits, the image's
+  identity, exact length, per-block CRC, volume, LBA in range), turns it
+  into runs and places them through `apply_write` and `apply_punch` (the
+  front door's path for a volume marked as a replica). A chunk is landed
+  only when `durable_seq()` covers its highest sequence, which is when a
+  committed CP carries it: then the cursor records it, BLAKE3 over the
+  images in index order advances, the record is saved, and only then does
+  `Landed` return the credits. `HelloAck` waits while chunks of the delta
+  are placed and not yet durable, so the cursor it sends holds every chunk
+  received and a resume never re-sends a landed chunk. After `DeltaEnd`,
+  with every chunk landed and the digest matching,
+  `create_snapshot_as(target uuid, Transfer, name)`; once it is listed,
+  the cursor commits, the record is rewritten (base = target, clean), the
+  mirror pins its own base, the previous transfer base is deleted, and
+  `Committed` goes out. A digest mismatch aborts the delta and starts over.
+  The record (`SinkRecord`, `OTRS` v1: a header, the stream's 4 KiB
+  `CursorPage`, a CRC) is saved atomically in `--state-dir` as
+  `repl-<pool>-sink-<vol>.rec` after the CP that made its chunks durable;
+  its `pool_cp` catches a pool rewound below it. The destination
+  snapshot's existence, under the source's uuid, is the commit record: a
+  sink that finds the landing's target among its snapshots finishes the
+  commit. A delta of another identity on a dirty mirror rolls the mirror
+  back to its base first (or deletes a base-less partial first transfer).
+  A lost record: the base is the mirror's newest `Transfer` snapshot and
+  the live volume is treated as dirty.
+- **The replica mark.** A mirror is offline and marked in memory
+  (`set_replica`); `set_volume_online(true)` answers `ReplicaVolume`, so no
+  client reads a partial delta or writes into a mirror. `replicate release`
+  syncs, rolls a dirty mirror back to its last complete snapshot, clears
+  the mark and the pin, removes the record and leaves the volume offline.
+  The replica stamps its own births (a block's birth is the CP that placed
+  it on the mirror).
+- **Rejected.** A format 2.5 record in the pool for the cursor (the
+  superblock's `InboundState` is reserved and never written; a separate
+  write has the same crash window, and the committed state is rebuildable
+  from the pool through the same-uuid snapshot); keeping the sender's
+  births (they mean nothing in another pool's CP sequence).
+- **Enforced by** `step6c_replication_sim_tests` (the property
+  `random_transfers_with_faults_and_crashes_converge`;
+  `every_frame_kind_and_position_tolerates_a_fault`, 57 runs; sink crashes;
+  abandoned deltas; pulls) and `step6c_replication_daemon_tests`.
+
+## E57. The source's pin moves on `Committed` only; one destination per source volume
+
+2026-10-16. Accepted, amended by E60 (the review's D2: the sink only reports a base it holds) (Step 6C).
+
+- **Decision.** The source calls `set_replication_base(T)` only on
+  `Committed`, or when a later handshake reports T as the sink's base (the
+  `Committed` was lost with a connection), and then waits for the pin to
+  be durable; anything short leaves the old pin. The mirror pins its own
+  base the same way. Because the base is the `PIN_REPLICATION` bit, not a
+  per-destination field, a source volume has one replication base and so
+  one destination.
+- **Consequences.** A second destination would move the first one's base
+  (limit, `06`). Source jobs live in memory: a daemon restart forgets them,
+  and a new push resumes from the sink's durable cursor.
+- **Enforced by** the pin checker of `step6c_replication_sim_tests` (every
+  move of the pin is checked against what the destination holds durably).
+
+## E58. The replication link: a framed, CRC-sealed byte stream, a fixed handshake, loopback by default, no TLS yet
+
+2026-10-16. Accepted (Step 6C).
+
+- **Decision.** A link frame is `OTRL`, a length (at most 8 MiB + 64 B +
+  1 KiB, refused at the header), a CRC-32C and the payload. `FrameReader`
+  poisons itself on a bad magic, an oversize length or a CRC failure, and
+  `finish` reports a truncated frame. The payload's first byte: 1, the
+  handshake (96 bytes, `OTRH`, the version first, role, accept, aggregate,
+  volume index, target and base uuid and CP, three names of at most 255
+  bytes); 2, a refusal (a code and at most 1 KiB of text); 3, one stream
+  frame. `REPL_PROTOCOL_VERSION` is 1; another version is answered
+  `Refuse(Version)` before anything else is parsed. Within a connection
+  nothing is dropped, duplicated or reordered; resent chunks after a
+  reconnect are the only duplicates. The same pool at both ends, and a
+  destination that exists and is not a replica, are refused.
+  `dbladed --replication-listen <host:port>` binds in `Daemon::spawn` and
+  lends the listener to the booted pool; listening and dialling are
+  loopback-only unless `--allow-remote-replication`, worded like the
+  control plane's `--allow-remote-control`. TCP timeouts: read poll
+  200 ms, write and mid-frame stall 30 s, connect 5 s.
+- **Rejected for now.** TLS and authentication: whoever reaches the port can
+  push into a mirror or pull a snapshot, which is why the default is
+  loopback and the flag's help says so (limit, `06`).
+- **Enforced by** `step6c_transport_wire_tests` (three properties),
+  `step6c_transport_tcp_tests`, and the replication control and `otapctl`
+  suites.
+
+## E59. The control protocol stays at version 1 for new variants; requests without fields are empty struct variants
+
+2026-10-16. Accepted (Steps 6B-1, 6B-2 and 6C; the second half after the
+Step 6 review's R1).
+
+- **Decision.** A new request or reply variant does not bump
+  `PROTOCOL_VERSION`: a daemon that does not know a request answers it
+  `BadRequest` (it cannot decode it), and a reply variant reaches only a
+  client that sent the request it answers. A field added to an existing
+  shape is still a version change, since both peers refuse unknown fields
+  (R3 of the Step 5 review). Step 6 added `DeviceList`, `DeviceReap`,
+  `PoolVerify`, `PoolVerifyStatus`, `PoolVerifyCancel`, `ReplicatePush`,
+  `ReplicatePull`, `ReplicateStatus`, `ReplicateCursor`, `ReplicateCancel`
+  and `ReplicateRelease`, and the replies `Devices`, `Reaped`, `Verify`,
+  `Replication`, `Replications` and `ReplicationCursor`, under version 1.
+  Every request and reply without fields is an empty struct variant
+  (`Ping {}`, `PoolStatus {}`, `Ok {}` and the rest): serde lets an
+  internally tagged *unit* variant ignore any field it does not know,
+  whatever `deny_unknown_fields` says, so seven requests and the `Ok` reply
+  accepted `{"op":"ping","force":true}`. The JSON on the wire is the same
+  (`{"op":"ping"}`), so the change is invisible to a peer of either age.
+- **Rejected.** Bumping the version for each step's additive verbs: every
+  `otapctl` of an older step would then refuse a newer daemon for verbs it
+  never sends.
+- **Enforced by** `review_step6_control_tests`
+  (`r1_a_request_without_fields_refuses_an_unknown_field`,
+  `r1_the_ok_reply_refuses_an_unknown_field`), the round-trip test of every
+  variant in `protocol/tests.rs`, and the per-step control suites.
+
+## E60. After the Step 6 review: what the sink, the snapshot table, the arena and the devices decide
+
+2026-10-16. Accepted (the Step 6 adversarial review,
+`reviews/2026-10-16-step6-qa-adversarial.md`; the findings and their fixes
+are in the Step 6 entry of `08-engineering-log.md`). Amends E42, E48, E51,
+E56 and E57; nothing here changes the format, the arena layout or the
+protocol version.
+
+- **A relocation verifies before it moves** (D1, the Step 5 review's hazard
+  8). A block that fails its CRC is not copied under its recorded CRC: its
+  segment is skipped like one with an unreadable block, and the damage
+  stays where it is. Rejected: re-stamping the block with a fresh CRC (it
+  would turn known damage into silent wrong data), and letting the boot's
+  data check skip relocation stripes (it would also skip the lost writes
+  that check exists to catch).
+- **The sink's commit is the delta's own** (D2). The destination snapshot
+  takes the identity recorded when the delta began, never the latest
+  handshake's; a newer delta waits for the older one's commit.
+- **A sink record knows which CP it was written after** (D3). The record
+  keeps the CP's nonce beside its number (in reserved bytes: layout 1
+  stays), and `Replicator::attach` forgets a landing the pool no longer
+  holds right after the boot commit, the one moment a rewind of a single
+  CP is visible. The sink still clears the mirror's nvfail, now only after
+  that check.
+- **The landing goes before the rollback** (D4): the abandoned delta's
+  cursor is aborted and saved before the rollback or the deletion is asked
+  for; and the daemon refuses `snapshot rollback` and `volume resize` of a
+  mirror.
+- **What makes a volume a mirror** (D5, D6, D7). A sink record that names
+  it, or the pool itself: the replication pin on its newest transfer
+  snapshot (set by the sink on the base it committed, cleared by `replicate
+  release`). Anything else is refused as a destination; a mirror whose
+  record is lost stays marked; the daemon forgets a record when it deletes
+  its volume; and the record is saved as soon as the mirror is asked for,
+  before its creation can commit. A partial first transfer whose record is
+  lost is still an ordinary offline volume (limit): a sink's
+  `--state-dir` belongs on persistent storage. Rejected: a format 2.5
+  replica flag in the volume table (a layout change late in the step, and
+  the pin already says it for every mirror that has a base).
+- **One copy of a source snapshot per pool** (W1): a target whose identity
+  another volume of the sink pool holds is refused at the handshake.
+- **A cleaning CP keeps the quarantine** (D8).
+- **A snapshot table that lost records refuses the boot** (D9; reverses
+  part of E51). An older head that does not verify, or an older region
+  that yields fewer records than its head counts, tears the candidate, as
+  format 2.3 tore it; with every candidate naming the region the boot is
+  refused. E51's tolerant path stays for damage that loses no record and
+  for the catalogue. The reason: a record the boot cannot read may have
+  created a snapshot, and booting without it counts that snapshot's blocks
+  dead and lets the cleaner free them, an irreversible loss behind one
+  warning; a refused boot loses nothing and leaves the decision to the
+  operator. Rejected: booting with every data free frozen until an
+  acknowledgement (the repair fold would make the loss permanent and
+  invisible to the next boot, and the pool would fill).
+- **The arena's re-attach takes the writer's fill discipline** (D10,
+  amends E42). A stale slot is judged at the position its index takes in
+  the window, never under its own unverified lap; `Fills::Serial` (the
+  engine) adds that a stale slot with anything written after it is damage,
+  since a serial writer's interrupted fill is its newest reservation's;
+  `Fills::Interleaved` (the arena's general contract, which E16's future
+  cells will need) keeps the neighbour rule alone. A damaged slot is
+  rewritten under its implied lap (R5).
+- **A device's binding outlives a `--no-ublk` boot** (D11, amends E47 and
+  E48): the record is loaded and saved on every boot, a deletion marks the
+  deleted volume's device stale, and two unrecorded devices claiming one
+  volume are both left stale.
+- **A pid is not an identity across a restart** (W2): a device naming this
+  process's pid that this process does not serve is an earlier process's,
+  its server dead.
+- **`--recovery-timeout` is 35 s by default** (amends E48), past the block
+  layer's 30 s request timeout that alone quiesces a device whose server
+  died holding every tag; only that case waits.
+- **A resize with nothing to hold is written at once** (W3, amends E45).
+- **A full pool can be verified** (R3): only holding something aborts a
+  verification on a full pool.
+- **One listing policy for both ublk hosts** (R4): a device that answers
+  `EINVAL` to `GET_DEV_INFO` (made with `UBLK_F_UNPRIVILEGED_DEV`) is left
+  out of the listing; any other refusal still fails it.
+- **Switches take no value** (R2) and **peer text is escaped** (R6).
+- **Lesson** (also in the log): every replication defect was a decision
+  taken against a different view of the same state than the one it acted
+  on: a target from the newest handshake over the old delta's content, a
+  record trusted against a pool that rewound under it, an identity read
+  from an index that a deletion recycles. The CP lesson of E39 holds for
+  the sessions too: what a session commits must be named by the state it
+  committed, never by what arrived since.
